@@ -830,9 +830,7 @@ impl DefaultMQPushConsumerImpl {
             info!("the pull request[{}] is dropped.", pull_request);
             return;
         }
-        pull_request.process_queue.set_last_pull_timestamp(get_current_millis());
         if let Err(e) = self.make_sure_state_ok() {
-            warn!("pullMessage exception, consumer state not ok {}", e);
             if !self.is_terminal_state() {
                 self.execute_pull_request_later(pull_request, self.pull_time_delay_mills_when_exception);
             }
@@ -865,6 +863,17 @@ impl DefaultMQPushConsumerImpl {
                     self.queue_flow_control_times
                 );
             }
+            pull_request.process_queue.mark_flow_control();
+            let stall_ms = pull_request.process_queue.flow_control_stall_ms();
+            if stall_ms > *crate::consumer::consumer_impl::PULL_MAX_IDLE_TIME / 2 {
+                warn!(
+                    "[STALL] queue flow-controlled by cached-count for {}ms, topic={}, queueId={}, count={}",
+                    stall_ms,
+                    pull_request.get_message_queue().get_topic(),
+                    pull_request.get_message_queue().get_queue_id(),
+                    cached_message_count,
+                );
+            }
             self.execute_pull_request_later(pull_request, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL);
 
             self.queue_flow_control_times += 1;
@@ -886,6 +895,17 @@ impl DefaultMQPushConsumerImpl {
                     cached_message_size_in_mib,
                     pull_request.to_string(),
                     self.queue_flow_control_times
+                );
+            }
+            pull_request.process_queue.mark_flow_control();
+            let stall_ms = pull_request.process_queue.flow_control_stall_ms();
+            if stall_ms > *crate::consumer::consumer_impl::PULL_MAX_IDLE_TIME / 2 {
+                warn!(
+                    "[STALL] queue flow-controlled by cached-size for {}ms, topic={}, queueId={}, size_mib={}",
+                    stall_ms,
+                    pull_request.get_message_queue().get_topic(),
+                    pull_request.get_message_queue().get_queue_id(),
+                    cached_message_size_in_mib,
                 );
             }
             self.execute_pull_request_later(pull_request, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL);
@@ -911,6 +931,17 @@ impl DefaultMQPushConsumerImpl {
                     );
                 }
                 self.queue_max_span_flow_control_times += 1;
+                pull_request.process_queue.mark_flow_control();
+                let stall_ms = pull_request.process_queue.flow_control_stall_ms();
+                if stall_ms > *crate::consumer::consumer_impl::PULL_MAX_IDLE_TIME / 2 {
+                    warn!(
+                        "[STALL] queue flow-controlled by max-span for {}ms, topic={}, queueId={}, span={}",
+                        stall_ms,
+                        pull_request.get_message_queue().get_topic(),
+                        pull_request.get_message_queue().get_queue_id(),
+                        max_span,
+                    );
+                }
                 self.execute_pull_request_later(pull_request, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL);
                 return;
             }
@@ -974,6 +1005,11 @@ impl DefaultMQPushConsumerImpl {
             self.execute_pull_request_later(pull_request, self.pull_time_delay_mills_when_exception);
             return;
         }
+        // Update liveness timestamp only after passing all flow-control checks and just before
+        // issuing the actual broker pull.  Updating it on entry (as it was before) caused every
+        // 50 ms flow-control retry to refresh the timestamp, preventing is_pull_expired() from
+        // ever triggering rebalance recovery (F1 in plan/29).
+        pull_request.process_queue.set_last_pull_timestamp(get_current_millis());
         let begin_timestamp = Instant::now();
         let topic = message_queue.get_topic().to_string();
 
@@ -1555,6 +1591,78 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
     }
 
     fn consumer_running_info(&self) -> ConsumerRunningInfo {
-        todo!()
+        // Build a Java 4.7.1-compatible ConsumerRunningInfo snapshot.
+        // We reuse the thread::spawn + Handle::current() pattern (same as subscriptions()) to
+        // block on async reads from within this sync trait method.
+        let offset_store = self.offset_store.clone();
+        let process_queue_table = self.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .clone();
+        let subscription_inner = self.rebalance_impl
+            .rebalance_impl_inner
+            .subscription_inner
+            .clone();
+        let client_config = self.client_config.clone();
+        let consumer_config = self.consumer_config.clone();
+        let consume_orderly = self.consume_orderly;
+
+        let handle = Handle::current();
+        thread::spawn(move || {
+            handle.block_on(async move {
+                let mut info = ConsumerRunningInfo::default();
+
+                // Properties
+                let ns_addr = client_config.get_namesrv_addr()
+                    .unwrap_or_default()
+                    .to_string();
+                info.properties.insert(
+                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_NAMESERVER_ADDR),
+                    CheetahString::from_string(ns_addr),
+                );
+                info.properties.insert(
+                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_TYPE),
+                    CheetahString::from_static_str("CONSUME_PASSIVELY"),
+                );
+                info.properties.insert(
+                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_ORDERLY),
+                    CheetahString::from_string(consume_orderly.to_string()),
+                );
+                info.properties.insert(
+                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CLIENT_VERSION),
+                    CheetahString::from_static_str(env!("CARGO_PKG_VERSION")),
+                );
+                info.properties.insert(
+                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_THREADPOOL_CORE_SIZE),
+                    CheetahString::from_string(
+                        consumer_config.consume_thread_max.to_string()
+                    ),
+                );
+
+                // Subscription set
+                {
+                    let sub = subscription_inner.read().await;
+                    info.subscription_set = sub.values().cloned().collect();
+                }
+
+                // Process queue table
+                {
+                    let pq_table = process_queue_table.read().await;
+                    for (mq, pq) in pq_table.iter() {
+                        let commit_offset = if let Some(ref store) = offset_store {
+                            store.read_offset(mq, crate::consumer::store::read_offset_type::ReadOffsetType::MemoryFirstThenStore).await
+                        } else {
+                            -1
+                        };
+                        let pq_info = pq.fill_process_queue_info(commit_offset.max(0) as u64);
+                        info.mq_table.insert(mq.clone(), pq_info);
+                    }
+                }
+
+                info
+            })
+        })
+        .join()
+        .unwrap_or_default()
     }
 }

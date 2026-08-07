@@ -66,6 +66,9 @@ pub(crate) struct ProcessQueue {
     pub(crate) last_lock_timestamp: Arc<AtomicU64>,
     pub(crate) consuming: Arc<AtomicBool>,
     pub(crate) msg_acc_cnt: Arc<AtomicI64>,
+    /// Millisecond wall-clock timestamp when the queue first entered flow-control in the current
+    /// stall window, or 0 when not flow-controlled. Used by the stall detector only.
+    pub(crate) flow_control_since: Arc<AtomicU64>,
     /// Serializes per-queue commit operations so that concurrent chunk tasks
     /// cannot interleave offset advancement or ProcessQueue removal.
     pub(crate) commit_lock: Arc<Mutex<()>>,
@@ -89,6 +92,7 @@ impl ProcessQueue {
             last_lock_timestamp: Arc::new(AtomicU64::new(get_current_millis())),
             consuming: Arc::new(AtomicBool::new(false)),
             msg_acc_cnt: Arc::new(AtomicI64::new(0)),
+            flow_control_since: Arc::new(AtomicU64::new(0)),
             commit_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -315,18 +319,68 @@ impl ProcessQueue {
         drop(lock);
     }
 
-    pub(crate) fn fill_process_queue_info(&self, info: ProcessQueueInfo) {
-        unimplemented!("fill_process_queue_info")
+    /// Snapshot the current queue state into a [`ProcessQueueInfo`] for admin/running-info.
+    pub(crate) fn fill_process_queue_info(&self, commit_offset: u64) -> ProcessQueueInfo {
+        let msg_count = self.msg_count.load(Ordering::Acquire);
+        let queue_offset_max = self.queue_offset_max.load(Ordering::Acquire);
+        // cached_msg_min_offset: 0 when queue is empty (consistent with Java client).
+        let cached_min = if msg_count == 0 {
+            0
+        } else {
+            // Approximate: min known offset is commit_offset when draining.
+            commit_offset
+        };
+        ProcessQueueInfo {
+            commit_offset,
+            cached_msg_min_offset: cached_min,
+            cached_msg_max_offset: queue_offset_max,
+            cached_msg_count: msg_count as u32,
+            cached_msg_size_in_mib: (self.msg_size.load(Ordering::Acquire) / (1024 * 1024)) as u32,
+            locked: self.locked.load(Ordering::Acquire),
+            try_unlock_times: self.try_unlock_times.load(Ordering::Acquire) as u64,
+            last_lock_timestamp: self.last_lock_timestamp.load(Ordering::Acquire),
+            droped: self.dropped.load(Ordering::Acquire),
+            last_pull_timestamp: self.last_pull_timestamp.load(Ordering::Acquire),
+            last_consume_timestamp: self.last_consume_timestamp.load(Ordering::Acquire),
+            // Transaction queue fields: not used in CLUSTERING push consumer.
+            transaction_msg_min_offset: 0,
+            transaction_msg_max_offset: 0,
+            transaction_msg_count: 0,
+        }
     }
 
     pub(crate) fn set_last_pull_timestamp(&self, last_pull_timestamp: u64) {
         self.last_pull_timestamp
             .store(last_pull_timestamp, std::sync::atomic::Ordering::Release);
+        // Clear the flow-control start marker when a real broker pull is issued.
+        self.flow_control_since.store(0, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn set_last_lock_timestamp(&self, last_lock_timestamp: u64) {
         self.last_lock_timestamp
             .store(last_lock_timestamp, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark that this queue entered flow-control.  Idempotent: only records the
+    /// first entry so the stall duration accumulates from that point.
+    pub(crate) fn mark_flow_control(&self) {
+        // Use compare-and-swap so that concurrent callers don't reset an existing start time.
+        let _ = self.flow_control_since.compare_exchange(
+            0,
+            get_current_millis(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// How many milliseconds this queue has been continuously flow-controlled,
+    /// or 0 if it is not currently in flow-control.
+    pub(crate) fn flow_control_stall_ms(&self) -> u64 {
+        let since = self.flow_control_since.load(Ordering::Acquire);
+        if since == 0 {
+            return 0;
+        }
+        get_current_millis().saturating_sub(since)
     }
 
     pub fn msg_count(&self) -> u64 {
@@ -349,6 +403,7 @@ mod tests {
     use rocketmq_rust::ArcMut;
 
     use super::ProcessQueue;
+    use rocketmq_common::TimeUtils::get_current_millis;
 
     fn make_msg(offset: i64, body_size: usize) -> ArcMut<MessageExt> {
         let mut msg = MessageExt {
@@ -491,5 +546,55 @@ mod tests {
         let _o2 = r2.unwrap();
 
         assert_eq!(pq.msg_count(), 0, "all messages must be removed");
+    }
+
+    #[test]
+    fn flow_control_stall_ms_is_zero_before_mark() {
+        let pq = ProcessQueue::new();
+        // Immediately after construction, no flow-control has been recorded.
+        // We reset to 0 explicitly to avoid the constructor timestamp.
+        pq.flow_control_since.store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(pq.flow_control_stall_ms(), 0);
+    }
+
+    #[test]
+    fn flow_control_stall_ms_is_nonzero_after_mark() {
+        let pq = ProcessQueue::new();
+        pq.flow_control_since.store(0, std::sync::atomic::Ordering::Release);
+        pq.mark_flow_control();
+        // Give the timer at least 1 ms to advance.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(pq.flow_control_stall_ms() > 0);
+    }
+
+    #[test]
+    fn set_last_pull_timestamp_clears_flow_control_marker() {
+        let pq = ProcessQueue::new();
+        pq.mark_flow_control();
+        assert!(pq.flow_control_since.load(std::sync::atomic::Ordering::Acquire) > 0);
+        pq.set_last_pull_timestamp(get_current_millis());
+        assert_eq!(pq.flow_control_since.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn fill_process_queue_info_reflects_queue_state() {
+        let pq = ProcessQueue::new();
+        pq.msg_count.store(5, std::sync::atomic::Ordering::Release);
+        pq.msg_size.store(1024 * 1024 * 3, std::sync::atomic::Ordering::Release);
+        pq.queue_offset_max.store(20, std::sync::atomic::Ordering::Release);
+        pq.locked.store(true, std::sync::atomic::Ordering::Release);
+        pq.dropped.store(false, std::sync::atomic::Ordering::Release);
+        pq.last_pull_timestamp.store(1_000, std::sync::atomic::Ordering::Release);
+        pq.last_consume_timestamp.store(900, std::sync::atomic::Ordering::Release);
+
+        let info = pq.fill_process_queue_info(10);
+        assert_eq!(info.commit_offset, 10);
+        assert_eq!(info.cached_msg_count, 5);
+        assert_eq!(info.cached_msg_size_in_mib, 3);
+        assert_eq!(info.cached_msg_max_offset, 20);
+        assert!(info.locked);
+        assert!(!info.droped);
+        assert_eq!(info.last_pull_timestamp, 1_000);
+        assert_eq!(info.last_consume_timestamp, 900);
     }
 }
