@@ -45,6 +45,8 @@ use rocketmq_rust::ArcMut;
 use rocketmq_rust::RocketMQTokioMutex;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -103,7 +105,9 @@ pub struct MQClientInstance {
     pub(crate) pull_message_service: ArcMut<PullMessageService>,
     rebalance_service: RebalanceService,
     pub(crate) default_producer: ArcMut<DefaultMQProducer>,
-    instance_runtime: Arc<RocketMQRuntime>,
+    instance_runtime: Option<RocketMQRuntime>,
+    scheduled_tasks: Vec<JoinHandle<()>>,
+    scheduled_tasks_stop: CancellationToken,
     broker_addr_table: Arc<RwLock<HashMap<CheetahString, HashMap<u64, CheetahString>>>>,
     broker_version_table:
         Arc<RwLock<HashMap<CheetahString /* Broker Name */, HashMap<CheetahString /* address */, i32>>>>,
@@ -162,10 +166,12 @@ impl MQClientInstance {
                     .client_config(client_config.clone())
                     .build(),
             ),
-            instance_runtime: Arc::new(RocketMQRuntime::new_multi(
+            instance_runtime: Some(RocketMQRuntime::new_multi(
                 num_cpus::get(),
                 "mq-client-instance",
             )),
+            scheduled_tasks: Vec::new(),
+            scheduled_tasks_stop: CancellationToken::new(),
             broker_addr_table,
             broker_version_table: Arc::new(Default::default()),
             send_heartbeat_times_total: Arc::new(AtomicI64::new(0)),
@@ -207,7 +213,9 @@ impl MQClientInstance {
                     .client_config(client_config.clone())
                     .build(),
             ),
-            instance_runtime: Arc::new(RocketMQRuntime::new_multi(num_cpus::get(), "mq-client-instance")),
+            instance_runtime: Some(RocketMQRuntime::new_multi(num_cpus::get(), "mq-client-instance")),
+            scheduled_tasks: Vec::new(),
+            scheduled_tasks_stop: CancellationToken::new(),
             broker_addr_table,
             broker_version_table: Arc::new(Default::default()),
             send_heartbeat_times_total: Arc::new(AtomicI64::new(0)),
@@ -365,12 +373,20 @@ impl MQClientInstance {
         if self.service_state == ServiceState::ShutdownAlready {
             return;
         }
+        self.service_state = ServiceState::Stopping;
         self.producer_table
             .write()
             .await
             .remove(mix_all::CLIENT_INNER_PRODUCER_GROUP);
         self.pull_message_service.shutdown();
         self.rebalance_service.shutdown();
+        self.scheduled_tasks_stop.cancel();
+        for task in self.scheduled_tasks.drain(..) {
+            let _ = task.await;
+        }
+        if let Some(runtime) = self.instance_runtime.take() {
+            let _ = tokio::task::spawn_blocking(move || runtime.shutdown_timeout(Duration::from_secs(3))).await;
+        }
         self.service_state = ServiceState::ShutdownAlready;
         crate::implementation::mq_client_manager::MQClientManager::get_instance()
             .remove_client_factory(&self.client_id);
@@ -403,70 +419,85 @@ impl MQClientInstance {
     }
 
     fn start_scheduled_task(&mut self, this: ArcMut<Self>) {
+        let stop = self.scheduled_tasks_stop.child_token();
+        let runtime = self.instance_runtime.as_ref().expect("client runtime").get_handle();
         if self.client_config.namesrv_addr.is_none() {
-            // Fetch name server address
             let mut mq_client_api_impl = self.mq_client_api_impl.as_ref().unwrap().clone();
-            self.instance_runtime.get_handle().spawn(async move {
+            let stop = stop.clone();
+            self.scheduled_tasks.push(runtime.spawn(async move {
                 info!("ScheduledTask fetchNameServerAddr started");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                let mut delay = tokio::time::sleep(Duration::from_secs(10));
+                tokio::pin!(delay);
                 loop {
-                    let current_execution_time = tokio::time::Instant::now();
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = &mut delay => {}
+                    }
                     mq_client_api_impl.fetch_name_server_addr().await;
-                    let next_execution_time = current_execution_time + Duration::from_secs(120);
-                    let delay = next_execution_time.saturating_duration_since(tokio::time::Instant::now());
-                    tokio::time::sleep(delay).await;
+                    delay
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_secs(120));
                 }
-            });
+            }));
         }
 
-        // Update topic route info from name server
         let mut client_instance = this.clone();
         let poll_name_server_interval = self.client_config.poll_name_server_interval;
-        self.instance_runtime.get_handle().spawn(async move {
+        let stop_route = stop.clone();
+        self.scheduled_tasks.push(runtime.spawn(async move {
             info!("ScheduledTask update_topic_route_info_from_name_server started");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut delay = tokio::time::sleep(Duration::from_millis(10));
+            tokio::pin!(delay);
             loop {
-                let current_execution_time = tokio::time::Instant::now();
+                tokio::select! {
+                    _ = stop_route.cancelled() => break,
+                    _ = &mut delay => {}
+                }
                 client_instance.update_topic_route_info_from_name_server().await;
-                let next_execution_time =
-                    current_execution_time + Duration::from_millis(poll_name_server_interval as u64);
-                let delay = next_execution_time.saturating_duration_since(tokio::time::Instant::now());
-                tokio::time::sleep(delay).await;
+                delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(poll_name_server_interval as u64));
             }
-        });
+        }));
 
-        // Clean offline broker and send heartbeat to all broker
         let mut client_instance = this.clone();
         let heartbeat_broker_interval = self.client_config.heartbeat_broker_interval;
-        self.instance_runtime.get_handle().spawn(async move {
+        let stop_heartbeat = stop.clone();
+        self.scheduled_tasks.push(runtime.spawn(async move {
             info!("ScheduledTask clean_offline_broker started");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut delay = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(delay);
             loop {
-                let current_execution_time = tokio::time::Instant::now();
+                tokio::select! {
+                    _ = stop_heartbeat.cancelled() => break,
+                    _ = &mut delay => {}
+                }
                 client_instance.clean_offline_broker().await;
                 client_instance.send_heartbeat_to_all_broker_with_lock().await;
-                let next_execution_time =
-                    current_execution_time + Duration::from_millis(heartbeat_broker_interval as u64);
-                let delay = next_execution_time.saturating_duration_since(tokio::time::Instant::now());
-                tokio::time::sleep(delay).await;
+                delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(heartbeat_broker_interval as u64));
             }
-        });
+        }));
 
-        // Persist all consumer offset
         let mut client_instance = this;
         let persist_consumer_offset_interval = self.client_config.persist_consumer_offset_interval as u64;
-        self.instance_runtime.get_handle().spawn(async move {
+        let stop_persist = stop;
+        self.scheduled_tasks.push(runtime.spawn(async move {
             info!("ScheduledTask persistAllConsumerOffset started");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut delay = tokio::time::sleep(Duration::from_secs(10));
+            tokio::pin!(delay);
             loop {
-                let current_execution_time = tokio::time::Instant::now();
+                tokio::select! {
+                    _ = stop_persist.cancelled() => break,
+                    _ = &mut delay => {}
+                }
                 client_instance.persist_all_consumer_offset().await;
-                let next_execution_time =
-                    current_execution_time + Duration::from_millis(persist_consumer_offset_interval);
-                let delay = next_execution_time.saturating_duration_since(tokio::time::Instant::now());
-                tokio::time::sleep(delay).await;
+                delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(persist_consumer_offset_interval));
             }
-        });
+        }));
     }
 
     pub async fn update_topic_route_info_from_name_server(&mut self) {
@@ -1051,10 +1082,15 @@ impl MQClientInstance {
             self.rebalance_service.wakeup();
         } else {
             let service = self.rebalance_service.clone();
-            self.instance_runtime.get_handle().spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay_millis)).await;
-                service.wakeup();
-            });
+            if let Some(runtime) = self.instance_runtime.as_ref() {
+                let stop = self.scheduled_tasks_stop.clone();
+                runtime.get_handle().spawn(async move {
+                    tokio::select! {
+                        _ = stop.cancelled() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(delay_millis)) => service.wakeup(),
+                    }
+                });
+            }
         }
     }
 
