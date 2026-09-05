@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -28,6 +30,7 @@ use rocketmq_remoting::protocol::body::consume_message_directly_result::ConsumeM
 use rocketmq_remoting::protocol::heartbeat::message_model::MessageModel;
 use rocketmq_runtime::RocketMQRuntime;
 use rocketmq_rust::ArcMut;
+use tokio::sync::Semaphore;
 use tracing::info;
 use tracing::warn;
 
@@ -49,7 +52,9 @@ pub struct ConsumeMessageConcurrentlyService {
     pub(crate) consumer_config: ArcMut<ConsumerConfig>,
     pub(crate) consumer_group: CheetahString,
     pub(crate) message_listener: ArcBoxMessageListenerConcurrently,
-    pub(crate) consume_runtime: RocketMQRuntime,
+    pub(crate) consume_runtime: Option<RocketMQRuntime>,
+    accepting: Arc<AtomicBool>,
+    permits: Arc<Semaphore>,
 }
 
 impl ConsumeMessageConcurrentlyService {
@@ -60,7 +65,7 @@ impl ConsumeMessageConcurrentlyService {
         message_listener: ArcBoxMessageListenerConcurrently,
         default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
     ) -> Self {
-        let consume_thread = consumer_config.consume_thread_max;
+        let consume_thread = consumer_config.consume_thread_max.max(1) as usize;
         let consumer_group_tag = format!("{}_{}", "ConsumeMessageThread_", consumer_group);
         Self {
             default_mqpush_consumer_impl,
@@ -68,7 +73,9 @@ impl ConsumeMessageConcurrentlyService {
             consumer_config,
             consumer_group,
             message_listener,
-            consume_runtime: RocketMQRuntime::new_multi(consume_thread as usize, consumer_group_tag.as_str()),
+            consume_runtime: Some(RocketMQRuntime::new_multi(consume_thread, consumer_group_tag.as_str())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            permits: Arc::new(Semaphore::new(consume_thread)),
         }
     }
 }
@@ -205,8 +212,20 @@ impl ConsumeMessageConcurrentlyService {
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
     ) {
-        self.consume_runtime.get_handle().spawn(async move {
+        if !self.accepting.load(Ordering::Acquire) {
+            process_queue.set_dropped(true);
+            return;
+        }
+        let Some(runtime) = self.consume_runtime.as_ref() else {
+            return;
+        };
+        let accepting = self.accepting.clone();
+        runtime.get_handle().spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            if !accepting.load(Ordering::Acquire) {
+                process_queue.set_dropped(true);
+                return;
+            }
             let this_ = this.clone();
             this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
                 .await;
@@ -221,8 +240,20 @@ impl ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         delay: Duration,
     ) {
-        self.consume_runtime.get_handle().spawn(async move {
+        if !self.accepting.load(Ordering::Acquire) {
+            process_queue.set_dropped(true);
+            return;
+        }
+        let Some(runtime) = self.consume_runtime.as_ref() else {
+            return;
+        };
+        let accepting = self.accepting.clone();
+        runtime.get_handle().spawn(async move {
             tokio::time::sleep(delay).await;
+            if !accepting.load(Ordering::Acquire) {
+                process_queue.set_dropped(true);
+                return;
+            }
             let this_ = this.clone();
             this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
                 .await;
@@ -250,7 +281,10 @@ impl ConsumeMessageConcurrentlyService {
 
 impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
     fn start(&mut self, mut this: ArcMut<Self>) {
-        self.consume_runtime.get_handle().spawn(async move {
+        let Some(runtime) = self.consume_runtime.as_ref() else {
+            return;
+        };
+        runtime.get_handle().spawn(async move {
             let timeout = this.consumer_config.consume_timeout;
             let mut interval = tokio::time::interval(Duration::from_secs(timeout * 60));
             interval.tick().await;
@@ -262,7 +296,13 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
     }
 
     async fn shutdown(&mut self, await_terminate_millis: u64) {
-        // todo!()
+        self.accepting.store(false, Ordering::Release);
+        self.permits.close();
+        let Some(runtime) = self.consume_runtime.take() else {
+            return;
+        };
+        let timeout = Duration::from_millis(await_terminate_millis);
+        let _ = tokio::task::spawn_blocking(move || runtime.shutdown_timeout(timeout)).await;
     }
 
     async fn consume_message_directly(
@@ -317,39 +357,65 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
     ) {
-        let consume_batch_size = self.consumer_config.consume_message_batch_max_size;
+        if !self.accepting.load(Ordering::Acquire) {
+            process_queue.set_dropped(true);
+            return;
+        }
+        let consume_batch_size = self.consumer_config.consume_message_batch_max_size.max(1);
         if msgs.len() <= consume_batch_size as usize {
             let mut consume_request = ConsumeRequest {
                 msgs,
                 message_listener: self.message_listener.clone(),
-                process_queue,
+                process_queue: process_queue.clone(),
                 message_queue,
                 dispatch_to_consume,
                 consumer_group: self.consumer_group.clone(),
                 default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
             };
 
-            self.consume_runtime
-                .get_handle()
-                .spawn(async move { consume_request.run(this).await });
+            let Ok(permit) = self.permits.clone().acquire_owned().await else {
+                process_queue.set_dropped(true);
+                return;
+            };
+            if !self.accepting.load(Ordering::Acquire) {
+                process_queue.set_dropped(true);
+                return;
+            }
+            let Some(runtime) = self.consume_runtime.as_ref() else {
+                return;
+            };
+            runtime.get_handle().spawn(async move {
+                let _permit = permit;
+                consume_request.run(this).await
+            });
         } else {
-            msgs.chunks(consume_batch_size as usize)
-                .map(|t| t.to_vec())
-                .for_each(|msgs| {
-                    let mut consume_request = ConsumeRequest {
-                        msgs,
-                        message_listener: self.message_listener.clone(),
-                        process_queue: process_queue.clone(),
-                        message_queue: message_queue.clone(),
-                        dispatch_to_consume,
-                        consumer_group: self.consumer_group.clone(),
-                        default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
-                    };
-                    let consume_message_concurrently_service = this.clone();
-                    self.consume_runtime
-                        .get_handle()
-                        .spawn(async move { consume_request.run(consume_message_concurrently_service).await });
+            for msgs in msgs.chunks(consume_batch_size as usize).map(|t| t.to_vec()) {
+                let mut consume_request = ConsumeRequest {
+                    msgs,
+                    message_listener: self.message_listener.clone(),
+                    process_queue: process_queue.clone(),
+                    message_queue: message_queue.clone(),
+                    dispatch_to_consume,
+                    consumer_group: self.consumer_group.clone(),
+                    default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                };
+                let Ok(permit) = self.permits.clone().acquire_owned().await else {
+                    process_queue.set_dropped(true);
+                    return;
+                };
+                if !self.accepting.load(Ordering::Acquire) {
+                    process_queue.set_dropped(true);
+                    return;
+                }
+                let Some(runtime) = self.consume_runtime.as_ref() else {
+                    return;
+                };
+                let consume_message_concurrently_service = this.clone();
+                runtime.get_handle().spawn(async move {
+                    let _permit = permit;
+                    consume_request.run(consume_message_concurrently_service).await
                 });
+            }
         }
     }
 

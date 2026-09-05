@@ -22,6 +22,8 @@ pub enum ServiceState {
     Starting,
     /// Service running
     Running,
+    /// Service shutdown is in progress; no new work may be admitted.
+    Stopping,
     /// Service shutdown
     ShutdownAlready,
     /// Service start failure
@@ -34,6 +36,7 @@ impl Display for ServiceState {
             ServiceState::CreateJust => write!(f, "CreateJust"),
             ServiceState::Starting => write!(f, "Starting"),
             ServiceState::Running => write!(f, "Running"),
+            ServiceState::Stopping => write!(f, "Stopping"),
             ServiceState::ShutdownAlready => write!(f, "ShutdownAlready"),
             ServiceState::StartFailed => write!(f, "StartFailed"),
         }
@@ -48,5 +51,6 @@ mod tests {
     fn starting_has_a_distinct_display_value() {
         assert_eq!(ServiceState::Starting.to_string(), "Starting");
         assert_ne!(ServiceState::Starting, ServiceState::StartFailed);
+        assert_eq!(ServiceState::Stopping.to_string(), "Stopping");
     }
 }

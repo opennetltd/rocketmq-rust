@@ -160,6 +160,7 @@ impl MQAdminExt for DefaultMQAdminExtImpl {
             ServiceState::Running
             | ServiceState::ShutdownAlready
             | ServiceState::Starting
+            | ServiceState::Stopping
             | ServiceState::StartFailed => {
                 unimplemented!()
             }
@@ -171,6 +172,7 @@ impl MQAdminExt for DefaultMQAdminExtImpl {
             ServiceState::CreateJust
             | ServiceState::Starting
             | ServiceState::ShutdownAlready
+            | ServiceState::Stopping
             | ServiceState::StartFailed => {
                 // do nothing
             }
