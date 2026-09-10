@@ -147,6 +147,11 @@ impl PartialEq for Connection {
 impl Eq for Connection {}
 
 impl Connection {
+    #[cfg(test)]
+    pub(crate) async fn block_outbound_for_test(&self) -> impl Drop + '_ {
+        self.outbound.lock().await
+    }
+
     async fn wait_closed(mut state: watch::Receiver<ConnectionState>) {
         loop {
             if *state.borrow() == ConnectionState::Closed {

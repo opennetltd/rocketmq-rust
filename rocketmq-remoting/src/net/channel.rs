@@ -73,13 +73,13 @@ pub type ArcChannel = ArcMut<Channel>;
 /// ## Design Rationale
 ///
 /// - **Separation of concerns**: `Channel` handles identity/routing, `ChannelInner` handles I/O
-/// - **Clone-friendly**: Lightweight outer type can be cloned, shares inner state via `ArcMut`
+/// - **Clone-friendly**: Lightweight outer type can be cloned, shares inner state via `Arc`
 /// - **Equality/Hash**: Based on identity (addresses + ID), not inner state
 #[derive(Clone)]
 pub struct Channel {
     // === Core State ===
-    /// Shared mutable access to channel internals (connection, response tracking, etc.)
-    inner: ArcMut<ChannelInner>,
+    /// Shared access to synchronized channel internals (connection, response tracking, etc.)
+    inner: Arc<ChannelInner>,
 
     // === Identity & Addressing ===
     /// Local socket address (our end of the connection)
@@ -106,7 +106,7 @@ impl Channel {
     /// # Returns
     ///
     /// A new channel with a randomly generated UUID as its ID.
-    pub fn new(inner: ArcMut<ChannelInner>, local_address: SocketAddr, remote_address: SocketAddr) -> Self {
+    pub fn new(inner: Arc<ChannelInner>, local_address: SocketAddr, remote_address: SocketAddr) -> Self {
         let channel_id = Uuid::new_v4().to_string().into();
         Self {
             inner,
@@ -195,13 +195,13 @@ impl Channel {
 
     // === Connection Access ===
 
-    /// Gets mutable access to the underlying connection.
+    /// Legacy accessor returning the synchronized connection.
     ///
     /// Deprecated: internal remoting paths use the channel-owned I/O methods.
     #[allow(deprecated)]
     #[deprecated(note = "use Channel::send_command, send_bytes, or receive_command")]
-    pub fn connection_mut(&mut self) -> &mut Connection {
-        self.inner.connection.as_mut()
+    pub fn connection_mut(&self) -> &Connection {
+        self.inner.connection.as_ref()
     }
 
     /// Gets immutable access to the underlying connection.
@@ -241,13 +241,10 @@ impl Channel {
         self.inner.as_ref()
     }
 
-    /// Gets mutable access to the shared channel state.
-    ///
-    /// # Returns
-    ///
-    /// Mutable reference to `ChannelInner` for advanced operations
-    pub fn channel_inner_mut(&mut self) -> &mut ChannelInner {
-        self.inner.as_mut()
+    /// Legacy accessor returning immutable shared channel state.
+    #[deprecated(note = "use channel_inner; shared channel state cannot be mutably borrowed")]
+    pub fn channel_inner_mut(&self) -> &ChannelInner {
+        self.inner.as_ref()
     }
 }
 
@@ -303,7 +300,7 @@ enum ChannelMessage {
 
 /// Shared state for a `Channel` - handles I/O, async message queueing, and response tracking.
 ///
-/// `ChannelInner` is the "heavy" part of a channel that is shared via `ArcMut` across
+/// `ChannelInner` is the "heavy" part of a channel that is shared via `Arc` across
 /// multiple `Channel` clones. It manages:
 ///
 /// - **Connection**: Low-level TCP I/O
@@ -339,7 +336,7 @@ pub struct ChannelInner {
     /// `Connection` serializes all outbound operations and allows the reader and
     /// writer to run independently. The deprecated mutable accessor is retained
     /// only for source compatibility.
-    pub(crate) connection: ArcMut<Connection>,
+    pub(crate) connection: Arc<Connection>,
 
     // === Response Tracking ===
     /// Synchronized pending request owner keyed by connection and opaque ID.
@@ -381,7 +378,7 @@ pub struct ChannelInner {
 /// This would reduce per-message overhead and improve throughput by ~20-40%
 /// under high load, at the cost of slightly increased latency for small batches.
 async fn handle_send(
-    connection: ArcMut<Connection>,
+    connection: Arc<Connection>,
     rx: Receiver<ChannelMessage>,
     pending_responses: PendingResponses,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
@@ -460,6 +457,13 @@ async fn handle_send(
                 if let Some(pending_request) = pending_request {
                     pending_request.timeout(pending_request.timeout_millis());
                 }
+                // A cancelled flush can leave a partial frame in the sink. Never
+                // reuse that stream for a subsequent request.
+                closed.store(true, Ordering::Release);
+                connection.close();
+                pending_responses.fail_connection(connection.connection_id().as_ref(), "send deadline expired");
+                let _ = shutdown_tx.send(());
+                return;
             }
         }
     }
@@ -502,7 +506,7 @@ impl ChannelInner {
         // flume provides lock-free operations and better throughput than tokio::mpsc
         let (outbound_queue_tx, outbound_queue_rx) = flume::bounded(QUEUE_CAPACITY);
 
-        let connection = ArcMut::new(connection);
+        let connection = Arc::new(connection);
         let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let closed = Arc::new(AtomicBool::new(false));
         let send_task = tokio::spawn(handle_send(
@@ -530,13 +534,9 @@ impl ChannelInner {
 impl ChannelInner {
     // === Connection Accessors ===
 
-    /// Gets a cloned `ArcMut` handle to the connection.
-    ///
-    /// # Returns
-    ///
-    /// Shared mutable reference to the connection (cheap clone, increments refcount)
+    /// Gets a cloned `Arc` handle to the synchronized connection.
     #[inline]
-    pub fn connection(&self) -> ArcMut<Connection> {
+    pub fn connection(&self) -> Arc<Connection> {
         self.connection.clone()
     }
 
@@ -550,13 +550,13 @@ impl ChannelInner {
         self.connection.as_ref()
     }
 
-    /// Gets a mutable reference to the connection.
+    /// Legacy accessor returning the synchronized connection.
     ///
     /// Deprecated: internal remoting paths use the channel-owned I/O methods.
     #[allow(deprecated)]
     #[deprecated(note = "use the channel-owned send and receive methods")]
-    pub fn connection_mut(&mut self) -> &mut Connection {
-        self.connection.as_mut()
+    pub fn connection_mut(&self) -> &Connection {
+        self.connection.as_ref()
     }
 
     pub(crate) fn shutdown(&self) {
@@ -582,6 +582,7 @@ impl ChannelInner {
         message: ChannelMessage,
         deadline: Option<tokio::time::Instant>,
     ) -> rocketmq_error::RocketMQResult<()> {
+        let mut shutdown = self.shutdown.subscribe();
         if self.closed.load(Ordering::Acquire) || !self.connection.is_healthy() {
             return Err(RocketMQError::network_connection_failed("channel", "connection closed"));
         }
@@ -589,7 +590,6 @@ impl ChannelInner {
             ChannelMessage::Command(_, Some(pending_request), _) => Some(pending_request.timeout_millis()),
             _ => None,
         };
-        let mut shutdown = self.shutdown.subscribe();
         let result = match deadline {
             Some(deadline) => {
                 tokio::select! {
@@ -666,7 +666,7 @@ impl ChannelInner {
     /// println!("Got response: {:?}", response);
     /// ```
     pub async fn send_wait_response(
-        &mut self,
+        &self,
         request: RemotingCommand,
         timeout_millis: u64,
     ) -> rocketmq_error::RocketMQResult<RemotingCommand> {
@@ -832,7 +832,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(address);
         let (stream, _) = tokio::join!(client, listener.accept());
-        let mut channel = ChannelInner::new(Connection::new(stream.unwrap()), PendingResponses::with_capacity(1));
+        let channel = ChannelInner::new(Connection::new(stream.unwrap()), PendingResponses::with_capacity(1));
 
         let request = RemotingCommand::new_request(1, Bytes::new());
         let result = channel.send_wait_response(request, 10).await;
@@ -845,12 +845,41 @@ mod tests {
             .register(&channel.connection_id, ResponseFuture::new(2, 1000, true, tx))
             .map_err(|_| "duplicate pending response")
             .unwrap();
+        let send_task = channel.send_task.lock().unwrap().take().unwrap();
         channel.shutdown();
         assert!(matches!(rx.await.unwrap(), Err(RocketMQError::Network(_))));
         drop(registration);
         assert_eq!(channel.pending_responses.len(), 0);
         assert_eq!(channel.connection.state(), crate::connection::ConnectionState::Closed);
-        tokio::task::yield_now().await;
-        assert_eq!(crate::metrics::snapshot().send_tasks, 0);
+        tokio::time::timeout(Duration::from_secs(1), send_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn send_deadline_retires_connection_and_stops_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let _peer = server.unwrap().0;
+        let channel = ChannelInner::new(Connection::new(client.unwrap()), PendingResponses::with_capacity(1));
+        let _blocked = channel.connection.block_outbound_for_test().await;
+        let send_task = channel.send_task.lock().unwrap().take().unwrap();
+        let result = channel
+            .send_wait_response(RemotingCommand::new_request(1, Bytes::new()), 20)
+            .await;
+        assert!(matches!(result, Err(RocketMQError::Timeout { .. })));
+        tokio::time::timeout(Duration::from_secs(1), send_task)
+            .await
+            .expect("timed-out writer must exit instead of reusing a possibly partial frame")
+            .unwrap();
+        assert_eq!(channel.connection.state(), crate::connection::ConnectionState::Closed);
+        assert_eq!(channel.pending_responses.len(), 0);
+        assert!(channel
+            .send(RemotingCommand::new_request(2, Bytes::new()), None)
+            .await
+            .is_err());
     }
 }

@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use rocketmq_common::common::server::config::ServerConfig;
 use rocketmq_rust::wait_for_signal;
-use rocketmq_rust::ArcMut;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -54,7 +53,7 @@ const DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS: u64 = 120;
 /// # Performance Notes
 /// - Uses reference-counted handler to avoid cloning heavyweight objects
 /// - Shutdown signal via broadcast for efficient multi-connection coordination
-/// - Connection context wrapped in ArcMut for safe concurrent access
+/// - Connection context wrapped in Arc for safe concurrent access
 ///
 /// # Lifecycle
 /// 1. Created when TCP connection accepted
@@ -64,7 +63,7 @@ const DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS: u64 = 120;
 pub struct ConnectionHandler<RP> {
     /// Connection-specific context (channel, state, metrics)
     ///
-    /// Wrapped in ArcMut to allow sharing with async tasks without excessive cloning
+    /// Wrapped in Arc to allow sharing with async tasks without excessive cloning
     connection_handler_context: ConnectionHandlerContext,
 
     /// Shutdown coordination signal
@@ -85,7 +84,7 @@ pub struct ConnectionHandler<RP> {
     /// Shared command processing handler
     ///
     /// Reference-counted to avoid cloning per-connection (contains processor + hooks)
-    cmd_handler: ArcMut<RemotingGeneralHandler<RP>>,
+    cmd_handler: Arc<RemotingGeneralHandler<RP>>,
 
     /// Event notification channel for ChannelEventListener
     ///
@@ -206,7 +205,7 @@ impl<RP: RequestProcessor + Sync + 'static> ConnectionHandler<RP> {
             // Dispatch command to business logic
             // Note: process_message_received handles errors internally
             self.cmd_handler
-                .process_message_received(&mut self.connection_handler_context, cmd)
+                .process_message_received(&self.connection_handler_context, cmd)
                 .await;
         }
         Ok(())
@@ -268,7 +267,7 @@ struct ConnectionListener<RP> {
     ///
     /// Contains request processor, RPC hooks, and response routing table.
     /// Arc-wrapped to share across all connection handlers efficiently.
-    cmd_handler: ArcMut<RemotingGeneralHandler<RP>>,
+    cmd_handler: Arc<RemotingGeneralHandler<RP>>,
 }
 
 impl<RP: RequestProcessor + Sync + 'static + Clone> ConnectionListener<RP> {
@@ -353,7 +352,7 @@ impl<RP: RequestProcessor + Sync + 'static + Clone> ConnectionListener<RP> {
             info!("Accepted connection: {} → {}", remote_addr, local_addr);
 
             // Create connection channel wrapper
-            let channel_inner = ArcMut::new(ChannelInner::new(
+            let channel_inner = Arc::new(ChannelInner::new(
                 Connection::new(socket),
                 self.cmd_handler.pending_responses.clone(),
             ));
@@ -369,7 +368,7 @@ impl<RP: RequestProcessor + Sync + 'static + Clone> ConnectionListener<RP> {
             // Build connection handler
             let idle_timeout = Duration::from_secs(DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS);
             let handler = ConnectionHandler {
-                connection_handler_context: ArcMut::new(ConnectionHandlerContextWrapper {
+                connection_handler_context: Arc::new(ConnectionHandlerContextWrapper {
                     channel: channel.clone(),
                 }),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
@@ -516,9 +515,9 @@ pub async fn run<RP: RequestProcessor + Sync + 'static + Clone>(
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
     // Initialize the connection listener state
     let handler = RemotingGeneralHandler {
-        request_processor,
+        request_processor: tokio::sync::Mutex::new(request_processor),
         //shutdown: Shutdown::new(notify_shutdown.subscribe()),
-        rpc_hooks,
+        rpc_hooks: std::sync::RwLock::new(rpc_hooks),
         pending_responses: PendingResponses::with_capacity(512),
     };
     let mut listener = ConnectionListener {
@@ -528,7 +527,7 @@ pub async fn run<RP: RequestProcessor + Sync + 'static + Clone>(
         conn_disconnect_notify,
         limit_connections: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
         channel_event_listener,
-        cmd_handler: ArcMut::new(handler),
+        cmd_handler: Arc::new(handler),
     };
 
     tokio::select! {

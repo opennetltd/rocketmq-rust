@@ -14,19 +14,19 @@
 
 use std::net::SocketAddr;
 
-use rocketmq_rust::ArcMut;
+use std::sync::Arc;
 use tracing::error;
 
 use crate::connection::Connection;
 use crate::net::channel::Channel;
 use crate::protocol::remoting_command::RemotingCommand;
 
-/// Shared mutable context for request handlers.
+/// Shared immutable context for request handlers.
 ///
-/// This type alias wraps `ConnectionHandlerContextWrapper` in an `ArcMut` to allow
-/// efficient sharing and mutation across async tasks. Handlers receive this context
+/// This type alias wraps `ConnectionHandlerContextWrapper` in an `Arc` for safe
+/// sharing across async tasks. Handlers receive this context
 /// and use it to access the channel and send responses.
-pub type ConnectionHandlerContext = ArcMut<ConnectionHandlerContextWrapper>;
+pub type ConnectionHandlerContext = Arc<ConnectionHandlerContextWrapper>;
 
 /// Request handler context - provides access to the channel for a specific connection.
 ///
@@ -41,7 +41,7 @@ pub type ConnectionHandlerContext = ArcMut<ConnectionHandlerContextWrapper>;
 ///
 /// - **Thin wrapper**: Delegates most operations to the underlying `Channel`
 /// - **Hash/Eq based on channel**: Contexts for the same channel are equal
-/// - **Wrapped in ArcMut**: Shared across async tasks, enables interior mutability
+/// - **Wrapped in Arc**: Shared across async tasks; channel methods synchronize I/O.
 ///
 /// ## Naming Note
 ///
@@ -91,7 +91,7 @@ impl ConnectionHandlerContextWrapper {
 
     #[allow(deprecated)]
     #[deprecated(note = "use the channel-owned send and receive methods")]
-    pub fn connection_mut(&mut self) -> &mut Connection {
+    pub fn connection_mut(&self) -> &Connection {
         self.channel.connection_mut()
     }
 
@@ -120,7 +120,7 @@ impl ConnectionHandlerContextWrapper {
     ///     ctx.write(response).await;
     /// }
     /// ```
-    pub async fn write_response(&mut self, cmd: RemotingCommand) {
+    pub async fn write_response(&self, cmd: RemotingCommand) {
         match self.channel.send_command(cmd).await {
             Ok(_) => {}
             Err(error) => {
@@ -146,7 +146,7 @@ impl ConnectionHandlerContextWrapper {
     /// # Note
     ///
     /// The command's body may be consumed during sending (`take_body()`).
-    pub async fn write_response_ref(&mut self, cmd: &mut RemotingCommand) {
+    pub async fn write_response_ref(&self, cmd: &mut RemotingCommand) {
         match self.channel.send_command(cmd.clone()).await {
             Ok(_) => {}
             Err(error) => {
@@ -161,7 +161,7 @@ impl ConnectionHandlerContextWrapper {
     ///
     /// Use `write_response()` for clearer semantics.
     #[deprecated(since = "0.6.0", note = "Use `write_response()` instead")]
-    pub async fn write(&mut self, cmd: RemotingCommand) {
+    pub async fn write(&self, cmd: RemotingCommand) {
         self.write_response(cmd).await;
     }
 
@@ -171,7 +171,7 @@ impl ConnectionHandlerContextWrapper {
     ///
     /// Use `write_response_ref()` for clearer semantics.
     #[deprecated(since = "0.6.0", note = "Use `write_response_ref()` instead")]
-    pub async fn write_ref(&mut self, cmd: &mut RemotingCommand) {
+    pub async fn write_ref(&self, cmd: &mut RemotingCommand) {
         self.write_response_ref(cmd).await;
     }
 
@@ -190,17 +190,10 @@ impl ConnectionHandlerContextWrapper {
         &self.channel
     }
 
-    /// Gets a mutable reference to the channel.
-    ///
-    /// # Returns
-    ///
-    /// Mutable reference to the `Channel`
-    ///
-    /// # Use Case
-    ///
-    /// Advanced channel operations (modify addresses, access inner state)
-    pub fn channel_mut(&mut self) -> &mut Channel {
-        &mut self.channel
+    /// Legacy accessor returning an immutable channel from the shared context.
+    #[deprecated(note = "use channel; shared context cannot be mutably borrowed")]
+    pub fn channel_mut(&self) -> &Channel {
+        &self.channel
     }
 
     // === Convenience Accessors ===

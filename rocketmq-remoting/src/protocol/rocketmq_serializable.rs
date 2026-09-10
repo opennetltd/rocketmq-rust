@@ -83,7 +83,10 @@ impl RocketMQSerializable {
 
         // Zero-copy split and freeze
         let bytes = buf.split_to(len).freeze();
-        Ok(Some(CheetahString::from_bytes(bytes)))
+        // Preserve the pinned fork decoder behavior; migrate its codec separately.
+        #[allow(deprecated)]
+        let value = CheetahString::from_bytes(bytes);
+        Ok(Some(value))
     }
 
     /// Optimized ROCKETMQ protocol encoding with reduced allocations

@@ -87,8 +87,8 @@ pub(crate) mod inner {
     use crate::runtime::RPCHook;
 
     pub(crate) struct RemotingGeneralHandler<RP> {
-        pub(crate) request_processor: RP,
-        pub(crate) rpc_hooks: Vec<Arc<dyn RPCHook>>,
+        pub(crate) request_processor: tokio::sync::Mutex<RP>,
+        pub(crate) rpc_hooks: std::sync::RwLock<Vec<Arc<dyn RPCHook>>>,
         pub(crate) pending_responses: PendingResponses,
     }
 
@@ -96,7 +96,7 @@ pub(crate) mod inner {
     where
         RP: RequestProcessor + Sync + 'static,
     {
-        pub async fn process_message_received(&mut self, ctx: &mut ConnectionHandlerContext, cmd: RemotingCommand) {
+        pub async fn process_message_received(&self, ctx: &ConnectionHandlerContext, cmd: RemotingCommand) {
             match cmd.get_type() {
                 RemotingCommandType::REQUEST => match self.process_request_command(ctx, cmd).await {
                     Ok(_) => {}
@@ -111,12 +111,12 @@ pub(crate) mod inner {
         }
 
         async fn process_request_command(
-            &mut self,
-            ctx: &mut ConnectionHandlerContext,
+            &self,
+            ctx: &ConnectionHandlerContext,
             mut cmd: RemotingCommand,
         ) -> RocketMQResult<()> {
             let opaque = cmd.opaque();
-            let reject_request = self.request_processor.reject_request(cmd.code());
+            let reject_request = self.request_processor.lock().await.reject_request(cmd.code());
             const REJECT_REQUEST_MSG: &str = "[REJECT REQUEST]system busy, start flow control for a while";
             if reject_request.0 {
                 let response = if let Some(response) = reject_request.1 {
@@ -144,6 +144,8 @@ pub(crate) mod inner {
                 let ctx = ctx.clone();
                 let result = self
                     .request_processor
+                    .lock()
+                    .await
                     .process_request(channel, ctx, &mut cmd)
                     .await
                     .unwrap_or_else(|_err| {
@@ -180,7 +182,7 @@ pub(crate) mod inner {
             Ok(())
         }
 
-        fn process_response_command(&mut self, ctx: &mut ConnectionHandlerContext, cmd: RemotingCommand) {
+        fn process_response_command(&self, ctx: &ConnectionHandlerContext, cmd: RemotingCommand) {
             if let Some(future) = self
                 .pending_responses
                 .take(ctx.connection_ref().connection_id().as_str(), cmd.opaque())
@@ -208,7 +210,7 @@ pub(crate) mod inner {
             response: Option<&mut RemotingCommand>,
         ) -> rocketmq_error::RocketMQResult<()> {
             if let Some(response) = response {
-                for hook in self.rpc_hooks.iter() {
+                for hook in self.hooks_snapshot() {
                     hook.do_after_response(channel.remote_address(), request, response)?;
                 }
             }
@@ -221,19 +223,23 @@ pub(crate) mod inner {
             request: Option<&mut RemotingCommand>,
         ) -> rocketmq_error::RocketMQResult<()> {
             if let Some(request) = request {
-                for hook in self.rpc_hooks.iter() {
+                for hook in self.hooks_snapshot() {
                     hook.do_before_request(channel.remote_address(), request)?;
                 }
             }
             Ok(())
         }
 
-        pub fn register_rpc_hook(&mut self, hook: Arc<dyn RPCHook>) {
-            self.rpc_hooks.push(hook);
+        fn hooks_snapshot(&self) -> Vec<Arc<dyn RPCHook>> {
+            self.rpc_hooks.read().expect("RPC hook lock poisoned").clone()
+        }
+
+        pub fn register_rpc_hook(&self, hook: Arc<dyn RPCHook>) {
+            self.rpc_hooks.write().expect("RPC hook lock poisoned").push(hook);
         }
     }
     async fn handle_error(
-        ctx: &mut ConnectionHandlerContext,
+        ctx: &ConnectionHandlerContext,
         oneway_rpc: bool,
         opaque: i32,
         exception: Option<RocketMQError>,
@@ -292,5 +298,95 @@ pub(crate) mod inner {
     enum HandleErrorResult {
         ReturnMethod,
         GoHead,
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::connection::Connection;
+        use crate::net::channel::ChannelInner;
+        use crate::runtime::connection_handler_context::ConnectionHandlerContextWrapper;
+        use bytes::Bytes;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use tokio::net::TcpListener;
+
+        struct Processor {
+            active: Arc<AtomicUsize>,
+            completed: usize,
+        }
+        impl RequestProcessor for Processor {
+            async fn process_request(
+                &mut self,
+                _: Channel,
+                _: ConnectionHandlerContext,
+                _: &mut RemotingCommand,
+            ) -> RocketMQResult<Option<RemotingCommand>> {
+                assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
+                tokio::task::yield_now().await;
+                self.completed += 1;
+                assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
+                Ok(None)
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_connections_serialize_mutable_processor_access() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (socket, peer) = tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+            let socket = socket.unwrap();
+            let local = socket.local_addr().unwrap();
+            let _peer = peer.unwrap().0;
+            let pending = PendingResponses::with_capacity(1);
+            let channel = Channel::new(
+                Arc::new(ChannelInner::new(Connection::new(socket), pending.clone())),
+                local,
+                address,
+            );
+            let ctx = Arc::new(ConnectionHandlerContextWrapper::new(channel.clone()));
+            let handler = Arc::new(RemotingGeneralHandler {
+                request_processor: tokio::sync::Mutex::new(Processor {
+                    active: Arc::new(AtomicUsize::new(0)),
+                    completed: 0,
+                }),
+                rpc_hooks: std::sync::RwLock::new(vec![]),
+                pending_responses: pending,
+            });
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..64 {
+                let handler = handler.clone();
+                let ctx = ctx.clone();
+                tasks.spawn(async move {
+                    handler
+                        .process_message_received(&ctx, RemotingCommand::new_request(1, Bytes::new()))
+                        .await;
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            let processor = handler.request_processor.lock().await;
+            assert_eq!(processor.completed, 64);
+            // A long broker request must not block response correlation on
+            // another connection using the same shared handler.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _registration = handler
+                .pending_responses
+                .register(
+                    channel.connection_ref().connection_id().as_str(),
+                    crate::base::response_future::ResponseFuture::new(17, 1000, true, tx),
+                )
+                .map_err(|_| ())
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                handler.process_message_received(&ctx, RemotingCommand::create_response_command().set_opaque(17)),
+            )
+            .await
+            .expect("responses must bypass the processor lock");
+            assert_eq!(rx.await.unwrap().unwrap().opaque(), 17);
+            drop(processor);
+            channel.shutdown();
+        }
     }
 }

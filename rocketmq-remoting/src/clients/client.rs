@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use rocketmq_error::RocketMQResult;
-use rocketmq_rust::ArcMut;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::broadcast;
 
 use crate::base::connection_net_event::ConnectionNetEvent;
 use crate::base::response_future::ResponseFuture;
@@ -27,29 +28,43 @@ use crate::net::channel::Channel;
 use crate::net::channel::ChannelInner;
 use crate::protocol::remoting_command::RemotingCommand;
 use crate::remoting::inner::RemotingGeneralHandler;
-use crate::remoting_server::rocketmq_tokio_server::Shutdown;
 use crate::runtime::connection_handler_context::ConnectionHandlerContext;
 use crate::runtime::connection_handler_context::ConnectionHandlerContextWrapper;
 use crate::runtime::processor::RequestProcessor;
 
 #[derive(Clone)]
 pub struct Client<PR> {
-    /// The TCP connection decorated with the rocketmq remoting protocol encoder / decoder
-    /// implemented using a buffered `TcpStream`.
-    ///
-    /// When `Listener` receives an inbound connection, the `TcpStream` is
-    /// passed to `Connection::new`, which initializes the associated buffers.
-    /// `Connection` allows the handler to operate at the "frame" level and keep
-    /// the byte level protocol parsing details encapsulated in `Connection`.
-    //connection: Connection,
-    inner: ArcMut<ClientInner<PR>>,
-    notify_shutdown: broadcast::Sender<()>,
+    channel: Channel,
+    // Only callers own this handle; the receive task must not own it.
+    tasks: Arc<ClientTasks>,
+    processor: PhantomData<fn() -> PR>,
+}
+
+struct ClientTasks {
+    channel: Channel,
+    receive: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for ClientTasks {
+    fn drop(&mut self) {
+        self.channel.shutdown();
+        if let Some(task) = self.receive.get_mut().expect("receive task lock poisoned").take() {
+            task.abort();
+        }
+    }
 }
 
 struct ClientInner<PR> {
-    cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
+    cmd_handler: Arc<RemotingGeneralHandler<PR>>,
     ctx: ConnectionHandlerContext,
-    shutdown: Shutdown,
+}
+
+impl<PR> Drop for ClientInner<PR> {
+    fn drop(&mut self) {
+        // Also close the sender and waiters when the receive task is cancelled
+        // or a request processor panics.
+        self.ctx.channel().shutdown();
+    }
 }
 
 impl<PR> ClientInner<PR> {
@@ -66,10 +81,9 @@ where
 {
     pub async fn connect<T>(
         addr: T,
-        cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
+        cmd_handler: Arc<RemotingGeneralHandler<PR>>,
         tx: Option<&tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
-        notify: broadcast::Receiver<()>,
-    ) -> RocketMQResult<ArcMut<ClientInner<PR>>>
+    ) -> RocketMQResult<(Channel, tokio::task::JoinHandle<()>)>
     where
         T: tokio::net::ToSocketAddrs,
     {
@@ -81,41 +95,27 @@ where
         let local_addr = stream.local_addr()?;
         let remote_address = stream.peer_addr()?;
         let connection = Connection::new(stream);
-        let channel_inner = ArcMut::new(ChannelInner::new(connection, cmd_handler.pending_responses.clone()));
+        let channel_inner = Arc::new(ChannelInner::new(connection, cmd_handler.pending_responses.clone()));
         let channel = Channel::new(channel_inner, local_addr, remote_address);
-        let client = ClientInner {
+        let mut receiver = ClientInner {
             cmd_handler,
-            ctx: ArcMut::new(ConnectionHandlerContextWrapper::new(
-                //connection,
-                channel,
-            )),
-            shutdown: Shutdown::new(notify),
+            ctx: Arc::new(ConnectionHandlerContextWrapper::new(channel.clone())),
         };
-        let client_inner = ArcMut::new(client);
-        let mut client_ = client_inner.clone();
-        tokio::spawn(async move {
+        let receive = tokio::spawn(async move {
             let _task = crate::metrics::recv_task_started();
-            let _ = client_.run_recv().await;
+            let _ = receiver.run_recv().await;
         });
-
         if let Some(tx) = tx {
-            let _ = tx.send(ConnectionNetEvent::CONNECTED(client_inner.ctx.channel.remote_address()));
+            let _ = tx.send(ConnectionNetEvent::CONNECTED(remote_address));
         }
-        Ok(client_inner)
+        Ok((channel, receive))
     }
 
     async fn run_recv(&mut self) -> RocketMQResult<()> {
         loop {
             //Get the next frame from the connection.
             let channel = self.ctx.channel();
-            let frame = tokio::select! {
-                res = channel.receive_command() => res,
-                _ = self.shutdown.recv() => {
-                    channel.shutdown();
-                    self.fail_pending("client shutdown");
-                    return Ok(());
-                }
-            };
+            let frame = channel.receive_command().await;
             let cmd = match frame {
                 Some(Ok(cmd)) => cmd,
                 Some(Err(error)) => {
@@ -130,7 +130,7 @@ where
                 }
             };
             //process request and response
-            self.cmd_handler.process_message_received(&mut self.ctx, cmd).await;
+            self.cmd_handler.process_message_received(&self.ctx, cmd).await;
         }
     }
 }
@@ -150,16 +150,21 @@ where
     /// A new `Client` instance wrapped in a `Result`. Returns an error if the connection fails.
     pub(crate) async fn connect<T>(
         addr: T,
-        cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
+        cmd_handler: Arc<RemotingGeneralHandler<PR>>,
         tx: Option<&tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
     ) -> RocketMQResult<Client<PR>>
     where
         T: tokio::net::ToSocketAddrs,
     {
-        let (notify_shutdown, _) = broadcast::channel(1);
-        let receiver = notify_shutdown.subscribe();
-        let inner = ClientInner::connect(addr, cmd_handler, tx, receiver).await?;
-        Ok(Client { inner, notify_shutdown })
+        let (channel, receive) = ClientInner::connect(addr, cmd_handler, tx).await?;
+        Ok(Client {
+            tasks: Arc::new(ClientTasks {
+                channel: channel.clone(),
+                receive: Mutex::new(Some(receive)),
+            }),
+            channel,
+            processor: PhantomData,
+        })
     }
 
     /// Invokes a remote operation with the given `RemotingCommand`.
@@ -180,19 +185,17 @@ where
         let (tx, rx) = tokio::sync::oneshot::channel::<RocketMQResult<RemotingCommand>>();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
         let registration = self
-            .inner
-            .cmd_handler
+            .channel
+            .channel_inner()
             .pending_responses
             .register(
-                self.inner.ctx.connection_ref().connection_id().as_str(),
+                self.channel.connection_ref().connection_id().as_str(),
                 ResponseFuture::new(request.opaque(), timeout_millis, true, tx),
             )
             .map_err(|_| remote_error("duplicate pending request"))?;
 
         let pending_request = registration.request();
         if let Err(err) = self
-            .inner
-            .ctx
             .channel
             .channel_inner()
             .send_command(request, Some(deadline), Some(pending_request))
@@ -241,14 +244,7 @@ where
     ///
     /// A `Result` indicating success or failure in sending the request.
     pub async fn send(&mut self, request: RemotingCommand) -> RocketMQResult<()> {
-        if let Err(err) = self
-            .inner
-            .ctx
-            .channel
-            .channel_inner()
-            .send_command(request, None, None)
-            .await
-        {
+        if let Err(err) = self.channel.channel_inner().send_command(request, None, None).await {
             return Err(remote_error(err.to_string()));
         }
         Ok(())
@@ -291,14 +287,7 @@ where
         // Send all commands individually through the channel
         // The underlying connection will buffer them efficiently
         for request in requests {
-            if let Err(err) = self
-                .inner
-                .ctx
-                .channel
-                .channel_inner()
-                .send_command(request, None, None)
-                .await
-            {
+            if let Err(err) = self.channel.channel_inner().send_command(request, None, None).await {
                 return Err(remote_error(err.to_string()));
             }
         }
@@ -346,19 +335,17 @@ where
         for request in requests {
             let (tx, rx) = tokio::sync::oneshot::channel::<RocketMQResult<RemotingCommand>>();
             let registration = self
-                .inner
-                .cmd_handler
+                .channel
+                .channel_inner()
                 .pending_responses
                 .register(
-                    self.inner.ctx.connection_ref().connection_id().as_str(),
+                    self.channel.connection_ref().connection_id().as_str(),
                     ResponseFuture::new(request.opaque(), timeout_millis, true, tx),
                 )
                 .map_err(|_| remote_error("duplicate pending request"))?;
             let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
             let pending_request = registration.request();
             if let Err(err) = self
-                .inner
-                .ctx
                 .channel
                 .channel_inner()
                 .send_command(request, Some(deadline), Some(pending_request))
@@ -416,13 +403,65 @@ where
         unimplemented!("read unimplemented")
     }
 
+    pub(crate) fn close(&self) {
+        self.channel.shutdown();
+        if let Some(task) = self.tasks.receive.lock().expect("receive task lock poisoned").take() {
+            task.abort();
+        }
+    }
+
     pub fn connection(&self) -> &Connection {
-        self.inner.ctx.connection_ref()
+        self.channel.connection_ref()
     }
 
     #[allow(deprecated)]
     #[deprecated(note = "use the channel-owned send and receive methods")]
-    pub fn connection_mut(&mut self) -> &mut Connection {
-        self.inner.ctx.connection_mut()
+    pub fn connection_mut(&self) -> &Connection {
+        self.channel.connection_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::pending_responses::PendingResponses;
+    use crate::request_processor::default_request_processor::DefaultRemotingRequestProcessor;
+    use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_client_drop_releases_receive_task_and_pending_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..16 {
+            let handler = Arc::new(RemotingGeneralHandler {
+                request_processor: tokio::sync::Mutex::new(DefaultRemotingRequestProcessor),
+                rpc_hooks: std::sync::RwLock::new(vec![]),
+                pending_responses: PendingResponses::with_capacity(1),
+            });
+            let (client, peer) = tokio::join!(
+                Client::connect(listener.local_addr().unwrap(), handler.clone(), None),
+                listener.accept()
+            );
+            let client = client.unwrap();
+            let _peer = peer.unwrap().0;
+            let receiver = client.tasks.receive.lock().unwrap().take().unwrap();
+            let owner = Arc::downgrade(&client.tasks);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _registration = handler
+                .pending_responses
+                .register(
+                    client.connection().connection_id().as_str(),
+                    ResponseFuture::new(42, 1000, true, tx),
+                )
+                .map_err(|_| ())
+                .unwrap();
+            drop(client);
+            assert!(owner.upgrade().is_none());
+            tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(rx.await.unwrap().is_err());
+            assert!(handler.pending_responses.is_empty());
+        }
     }
 }

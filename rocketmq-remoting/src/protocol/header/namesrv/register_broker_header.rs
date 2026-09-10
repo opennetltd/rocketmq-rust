@@ -82,6 +82,7 @@ impl RegisterBrokerRequestHeader {
     /// # Returns
     ///
     /// A new `RegisterBrokerRequestHeader` instance.
+    #[allow(clippy::too_many_arguments)] // Preserve the upstream public constructor.
     pub fn new(
         broker_name: CheetahString,
         broker_addr: CheetahString,
@@ -115,6 +116,7 @@ pub struct RegisterBrokerResponseHeader {
 }
 
 impl RegisterBrokerResponseHeader {
+    #[allow(clippy::too_many_arguments)] // Preserve the upstream public constructor.
     pub fn new(ha_server_addr: Option<CheetahString>, master_addr: Option<CheetahString>) -> Self {
         RegisterBrokerResponseHeader {
             ha_server_addr,

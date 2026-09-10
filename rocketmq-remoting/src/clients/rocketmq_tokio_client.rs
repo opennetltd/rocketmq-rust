@@ -180,7 +180,7 @@ pub struct RocketmqDefaultClient<PR = DefaultRemotingRequestProcessor> {
     /// Shared command handler (processor + response table)
     ///
     /// Arc-wrapped to share across all `Client` instances
-    cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
+    cmd_handler: Arc<RemotingGeneralHandler<PR>>,
 
     /// Optional connection event broadcaster
     ///
@@ -198,9 +198,9 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         tx: Option<tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
     ) -> Self {
         let handler = RemotingGeneralHandler {
-            request_processor: processor,
+            request_processor: tokio::sync::Mutex::new(processor),
             //shutdown: (),
-            rpc_hooks: vec![],
+            rpc_hooks: std::sync::RwLock::new(vec![]),
             pending_responses: PendingResponses::with_capacity(512),
         };
         Self {
@@ -214,7 +214,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
             circuit_breakers: Arc::new(DashMap::with_capacity(64)),
             connection_pool: None, // Disabled by default, enable via enable_connection_pool()
             client_runtime: Some(RocketMQRuntime::new_multi(10, "client-thread")),
-            cmd_handler: ArcMut::new(handler),
+            cmd_handler: Arc::new(handler),
             tx,
         }
     }
@@ -488,6 +488,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
             }
             // Client unhealthy - remove it immediately (DashMap allows concurrent removal)
             drop(client_ref); // Release read guard before removal
+            client.close();
             self.connection_tables.remove(addr);
         }
 
@@ -520,21 +521,13 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
                 breaker.record_success();
                 self.circuit_breakers.insert(addr.clone(), breaker);
 
-                // Insert into connection pool (if enabled) ===
-                if let Some(ref pool) = self.connection_pool {
-                    if pool.insert(addr.clone(), new_client.clone()) {
-                        info!("Added connection to pool: {} (pool size: {})", addr, pool.stats().total);
-                    } else {
-                        warn!("Connection pool at capacity, falling back to DashMap");
-                    }
-                }
-
                 // Insert into DashMap (fallback or dual-store) ===
                 match self.connection_tables.entry(addr.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                         // Check if existing is still healthy
                         if entry.get().connection().is_healthy() {
                             info!("Race condition: {} already connected by another task", addr);
+                            new_client.close();
                             return Some(entry.get().clone());
                         }
                         // Replace unhealthy with new client
@@ -542,6 +535,16 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
                     }
                     dashmap::mapref::entry::Entry::Vacant(entry) => {
                         entry.insert(new_client.clone());
+                    }
+                }
+
+                // Only publish the selected connection; a losing connection is closed above.
+                // Insert into connection pool (if enabled) ===
+                if let Some(ref pool) = self.connection_pool {
+                    if pool.insert(addr.clone(), new_client.clone()) {
+                        info!("Added connection to pool: {} (pool size: {})", addr, pool.stats().total);
+                    } else {
+                        warn!("Connection pool at capacity, falling back to DashMap");
                     }
                 }
 
@@ -747,6 +750,9 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingService for Rocketmq
     }
 
     fn shutdown(&mut self) {
+        for client in self.connection_tables.iter() {
+            client.value().close();
+        }
         if let Some(rt) = self.client_runtime.take() {
             rt.shutdown();
         }

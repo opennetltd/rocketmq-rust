@@ -61,8 +61,9 @@ impl PopRequest {
         self.ctx.channel()
     }
 
-    pub fn get_channel_mut(&mut self) -> &mut Channel {
-        self.ctx.channel_mut()
+    #[deprecated(note = "use get_channel; shared context cannot be mutably borrowed")]
+    pub fn get_channel_mut(&self) -> &Channel {
+        self.ctx.channel()
     }
 
     pub fn get_ctx(&self) -> &ConnectionHandlerContext {

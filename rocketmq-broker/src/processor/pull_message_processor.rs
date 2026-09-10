@@ -1000,7 +1000,7 @@ where
         &self,
         mut pull_message_processor: ArcMut<PullMessageProcessor<MS>>,
         channel: Channel,
-        mut ctx: ConnectionHandlerContext,
+        ctx: ConnectionHandlerContext,
         mut request: RemotingCommand,
     ) {
         let lock = Arc::clone(&self.write_message_lock);

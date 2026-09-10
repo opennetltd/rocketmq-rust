@@ -202,6 +202,7 @@ impl ExtraInfoUtil {
     }
 
     /// Build extra info string with queue offset
+    #[allow(clippy::too_many_arguments)] // Existing upstream wire-format helper.
     pub fn build_extra_info_with_offset(
         ck_queue_offset: i64,
         pop_time: i64,
