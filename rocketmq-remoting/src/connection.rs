@@ -25,6 +25,7 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio::sync::Mutex;
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -94,17 +95,15 @@ pub enum ConnectionState {
 /// - **Broadcast state changes**: Using `watch` channel for reactive updates
 /// - **Fail-fast**: I/O errors immediately update state and return error
 /// - **Zero polling**: Subscribers notified automatically on state change
+struct Outbound {
+    sink: SplitSink<Framed<TcpStream, CompositeCodec>, Bytes>,
+    encode_buffer: BytesMut,
+}
+
 pub struct Connection {
     // === I/O Transport ===
-    /// Outbound message sink (sends encoded frames to peer)
-    ///
-    /// Handles outbound data flow with automatic framing
-    outbound_sink: SplitSink<Framed<TcpStream, CompositeCodec>, Bytes>,
-
-    /// Inbound message stream (receives decoded frames from peer)
-    ///
-    /// Handles inbound data flow with automatic frame decoding
-    inbound_stream: SplitStream<Framed<TcpStream, CompositeCodec>>,
+    outbound: Mutex<Outbound>,
+    inbound_stream: Mutex<SplitStream<Framed<TcpStream, CompositeCodec>>>,
 
     // === State Management (Tokio Watch Channel) ===
     /// Broadcast channel for connection state changes
@@ -125,13 +124,6 @@ pub struct Connection {
     ///
     /// Used for fast `state()` queries without creating new receivers
     state_rx: watch::Receiver<ConnectionState>,
-
-    // === Buffers ===
-    /// Reusable encoding buffer to avoid repeated allocations
-    ///
-    /// Used for staging `RemotingCommand` serialization before sending.
-    /// Split pattern automatically clears buffer after each send.
-    encode_buffer: BytesMut,
 
     // === Identification ===
     /// Unique identifier for this connection instance
@@ -155,6 +147,37 @@ impl PartialEq for Connection {
 impl Eq for Connection {}
 
 impl Connection {
+    async fn wait_closed(mut state: watch::Receiver<ConnectionState>) {
+        loop {
+            if *state.borrow() == ConnectionState::Closed {
+                return;
+            }
+            if state.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn send_outbound(&self, outbound: &mut Outbound, bytes: Bytes) -> rocketmq_error::RocketMQResult<()> {
+        if self.state() == ConnectionState::Closed {
+            return Err(rocketmq_error::RocketMQError::network_connection_failed(
+                "connection",
+                "connection closed",
+            ));
+        }
+        let result = tokio::select! {
+            result = outbound.sink.send(bytes) => result,
+            _ = Self::wait_closed(self.subscribe()) => Err(rocketmq_error::RocketMQError::network_connection_failed(
+                "connection",
+                "connection closed",
+            )),
+        };
+        if result.is_err() && self.state() != ConnectionState::Closed {
+            self.mark_degraded();
+        }
+        result
+    }
+
     /// Creates a new `Connection` instance with initial Healthy state.
     ///
     /// # Arguments
@@ -190,33 +213,15 @@ impl Connection {
         let (state_tx, state_rx) = watch::channel(ConnectionState::Healthy);
 
         Self {
-            outbound_sink,
-            inbound_stream,
+            outbound: Mutex::new(Outbound {
+                sink: outbound_sink,
+                encode_buffer: BytesMut::with_capacity(BUFFER_SIZE),
+            }),
+            inbound_stream: Mutex::new(inbound_stream),
             state_tx,
             state_rx,
-            encode_buffer: BytesMut::with_capacity(BUFFER_SIZE),
             connection_id: CheetahString::from_string(Uuid::new_v4().to_string()),
         }
-    }
-
-    /// Gets a reference to the inbound stream for receiving messages
-    ///
-    /// # Returns
-    ///
-    /// Immutable reference to the inbound message stream
-    #[inline]
-    pub fn inbound_stream(&self) -> &SplitStream<Framed<TcpStream, CompositeCodec>> {
-        &self.inbound_stream
-    }
-
-    /// Gets a reference to the outbound sink for sending messages
-    ///
-    /// # Returns
-    ///
-    /// Immutable reference to the outbound message sink
-    #[inline]
-    pub fn outbound_sink(&self) -> &SplitSink<Framed<TcpStream, CompositeCodec>, Bytes> {
-        &self.outbound_sink
     }
 
     /// Receives the next `RemotingCommand` from the peer.
@@ -240,8 +245,12 @@ impl Connection {
     /// }
     /// // Connection closed
     /// ```
-    pub async fn receive_command(&mut self) -> Option<rocketmq_error::RocketMQResult<RemotingCommand>> {
-        self.inbound_stream.next().await
+    pub async fn receive_command(&self) -> Option<rocketmq_error::RocketMQResult<RemotingCommand>> {
+        let mut inbound = self.inbound_stream.lock().await;
+        tokio::select! {
+            result = inbound.next() => result,
+            _ = Self::wait_closed(self.subscribe()) => None,
+        }
     }
 
     /// Sends a `RemotingCommand` to the peer (consumes command).
@@ -280,27 +289,17 @@ impl Connection {
     /// - Uses `split_to(len)` instead of `split()` for better performance
     /// - `split_to()` returns all data and leaves buffer empty, eliminating need for clear()
     /// - `freeze()` converts BytesMut to Bytes with zero-copy (just refcount increment)
-    pub async fn send_command(&mut self, mut command: RemotingCommand) -> rocketmq_error::RocketMQResult<()> {
-        // Encode command into buffer (buffer might have capacity from previous use)
-        command.fast_header_encode(&mut self.encode_buffer);
+    ///
+    /// Sends through the connection-owned outbound sink.
+    pub async fn send_command(&self, mut command: RemotingCommand) -> rocketmq_error::RocketMQResult<()> {
+        let mut outbound = self.outbound.lock().await;
+        command.fast_header_encode(&mut outbound.encode_buffer);
         if let Some(body_inner) = command.take_body() {
-            self.encode_buffer.put(body_inner);
+            outbound.encode_buffer.put(body_inner);
         }
-
-        // Zero-copy extraction: split_to(len) returns all data, leaves buffer empty
-        // This is more efficient than split() + clear() pattern
-        let len = self.encode_buffer.len();
-        let bytes = self.encode_buffer.split_to(len).freeze();
-
-        // Send and automatically handle state on error
-        match self.outbound_sink.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Tokio best practice: Mark degraded on I/O error
-                self.mark_degraded();
-                Err(e)
-            }
-        }
+        let len = outbound.encode_buffer.len();
+        let bytes = outbound.encode_buffer.split_to(len).freeze();
+        self.send_outbound(&mut outbound, bytes).await
     }
 
     /// Sends a `RemotingCommand` to the peer (borrows command).
@@ -322,25 +321,15 @@ impl Connection {
     ///
     /// This method may consume the command's body (`take_body()`), modifying
     /// the original command.
-    pub async fn send_command_ref(&mut self, command: &mut RemotingCommand) -> rocketmq_error::RocketMQResult<()> {
-        // Encode command into buffer
-        command.fast_header_encode(&mut self.encode_buffer);
+    pub async fn send_command_ref(&self, command: &mut RemotingCommand) -> rocketmq_error::RocketMQResult<()> {
+        let mut outbound = self.outbound.lock().await;
+        command.fast_header_encode(&mut outbound.encode_buffer);
         if let Some(body_inner) = command.take_body() {
-            self.encode_buffer.put(body_inner);
+            outbound.encode_buffer.put(body_inner);
         }
-
-        // Zero-copy extraction using split_to() pattern
-        let len = self.encode_buffer.len();
-        let bytes = self.encode_buffer.split_to(len).freeze();
-
-        // Send and automatically handle state on error
-        match self.outbound_sink.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.mark_degraded();
-                Err(e)
-            }
-        }
+        let len = outbound.encode_buffer.len();
+        let bytes = outbound.encode_buffer.split_to(len).freeze();
+        self.send_outbound(&mut outbound, bytes).await
     }
 
     /// Sends multiple `RemotingCommand`s in a single batch (optimized for throughput).
@@ -376,31 +365,21 @@ impl Connection {
     /// let batch = vec![cmd1, cmd2, cmd3];
     /// connection.send_batch(batch).await?;
     /// ```
-    pub async fn send_batch(&mut self, mut commands: Vec<RemotingCommand>) -> rocketmq_error::RocketMQResult<()> {
+    pub async fn send_batch(&self, mut commands: Vec<RemotingCommand>) -> rocketmq_error::RocketMQResult<()> {
         if commands.is_empty() {
             return Ok(());
         }
 
-        // Encode all commands into a single buffer
+        let mut outbound = self.outbound.lock().await;
         for command in &mut commands {
-            command.fast_header_encode(&mut self.encode_buffer);
+            command.fast_header_encode(&mut outbound.encode_buffer);
             if let Some(body_inner) = command.take_body() {
-                self.encode_buffer.put(body_inner);
+                outbound.encode_buffer.put(body_inner);
             }
         }
-
-        // Send entire batch as one Bytes chunk
-        let len = self.encode_buffer.len();
-        let bytes = self.encode_buffer.split_to(len).freeze();
-
-        // Send and automatically handle state on error
-        match self.outbound_sink.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.mark_degraded();
-                Err(e)
-            }
-        }
+        let len = outbound.encode_buffer.len();
+        let bytes = outbound.encode_buffer.split_to(len).freeze();
+        self.send_outbound(&mut outbound, bytes).await
     }
 
     /// Sends raw `Bytes` directly to the peer (zero-copy).
@@ -422,14 +401,9 @@ impl Connection {
     ///
     /// This is the most efficient send method as it avoids intermediate buffering
     /// and serialization overhead.
-    pub async fn send_bytes(&mut self, bytes: Bytes) -> rocketmq_error::RocketMQResult<()> {
-        match self.outbound_sink.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.mark_degraded();
-                Err(e)
-            }
-        }
+    pub async fn send_bytes(&self, bytes: Bytes) -> rocketmq_error::RocketMQResult<()> {
+        let mut outbound = self.outbound.lock().await;
+        self.send_outbound(&mut outbound, bytes).await
     }
 
     /// Sends a static byte slice to the peer (zero-copy).
@@ -453,15 +427,8 @@ impl Connection {
     /// const PING: &[u8] = b"PING\r\n";
     /// connection.send_slice(PING).await?;
     /// ```
-    pub async fn send_slice(&mut self, slice: &'static [u8]) -> rocketmq_error::RocketMQResult<()> {
-        let bytes = slice.into();
-        match self.outbound_sink.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.mark_degraded();
-                Err(e)
-            }
-        }
+    pub async fn send_slice(&self, slice: &'static [u8]) -> rocketmq_error::RocketMQResult<()> {
+        self.send_bytes(slice.into()).await
     }
 
     /// Gets the unique identifier for this connection.
@@ -594,12 +561,8 @@ impl Connection {
 
     /// Explicitly closes the connection and broadcasts Closed state.
     ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// connection.close();
-    /// assert_eq!(connection.state(), ConnectionState::Closed);
-    /// ```
+    /// In-flight I/O observes the Closed state and returns without requiring
+    /// mutable access to the public connection object.
     pub fn close(&self) {
         self.mark_closed();
     }

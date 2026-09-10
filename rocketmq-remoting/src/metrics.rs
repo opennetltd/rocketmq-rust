@@ -25,7 +25,13 @@ pub(crate) fn pending_registered() {
 }
 
 pub(crate) fn pending_removed() {
-    PENDING_RESPONSES.fetch_sub(1, Ordering::Relaxed);
+    let mut current = PENDING_RESPONSES.load(Ordering::Relaxed);
+    while current != 0 {
+        match PENDING_RESPONSES.compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(value) => current = value,
+        }
+    }
 }
 
 pub(crate) struct TaskGuard {

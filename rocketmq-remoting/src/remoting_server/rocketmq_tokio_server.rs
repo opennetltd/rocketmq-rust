@@ -128,22 +128,23 @@ impl<RP: RequestProcessor + Sync + 'static> ConnectionHandler<RP> {
     /// - Connection closed: graceful return Ok(())
     #[inline]
     async fn handle(&mut self) -> rocketmq_error::RocketMQResult<()> {
+        let _task = crate::metrics::recv_task_started();
         // Get idle timeout configuration from handler
         let idle_timeout = self.idle_timeout;
         let remote_addr = self.connection_handler_context.remote_address();
 
         // HOT PATH: Main server receive loop
         while !self.shutdown.is_shutdown {
-            let channel = self.connection_handler_context.channel_mut();
+            let channel = self.connection_handler_context.channel();
 
             let frame = tokio::select! {
                 // Branch 1: Receive next command from peer
-                res = channel.connection_mut().receive_command() => res,
+                res = channel.receive_command() => res,
 
                 // Branch 2: Shutdown signal received
                 _ = self.shutdown.recv() => {
                     // Mark connection as closed to prevent further sends
-                    channel.connection_mut().close();
+                    channel.shutdown();
                     return Ok(());
                 }
 
@@ -168,7 +169,7 @@ impl<RP: RequestProcessor + Sync + 'static> ConnectionHandler<RP> {
                     }
 
                     // Close connection due to idle timeout
-                    channel.connection_mut().close();
+                    channel.shutdown();
                     return Ok(());
                 }
             };
@@ -192,11 +193,12 @@ impl<RP: RequestProcessor + Sync + 'static> ConnectionHandler<RP> {
                         ));
                     }
 
-                    channel.connection_mut().close();
+                    channel.shutdown();
                     return Err(e);
                 }
                 None => {
                     // Peer closed connection gracefully
+                    channel.shutdown();
                     return Ok(());
                 }
             };
@@ -551,6 +553,7 @@ pub async fn run<RP: RequestProcessor + Sync + 'static + Clone>(
         notify_shutdown,
         ..
     } = listener;
+    let _ = notify_shutdown.send(());
     drop(notify_shutdown);
     drop(shutdown_complete_tx);
 

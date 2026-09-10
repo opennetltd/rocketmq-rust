@@ -17,8 +17,13 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use bytes::Bytes;
 use cheetah_string::CheetahString;
 // Use flume for high-performance async channel (40-60% faster than tokio::mpsc)
 // Lock-free design provides better throughput under high load
@@ -26,7 +31,7 @@ use flume::Receiver;
 use flume::Sender;
 use rocketmq_error::RocketMQError;
 use rocketmq_rust::ArcMut;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::error;
 use uuid::Uuid;
 
@@ -192,14 +197,9 @@ impl Channel {
 
     /// Gets mutable access to the underlying connection.
     ///
-    /// # Returns
-    ///
-    /// Mutable reference to the `Connection` for sending/receiving
-    ///
-    /// # Use Case
-    ///
-    /// Direct low-level I/O operations (receive_command, send_command)
-    #[inline]
+    /// Deprecated: internal remoting paths use the channel-owned I/O methods.
+    #[allow(deprecated)]
+    #[deprecated(note = "use Channel::send_command, send_bytes, or receive_command")]
     pub fn connection_mut(&mut self) -> &mut Connection {
         self.inner.connection.as_mut()
     }
@@ -212,6 +212,22 @@ impl Channel {
     #[inline]
     pub fn connection_ref(&self) -> &Connection {
         self.inner.connection_ref()
+    }
+
+    pub async fn send_command(&self, command: RemotingCommand) -> rocketmq_error::RocketMQResult<()> {
+        self.inner.send_command(command, None, None).await
+    }
+
+    pub async fn send_bytes(&self, bytes: Bytes) -> rocketmq_error::RocketMQResult<()> {
+        self.inner.send_bytes(bytes).await
+    }
+
+    pub(crate) async fn receive_command(&self) -> Option<rocketmq_error::RocketMQResult<RemotingCommand>> {
+        self.inner.receive_command().await
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.inner.shutdown();
     }
 
     // === Inner State Access ===
@@ -276,11 +292,14 @@ impl Display for Channel {
 /// Internal message type for the send queue.
 ///
 /// Encapsulates a command to send along with optional response tracking.
-type ChannelMessage = (
-    RemotingCommand,
-    Option<crate::base::pending_responses::PendingRequest>,
-    Option<u64>,
-);
+enum ChannelMessage {
+    Command(
+        RemotingCommand,
+        Option<crate::base::pending_responses::PendingRequest>,
+        Option<tokio::time::Instant>,
+    ),
+    Bytes(Bytes),
+}
 
 /// Shared state for a `Channel` - handles I/O, async message queueing, and response tracking.
 ///
@@ -315,10 +334,11 @@ pub struct ChannelInner {
     outbound_queue_tx: Sender<ChannelMessage>,
 
     // === I/O Transport ===
-    /// Underlying network connection (shared, mutable).
+    /// Underlying network connection shared by channel-owned transport tasks.
     ///
-    /// Wrapped in `ArcMut` to allow concurrent access by the send task
-    /// and potential direct access via `Channel::connection_mut()`.
+    /// `Connection` serializes all outbound operations and allows the reader and
+    /// writer to run independently. The deprecated mutable accessor is retained
+    /// only for source compatibility.
     pub(crate) connection: ArcMut<Connection>,
 
     // === Response Tracking ===
@@ -329,6 +349,10 @@ pub struct ChannelInner {
     /// - Receive task: Removes and completes entries when response arrives
     pub(crate) pending_responses: PendingResponses,
     connection_id: String,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    closed: Arc<AtomicBool>,
+    shutdown_started: AtomicBool,
+    send_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Background task that processes the outbound message queue.
@@ -356,24 +380,41 @@ pub struct ChannelInner {
 ///
 /// This would reduce per-message overhead and improve throughput by ~20-40%
 /// under high load, at the cost of slightly increased latency for small batches.
-pub(crate) async fn handle_send(
-    mut connection: ArcMut<Connection>,
+async fn handle_send(
+    connection: ArcMut<Connection>,
     rx: Receiver<ChannelMessage>,
     pending_responses: PendingResponses,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    closed: Arc<AtomicBool>,
 ) {
-    // Loop until channel is closed or connection fails
+    let _task = crate::metrics::send_task_started();
     loop {
-        // flume receiver is async-compatible: recv_async() awaits message
-        let msg = match rx.recv_async().await {
-            Ok(msg) => msg,
-            Err(_) => {
-                // Channel closed, exit gracefully
-                break;
-            }
+        let msg = tokio::select! {
+            msg = rx.recv_async() => match msg {
+                Ok(msg) => msg,
+                Err(_) => break,
+            },
+            _ = shutdown.recv() => break,
         };
 
-        let (send, pending_request, _timeout_millis) = msg;
-        let _opaque = send.opaque();
+        let (send, pending_request, deadline) = match msg {
+            ChannelMessage::Command(send, pending_request, deadline) => (send, pending_request, deadline),
+            ChannelMessage::Bytes(bytes) => {
+                let result = tokio::select! {
+                    result = connection.send_bytes(bytes) => result,
+                    _ = shutdown.recv() => return,
+                };
+                if let Err(error) = result {
+                    closed.store(true, Ordering::Release);
+                    connection.close();
+                    pending_responses.fail_connection(connection.connection_id().as_ref(), error.to_string());
+                    let _ = shutdown_tx.send(());
+                    return;
+                }
+                continue;
+            }
+        };
 
         if let Some(pending_request) = &pending_request {
             if !pending_request.is_registered() {
@@ -381,25 +422,52 @@ pub(crate) async fn handle_send(
             }
         }
 
-        // Send command via connection
-        match connection.send_command(send).await {
-            Ok(_) => {}
-            Err(error) => match error {
+        let result = match deadline {
+            Some(deadline) if deadline <= tokio::time::Instant::now() => {
+                if let Some(pending_request) = pending_request {
+                    pending_request.timeout(pending_request.timeout_millis());
+                }
+                continue;
+            }
+            Some(deadline) => tokio::select! {
+                result = tokio::time::timeout_at(deadline, connection.send_command(send)) => result,
+                _ = shutdown.recv() => return,
+            },
+            None => tokio::select! {
+                result = connection.send_command(send) => Ok(result),
+                _ = shutdown.recv() => return,
+            },
+        };
+
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => match error {
                 rocketmq_error::RocketMQError::IO(error) => {
-                    // I/O error means connection is broken
-                    // Connection state is automatically marked as degraded by send_command()
                     error!("send request failed: {}", error);
-                    pending_responses.fail_connection(&connection.connection_id().to_string(), error.to_string());
+                    closed.store(true, Ordering::Release);
+                    connection.close();
+                    pending_responses.fail_connection(connection.connection_id().as_ref(), error.to_string());
+                    let _ = shutdown_tx.send(());
                     return;
                 }
                 _ => {
-                    // Other errors: remove response future but continue
                     if let Some(pending_request) = pending_request {
                         pending_request.fail(error.to_string());
                     }
                 }
             },
-        };
+            Err(_) => {
+                if let Some(pending_request) = pending_request {
+                    pending_request.timeout(pending_request.timeout_millis());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ChannelInner {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -435,10 +503,15 @@ impl ChannelInner {
         let (outbound_queue_tx, outbound_queue_rx) = flume::bounded(QUEUE_CAPACITY);
 
         let connection = ArcMut::new(connection);
-        tokio::spawn(handle_send(
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let closed = Arc::new(AtomicBool::new(false));
+        let send_task = tokio::spawn(handle_send(
             connection.clone(),
             outbound_queue_rx,
             pending_responses.clone(),
+            shutdown_rx,
+            shutdown.clone(),
+            closed.clone(),
         ));
         let connection_id = connection.connection_id().to_string();
         Self {
@@ -446,6 +519,10 @@ impl ChannelInner {
             connection,
             connection_id,
             pending_responses,
+            shutdown,
+            closed,
+            shutdown_started: AtomicBool::new(false),
+            send_task: Mutex::new(Some(send_task)),
         }
     }
 }
@@ -475,12 +552,85 @@ impl ChannelInner {
 
     /// Gets a mutable reference to the connection.
     ///
-    /// # Returns
-    ///
-    /// Mutable reference to the underlying `Connection`
-    #[inline]
+    /// Deprecated: internal remoting paths use the channel-owned I/O methods.
+    #[allow(deprecated)]
+    #[deprecated(note = "use the channel-owned send and receive methods")]
     pub fn connection_mut(&mut self) -> &mut Connection {
         self.connection.as_mut()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.closed.store(true, Ordering::Release);
+        let _ = self.shutdown.send(());
+        self.connection.close();
+        self.pending_responses
+            .fail_connection(&self.connection_id, "connection closed");
+        if let Some(task) = self.send_task.lock().expect("send task lock poisoned").take() {
+            task.abort();
+        }
+    }
+
+    async fn receive_command(&self) -> Option<rocketmq_error::RocketMQResult<RemotingCommand>> {
+        self.connection.clone().receive_command().await
+    }
+
+    async fn enqueue(
+        &self,
+        message: ChannelMessage,
+        deadline: Option<tokio::time::Instant>,
+    ) -> rocketmq_error::RocketMQResult<()> {
+        if self.closed.load(Ordering::Acquire) || !self.connection.is_healthy() {
+            return Err(RocketMQError::network_connection_failed("channel", "connection closed"));
+        }
+        let timeout_millis = match &message {
+            ChannelMessage::Command(_, Some(pending_request), _) => Some(pending_request.timeout_millis()),
+            _ => None,
+        };
+        let mut shutdown = self.shutdown.subscribe();
+        let result = match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    result = timeout_at(deadline, self.outbound_queue_tx.send_async(message)) => match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return Err(RocketMQError::Timeout {
+                                operation: "send_queue",
+                                timeout_ms: timeout_millis.unwrap_or(0),
+                            })
+                        }
+                    },
+                    _ = shutdown.recv() => {
+                        return Err(RocketMQError::network_connection_failed("channel", "connection closed"));
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    result = self.outbound_queue_tx.send_async(message) => result,
+                    _ = shutdown.recv() => {
+                        return Err(RocketMQError::network_connection_failed("channel", "connection closed"));
+                    }
+                }
+            }
+        };
+        result.map_err(|err| RocketMQError::network_connection_failed("channel", format!("send failed: {err}")))
+    }
+
+    pub(crate) async fn send_command(
+        &self,
+        request: RemotingCommand,
+        deadline: Option<tokio::time::Instant>,
+        pending_request: Option<crate::base::pending_responses::PendingRequest>,
+    ) -> rocketmq_error::RocketMQResult<()> {
+        self.enqueue(ChannelMessage::Command(request, pending_request, deadline), deadline)
+            .await
+    }
+
+    pub(crate) async fn send_bytes(&self, bytes: Bytes) -> rocketmq_error::RocketMQResult<()> {
+        self.enqueue(ChannelMessage::Bytes(bytes), None).await
     }
 
     // === High-Level Send Methods ===
@@ -522,6 +672,7 @@ impl ChannelInner {
     ) -> rocketmq_error::RocketMQResult<RemotingCommand> {
         let (response_tx, response_rx) =
             tokio::sync::oneshot::channel::<rocketmq_error::RocketMQResult<RemotingCommand>>();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
         let opaque = request.opaque();
         let registration = self
             .pending_responses
@@ -534,19 +685,18 @@ impl ChannelInner {
         // Enqueue request with response tracking
         // flume sender: use send_async() for async context
         if let Err(err) = self
-            .outbound_queue_tx
-            .send_async((request, Some(registration.request()), Some(timeout_millis)))
+            .enqueue(
+                ChannelMessage::Command(request, Some(registration.request()), Some(deadline)),
+                Some(deadline),
+            )
             .await
         {
             drop(registration);
-            return Err(RocketMQError::network_connection_failed(
-                "channel",
-                format!("send failed: {}", err),
-            ));
+            return Err(err);
         }
 
         // Wait for response with timeout
-        match timeout(Duration::from_millis(timeout_millis), response_rx).await {
+        match timeout_at(deadline, response_rx).await {
             Ok(result) => match result {
                 Ok(response) => response,
                 Err(e) => {
@@ -560,6 +710,7 @@ impl ChannelInner {
             },
             Err(_) => {
                 // Timeout expired
+                registration.timeout(timeout_millis);
                 drop(registration);
                 Err(RocketMQError::Timeout {
                     operation: "channel_recv",
@@ -593,11 +744,11 @@ impl ChannelInner {
         timeout_millis: u64,
     ) -> rocketmq_error::RocketMQResult<()> {
         let request = request.mark_oneway_rpc();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
 
         // flume sender: use send_async() for async context
         if let Err(err) = self
-            .outbound_queue_tx
-            .send_async((request, None, Some(timeout_millis)))
+            .enqueue(ChannelMessage::Command(request, None, Some(deadline)), Some(deadline))
             .await
         {
             error!("send oneway request failed: {}", err);
@@ -629,7 +780,11 @@ impl ChannelInner {
         timeout_millis: Option<u64>,
     ) -> rocketmq_error::RocketMQResult<()> {
         // flume sender: use send_async() for async context
-        if let Err(err) = self.outbound_queue_tx.send_async((request, None, timeout_millis)).await {
+        let deadline = timeout_millis.map(|timeout| tokio::time::Instant::now() + Duration::from_millis(timeout));
+        if let Err(err) = self
+            .enqueue(ChannelMessage::Command(request, None, deadline), deadline)
+            .await
+        {
             error!("send request failed: {}", err);
             return Err(RocketMQError::network_connection_failed(
                 "channel",
@@ -661,5 +816,41 @@ impl ChannelInner {
     #[deprecated(since = "0.1.0", note = "Use `is_healthy()` instead")]
     pub fn is_ok(&self) -> bool {
         self.connection.is_healthy()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocketmq_error::RocketMQResult;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn timeout_and_close_leave_no_pending_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(address);
+        let (stream, _) = tokio::join!(client, listener.accept());
+        let mut channel = ChannelInner::new(Connection::new(stream.unwrap()), PendingResponses::with_capacity(1));
+
+        let request = RemotingCommand::new_request(1, Bytes::new());
+        let result = channel.send_wait_response(request, 10).await;
+        assert!(matches!(result, Err(RocketMQError::Timeout { .. })));
+        assert_eq!(channel.pending_responses.len(), 0);
+
+        let (tx, rx) = oneshot::channel::<RocketMQResult<RemotingCommand>>();
+        let registration = channel
+            .pending_responses
+            .register(&channel.connection_id, ResponseFuture::new(2, 1000, true, tx))
+            .map_err(|_| "duplicate pending response")
+            .unwrap();
+        channel.shutdown();
+        assert!(matches!(rx.await.unwrap(), Err(RocketMQError::Network(_))));
+        drop(registration);
+        assert_eq!(channel.pending_responses.len(), 0);
+        assert_eq!(channel.connection.state(), crate::connection::ConnectionState::Closed);
+        tokio::task::yield_now().await;
+        assert_eq!(crate::metrics::snapshot().send_tasks, 0);
     }
 }

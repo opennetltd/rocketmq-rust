@@ -127,10 +127,7 @@ pub(crate) mod inner {
                         REJECT_REQUEST_MSG,
                     )
                 };
-                ctx.channel
-                    .connection_mut()
-                    .send_command(response.set_opaque(opaque))
-                    .await?;
+                ctx.channel.send_command(response.set_opaque(opaque)).await?;
                 return Ok(());
             }
             let oneway_rpc = cmd.is_oneway_rpc();
@@ -167,11 +164,7 @@ pub(crate) mod inner {
                 return Ok(());
             }
             let response = response.unwrap();
-            let result = ctx
-                .channel_mut()
-                .connection_mut()
-                .send_command(response.set_opaque(opaque))
-                .await;
+            let result = ctx.channel.send_command(response.set_opaque(opaque)).await;
             match result {
                 Ok(_) => {}
                 Err(err) => match err {
@@ -254,7 +247,7 @@ pub(crate) mod inner {
                     }
                     let response = RemotingCommand::create_response_command_with_code_remark(code, message);
                     tokio::select! {
-                        result =ctx.connection_mut().send_command(response.set_opaque(opaque)) => match result{
+                        result =ctx.channel.send_command(response.set_opaque(opaque)) => match result{
                             Ok(_) =>{},
                             Err(err) => {
                                 match err {
@@ -275,7 +268,7 @@ pub(crate) mod inner {
                             exception_inner.to_string(),
                         );
                         tokio::select! {
-                            result =ctx.connection_mut().send_command(response.set_opaque(opaque)) => match result{
+                            result =ctx.channel.send_command(response.set_opaque(opaque)) => match result{
                                 Ok(_) =>{},
                                 Err(err) => {
                                     match err {

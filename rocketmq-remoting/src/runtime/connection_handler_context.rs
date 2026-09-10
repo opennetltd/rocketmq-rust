@@ -89,15 +89,8 @@ impl ConnectionHandlerContextWrapper {
         self.channel.connection_ref()
     }
 
-    /// Gets a mutable reference to the underlying connection.
-    ///
-    /// # Returns
-    ///
-    /// Mutable reference to the `Connection` for advanced I/O
-    ///
-    /// # Use Case
-    ///
-    /// Direct send/receive operations bypassing channel abstractions
+    #[allow(deprecated)]
+    #[deprecated(note = "use the channel-owned send and receive methods")]
     pub fn connection_mut(&mut self) -> &mut Connection {
         self.channel.connection_mut()
     }
@@ -128,7 +121,7 @@ impl ConnectionHandlerContextWrapper {
     /// }
     /// ```
     pub async fn write_response(&mut self, cmd: RemotingCommand) {
-        match self.channel.connection_mut().send_command(cmd).await {
+        match self.channel.send_command(cmd).await {
             Ok(_) => {}
             Err(error) => {
                 error!("failed to send response: {}", error);
@@ -154,7 +147,7 @@ impl ConnectionHandlerContextWrapper {
     ///
     /// The command's body may be consumed during sending (`take_body()`).
     pub async fn write_response_ref(&mut self, cmd: &mut RemotingCommand) {
-        match self.channel.connection_mut().send_command_ref(cmd).await {
+        match self.channel.send_command(cmd.clone()).await {
             Ok(_) => {}
             Err(error) => {
                 error!("failed to send response: {}", error);

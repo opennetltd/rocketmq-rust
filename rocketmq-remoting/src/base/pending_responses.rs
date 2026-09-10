@@ -48,6 +48,7 @@ pub struct PendingResponses {
 pub(crate) struct PendingIdentity {
     key: PendingKey,
     token: u64,
+    timeout_millis: u64,
 }
 
 pub(crate) struct PendingRegistration {
@@ -80,6 +81,7 @@ impl PendingResponses {
             connection_id: connection_id.to_owned(),
             opaque: future.opaque,
         };
+        let timeout_millis = future.timeout_millis;
         let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.inner.entries.lock().expect("pending response lock poisoned");
         if entries.contains_key(&key) {
@@ -89,7 +91,11 @@ impl PendingResponses {
         crate::metrics::pending_registered();
         Ok(PendingRegistration {
             table: self.clone(),
-            identity: PendingIdentity { key, token },
+            identity: PendingIdentity {
+                key,
+                token,
+                timeout_millis,
+            },
         })
     }
 
@@ -128,13 +134,27 @@ impl PendingResponses {
         })
     }
 
-    pub(crate) fn fail_identity(&self, identity: &PendingIdentity, message: impl Into<String>) {
+    fn finish_identity(&self, identity: &PendingIdentity, error: RocketMQError) {
         if let Some(future) = self.remove_if_token_matches(identity) {
-            let _ = future.tx.send(Err(RocketMQError::network_connection_failed(
-                "remoting",
-                message.into(),
-            )));
+            let _ = future.tx.send(Err(error));
         }
+    }
+
+    pub(crate) fn fail_identity(&self, identity: &PendingIdentity, message: impl Into<String>) {
+        self.finish_identity(
+            identity,
+            RocketMQError::network_connection_failed("remoting", message.into()),
+        );
+    }
+
+    pub(crate) fn timeout_identity(&self, identity: &PendingIdentity, timeout_millis: u64) {
+        self.finish_identity(
+            identity,
+            RocketMQError::Timeout {
+                operation: "send_request",
+                timeout_ms: timeout_millis,
+            },
+        );
     }
 
     pub(crate) fn fail_connection(&self, connection_id: &str, message: impl Into<String>) {
@@ -167,6 +187,10 @@ impl PendingResponses {
         self.inner.entries.lock().expect("pending response lock poisoned").len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     #[cfg(test)]
     fn len_for_test(&self) -> usize {
         self.inner.entries.lock().expect("pending response lock poisoned").len()
@@ -174,6 +198,10 @@ impl PendingResponses {
 }
 
 impl PendingRegistration {
+    pub(crate) fn timeout(&self, timeout_millis: u64) {
+        self.table.timeout_identity(&self.identity, timeout_millis);
+    }
+
     pub(crate) fn request(&self) -> PendingRequest {
         PendingRequest {
             table: self.table.clone(),
@@ -183,12 +211,20 @@ impl PendingRegistration {
 }
 
 impl PendingRequest {
+    pub(crate) fn timeout_millis(&self) -> u64 {
+        self.identity.timeout_millis
+    }
+
     pub(crate) fn is_registered(&self) -> bool {
         self.table.is_registered(&self.identity)
     }
 
     pub(crate) fn fail(&self, message: impl Into<String>) {
         self.table.fail_identity(&self.identity, message);
+    }
+
+    pub(crate) fn timeout(&self, timeout_millis: u64) {
+        self.table.timeout_identity(&self.identity, timeout_millis);
     }
 }
 

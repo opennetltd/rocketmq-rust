@@ -16,14 +16,11 @@ use rocketmq_error::RocketMQResult;
 use rocketmq_rust::ArcMut;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::Receiver;
 
 use crate::base::connection_net_event::ConnectionNetEvent;
-use crate::base::pending_responses::PendingRequest;
 use crate::base::response_future::ResponseFuture;
 use crate::connection::Connection;
 // Import error helpers for convenient error creation
-use crate::error_helpers::connection_invalid;
 use crate::error_helpers::io_error;
 use crate::error_helpers::remote_error;
 use crate::net::channel::Channel;
@@ -47,10 +44,7 @@ pub struct Client<PR> {
     //connection: Connection,
     inner: ArcMut<ClientInner<PR>>,
     notify_shutdown: broadcast::Sender<()>,
-    tx: tokio::sync::mpsc::Sender<SendMessage>,
 }
-
-type SendMessage = (RemotingCommand, Option<u64>, Option<PendingRequest>);
 
 struct ClientInner<PR> {
     cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
@@ -75,7 +69,7 @@ where
         cmd_handler: ArcMut<RemotingGeneralHandler<PR>>,
         tx: Option<&tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
         notify: broadcast::Receiver<()>,
-    ) -> RocketMQResult<(tokio::sync::mpsc::Sender<SendMessage>, ArcMut<ClientInner<PR>>)>
+    ) -> RocketMQResult<ArcMut<ClientInner<PR>>>
     where
         T: tokio::net::ToSocketAddrs,
     {
@@ -89,7 +83,6 @@ where
         let connection = Connection::new(stream);
         let channel_inner = ArcMut::new(ChannelInner::new(connection, cmd_handler.pending_responses.clone()));
         let channel = Channel::new(channel_inner, local_addr, remote_address);
-        let (tx_, rx) = tokio::sync::mpsc::channel(1024);
         let client = ClientInner {
             cmd_handler,
             ctx: ArcMut::new(ConnectionHandlerContextWrapper::new(
@@ -104,27 +97,21 @@ where
             let _task = crate::metrics::recv_task_started();
             let _ = client_.run_recv().await;
         });
-        let mut client_ = client_inner.clone();
-        tokio::spawn(async move {
-            let _task = crate::metrics::send_task_started();
-            client_.run_send(rx).await;
-        });
 
         if let Some(tx) = tx {
             let _ = tx.send(ConnectionNetEvent::CONNECTED(client_inner.ctx.channel.remote_address()));
         }
-        Ok((tx_, client_inner))
+        Ok(client_inner)
     }
 
     async fn run_recv(&mut self) -> RocketMQResult<()> {
         loop {
             //Get the next frame from the connection.
-            let channel = self.ctx.channel_mut();
+            let channel = self.ctx.channel();
             let frame = tokio::select! {
-                res = channel.connection_mut().receive_command() => res,
-                _ = self.shutdown.recv() =>{
-                    //If a shutdown signal is received, mark connection as closed
-                    channel.connection_mut().close();
+                res = channel.receive_command() => res,
+                _ = self.shutdown.recv() => {
+                    channel.shutdown();
                     self.fail_pending("client shutdown");
                     return Ok(());
                 }
@@ -132,43 +119,18 @@ where
             let cmd = match frame {
                 Some(Ok(cmd)) => cmd,
                 Some(Err(error)) => {
+                    self.ctx.channel().shutdown();
                     self.fail_pending(error.to_string());
                     return Err(error);
                 }
                 None => {
+                    self.ctx.channel().shutdown();
                     self.fail_pending("connection closed");
                     return Ok(());
                 }
             };
             //process request and response
             self.cmd_handler.process_message_received(&mut self.ctx, cmd).await;
-        }
-    }
-
-    async fn run_send(&mut self, mut rx: Receiver<SendMessage>) {
-        while let Some((request, _timeout, registration)) = rx.recv().await {
-            let _ = self.send(request, registration).await;
-        }
-    }
-
-    pub async fn send(&mut self, request: RemotingCommand, registration: Option<PendingRequest>) -> RocketMQResult<()> {
-        if let Some(registration) = &registration {
-            if !registration.is_registered() {
-                return Err(remote_error("request cancelled before send"));
-            }
-        }
-        match self.ctx.connection_mut().send_command(request).await {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                if let Some(registration) = registration {
-                    registration.fail(error.to_string());
-                }
-                if matches!(error, rocketmq_error::RocketMQError::IO(_)) {
-                    self.fail_pending(error.to_string());
-                    return Err(connection_invalid(error.to_string()));
-                }
-                Err(error)
-            }
         }
     }
 }
@@ -196,12 +158,8 @@ where
     {
         let (notify_shutdown, _) = broadcast::channel(1);
         let receiver = notify_shutdown.subscribe();
-        let (tx, inner) = ClientInner::connect(addr, cmd_handler, tx, receiver).await?;
-        Ok(Client {
-            inner,
-            notify_shutdown,
-            tx,
-        })
+        let inner = ClientInner::connect(addr, cmd_handler, tx, receiver).await?;
+        Ok(Client { inner, notify_shutdown })
     }
 
     /// Invokes a remote operation with the given `RemotingCommand`.
@@ -220,33 +178,39 @@ where
         timeout_millis: u64,
     ) -> RocketMQResult<RemotingCommand> {
         let (tx, rx) = tokio::sync::oneshot::channel::<RocketMQResult<RemotingCommand>>();
-        let opaque = request.opaque();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
         let registration = self
             .inner
             .cmd_handler
             .pending_responses
             .register(
                 self.inner.ctx.connection_ref().connection_id().as_str(),
-                ResponseFuture::new(opaque, timeout_millis, true, tx),
+                ResponseFuture::new(request.opaque(), timeout_millis, true, tx),
             )
             .map_err(|_| remote_error("duplicate pending request"))?;
 
         let pending_request = registration.request();
         if let Err(err) = self
-            .tx
-            .send((request, Some(timeout_millis), Some(pending_request)))
+            .inner
+            .ctx
+            .channel
+            .channel_inner()
+            .send_command(request, Some(deadline), Some(pending_request))
             .await
         {
             drop(registration);
-            return Err(remote_error(err.to_string()));
+            return Err(err);
         }
-        let result = match tokio::time::timeout(Duration::from_millis(timeout_millis), rx).await {
+        let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => Err(remote_error(error.to_string())),
-            Err(_) => Err(rocketmq_error::RocketMQError::Timeout {
-                operation: "send_read",
-                timeout_ms: timeout_millis,
-            }),
+            Err(_) => {
+                registration.timeout(timeout_millis);
+                Err(rocketmq_error::RocketMQError::Timeout {
+                    operation: "send_read",
+                    timeout_ms: timeout_millis,
+                })
+            }
         };
         drop(registration);
         result
@@ -277,7 +241,14 @@ where
     ///
     /// A `Result` indicating success or failure in sending the request.
     pub async fn send(&mut self, request: RemotingCommand) -> RocketMQResult<()> {
-        if let Err(err) = self.tx.send((request, None, None)).await {
+        if let Err(err) = self
+            .inner
+            .ctx
+            .channel
+            .channel_inner()
+            .send_command(request, None, None)
+            .await
+        {
             return Err(remote_error(err.to_string()));
         }
         Ok(())
@@ -320,7 +291,14 @@ where
         // Send all commands individually through the channel
         // The underlying connection will buffer them efficiently
         for request in requests {
-            if let Err(err) = self.tx.send((request, None, None)).await {
+            if let Err(err) = self
+                .inner
+                .ctx
+                .channel
+                .channel_inner()
+                .send_command(request, None, None)
+                .await
+            {
                 return Err(remote_error(err.to_string()));
             }
         }
@@ -376,27 +354,34 @@ where
                     ResponseFuture::new(request.opaque(), timeout_millis, true, tx),
                 )
                 .map_err(|_| remote_error("duplicate pending request"))?;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_millis);
             let pending_request = registration.request();
             if let Err(err) = self
-                .tx
-                .send((request, Some(timeout_millis), Some(pending_request)))
+                .inner
+                .ctx
+                .channel
+                .channel_inner()
+                .send_command(request, Some(deadline), Some(pending_request))
                 .await
             {
                 drop(registration);
-                return Err(remote_error(err.to_string()));
+                return Err(err);
             }
-            receivers.push((rx, registration));
+            receivers.push((rx, registration, deadline));
         }
 
         let mut results = Vec::with_capacity(receivers.len());
-        for (rx, registration) in receivers {
-            let result = match tokio::time::timeout(Duration::from_millis(timeout_millis), rx).await {
+        for (rx, registration, deadline) in receivers {
+            let result = match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => Err(remote_error(error.to_string())),
-                Err(_) => Err(rocketmq_error::RocketMQError::Timeout {
-                    operation: "send_batch_read",
-                    timeout_ms: timeout_millis,
-                }),
+                Err(_) => {
+                    registration.timeout(timeout_millis);
+                    Err(rocketmq_error::RocketMQError::Timeout {
+                        operation: "send_batch_read",
+                        timeout_ms: timeout_millis,
+                    })
+                }
             };
             drop(registration);
             results.push(result);
@@ -435,6 +420,8 @@ where
         self.inner.ctx.connection_ref()
     }
 
+    #[allow(deprecated)]
+    #[deprecated(note = "use the channel-owned send and receive methods")]
     pub fn connection_mut(&mut self) -> &mut Connection {
         self.inner.ctx.connection_mut()
     }
