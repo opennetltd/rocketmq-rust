@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,6 +32,7 @@ use tracing::warn;
 
 use crate::base::channel_event_listener::ChannelEventListener;
 use crate::base::connection_net_event::ConnectionNetEvent;
+use crate::base::pending_responses::PendingResponses;
 use crate::base::tokio_event::TokioEvent;
 use crate::connection::Connection;
 use crate::net::channel::Channel;
@@ -353,7 +353,7 @@ impl<RP: RequestProcessor + Sync + 'static + Clone> ConnectionListener<RP> {
             // Create connection channel wrapper
             let channel_inner = ArcMut::new(ChannelInner::new(
                 Connection::new(socket),
-                self.cmd_handler.response_table.clone(),
+                self.cmd_handler.pending_responses.clone(),
             ));
             let channel = Channel::new(channel_inner, local_addr, remote_addr);
 
@@ -517,7 +517,7 @@ pub async fn run<RP: RequestProcessor + Sync + 'static + Clone>(
         request_processor,
         //shutdown: Shutdown::new(notify_shutdown.subscribe()),
         rpc_hooks,
-        response_table: ArcMut::new(HashMap::with_capacity(512)),
+        pending_responses: PendingResponses::with_capacity(512),
     };
     let mut listener = ConnectionListener {
         listener,

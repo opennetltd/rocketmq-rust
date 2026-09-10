@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -31,6 +30,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::base::connection_net_event::ConnectionNetEvent;
+use crate::base::pending_responses::PendingResponses;
 use crate::clients::connection_pool::ConnectionPool;
 use crate::clients::nameserver_selector::LatencyTracker;
 use crate::clients::reconnect::CircuitBreaker;
@@ -201,7 +201,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
             request_processor: processor,
             //shutdown: (),
             rpc_hooks: vec![],
-            response_table: ArcMut::new(HashMap::with_capacity(512)),
+            pending_responses: PendingResponses::with_capacity(512),
         };
         Self {
             tokio_client_config,

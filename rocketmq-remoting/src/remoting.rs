@@ -70,16 +70,14 @@ pub trait InvokeCallback {
 
 #[allow(unused_variables)]
 pub(crate) mod inner {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use rocketmq_error::RocketMQError;
     use rocketmq_error::RocketMQResult;
-    use rocketmq_rust::ArcMut;
     use tracing::error;
     use tracing::warn;
 
-    use crate::base::response_future::ResponseFuture;
+    use crate::base::pending_responses::PendingResponses;
     use crate::code::response_code::ResponseCode;
     use crate::net::channel::Channel;
     use crate::protocol::remoting_command::RemotingCommand;
@@ -91,7 +89,7 @@ pub(crate) mod inner {
     pub(crate) struct RemotingGeneralHandler<RP> {
         pub(crate) request_processor: RP,
         pub(crate) rpc_hooks: Vec<Arc<dyn RPCHook>>,
-        pub(crate) response_table: ArcMut<HashMap<i32, ResponseFuture>>,
+        pub(crate) pending_responses: PendingResponses,
     }
 
     impl<RP> RemotingGeneralHandler<RP>
@@ -190,7 +188,10 @@ pub(crate) mod inner {
         }
 
         fn process_response_command(&mut self, ctx: &mut ConnectionHandlerContext, cmd: RemotingCommand) {
-            if let Some(future) = self.response_table.remove(&cmd.opaque()) {
+            if let Some(future) = self
+                .pending_responses
+                .take(ctx.connection_ref().connection_id().as_str(), cmd.opaque())
+            {
                 match future.tx.send(Ok(cmd)) {
                     Ok(_) => {}
                     Err(e) => {

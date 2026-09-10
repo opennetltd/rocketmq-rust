@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -31,6 +30,7 @@ use tokio::time::timeout;
 use tracing::error;
 use uuid::Uuid;
 
+use crate::base::pending_responses::PendingResponses;
 use crate::base::response_future::ResponseFuture;
 use crate::connection::Connection;
 use crate::protocol::remoting_command::RemotingCommand;
@@ -277,9 +277,9 @@ impl Display for Channel {
 ///
 /// Encapsulates a command to send along with optional response tracking.
 type ChannelMessage = (
-    RemotingCommand,                                                                       /* command */
-    Option<tokio::sync::oneshot::Sender<rocketmq_error::RocketMQResult<RemotingCommand>>>, /* response_tx */
-    Option<u64>,                                                                           /* timeout_millis */
+    RemotingCommand,
+    Option<crate::base::pending_responses::PendingRequest>,
+    Option<u64>,
 );
 
 /// Shared state for a `Channel` - handles I/O, async message queueing, and response tracking.
@@ -294,7 +294,7 @@ type ChannelMessage = (
 /// ## Threading Model
 ///
 /// - **Send Task**: Dedicated task (`handle_send`) pulls from queue and writes to connection
-/// - **Response Tracking**: Shared map accessed by send task (insert) and receive task (remove)
+/// - **Response Tracking**: Shared owner accessed by send and receive tasks
 ///
 /// ## Lifecycle
 ///
@@ -322,15 +322,13 @@ pub struct ChannelInner {
     pub(crate) connection: ArcMut<Connection>,
 
     // === Response Tracking ===
-    /// Map of pending request opaque IDs to their response futures.
-    ///
-    /// - **Key**: Request opaque ID (unique per request)
-    /// - **Value**: `ResponseFuture` containing timeout and oneshot channel
+    /// Synchronized pending request owner keyed by connection and opaque ID.
     ///
     /// Shared between:
     /// - Send task: Inserts entries when request is sent
     /// - Receive task: Removes and completes entries when response arrives
-    pub(crate) response_table: ArcMut<HashMap<i32, ResponseFuture>>,
+    pub(crate) pending_responses: PendingResponses,
+    connection_id: String,
 }
 
 /// Background task that processes the outbound message queue.
@@ -361,7 +359,7 @@ pub struct ChannelInner {
 pub(crate) async fn handle_send(
     mut connection: ArcMut<Connection>,
     rx: Receiver<ChannelMessage>,
-    mut response_table: ArcMut<HashMap<i32, ResponseFuture>>,
+    pending_responses: PendingResponses,
 ) {
     // Loop until channel is closed or connection fails
     loop {
@@ -374,15 +372,13 @@ pub(crate) async fn handle_send(
             }
         };
 
-        let (send, tx, timeout_millis) = msg;
-        let opaque = send.opaque();
+        let (send, pending_request, _timeout_millis) = msg;
+        let _opaque = send.opaque();
 
-        // Register response future if this is a request-response operation
-        if let Some(tx) = tx {
-            response_table.insert(
-                opaque,
-                ResponseFuture::new(opaque, timeout_millis.unwrap_or(0), true, tx),
-            );
+        if let Some(pending_request) = &pending_request {
+            if !pending_request.is_registered() {
+                continue;
+            }
         }
 
         // Send command via connection
@@ -393,12 +389,14 @@ pub(crate) async fn handle_send(
                     // I/O error means connection is broken
                     // Connection state is automatically marked as degraded by send_command()
                     error!("send request failed: {}", error);
-                    response_table.remove(&opaque);
+                    pending_responses.fail_connection(&connection.connection_id().to_string(), error.to_string());
                     return;
                 }
                 _ => {
                     // Other errors: remove response future but continue
-                    response_table.remove(&opaque);
+                    if let Some(pending_request) = pending_request {
+                        pending_request.fail(error.to_string());
+                    }
                 }
             },
         };
@@ -411,7 +409,7 @@ impl ChannelInner {
     /// # Arguments
     ///
     /// * `connection` - The underlying TCP connection
-    /// * `response_table` - Shared response tracking map
+    /// * `pending_responses` - Shared synchronized response tracking
     ///
     /// # Returns
     ///
@@ -429,7 +427,7 @@ impl ChannelInner {
     /// - Lock-free operations for most cases
     /// - ~40-60% higher throughput than tokio::mpsc
     /// - Better performance under contention
-    pub fn new(connection: Connection, response_table: ArcMut<HashMap<i32, ResponseFuture>>) -> Self {
+    pub fn new(connection: Connection, pending_responses: PendingResponses) -> Self {
         const QUEUE_CAPACITY: usize = 1024;
 
         // Use flume bounded channel for better performance
@@ -440,12 +438,14 @@ impl ChannelInner {
         tokio::spawn(handle_send(
             connection.clone(),
             outbound_queue_rx,
-            response_table.clone(),
+            pending_responses.clone(),
         ));
+        let connection_id = connection.connection_id().to_string();
         Self {
             outbound_queue_tx,
             connection,
-            response_table,
+            connection_id,
+            pending_responses,
         }
     }
 }
@@ -523,14 +523,22 @@ impl ChannelInner {
         let (response_tx, response_rx) =
             tokio::sync::oneshot::channel::<rocketmq_error::RocketMQResult<RemotingCommand>>();
         let opaque = request.opaque();
+        let registration = self
+            .pending_responses
+            .register(
+                &self.connection_id,
+                ResponseFuture::new(opaque, timeout_millis, true, response_tx),
+            )
+            .map_err(|_| RocketMQError::network_connection_failed("channel", "duplicate pending request"))?;
 
         // Enqueue request with response tracking
         // flume sender: use send_async() for async context
         if let Err(err) = self
             .outbound_queue_tx
-            .send_async((request, Some(response_tx), Some(timeout_millis)))
+            .send_async((request, Some(registration.request()), Some(timeout_millis)))
             .await
         {
+            drop(registration);
             return Err(RocketMQError::network_connection_failed(
                 "channel",
                 format!("send failed: {}", err),
@@ -543,7 +551,7 @@ impl ChannelInner {
                 Ok(response) => response,
                 Err(e) => {
                     // Response channel closed without sending (connection dropped?)
-                    self.response_table.remove(&opaque);
+                    drop(registration);
                     Err(RocketMQError::network_connection_failed(
                         "channel",
                         format!("connection dropped: {}", e),
@@ -552,7 +560,7 @@ impl ChannelInner {
             },
             Err(_) => {
                 // Timeout expired
-                self.response_table.remove(&opaque);
+                drop(registration);
                 Err(RocketMQError::Timeout {
                     operation: "channel_recv",
                     timeout_ms: timeout_millis,
