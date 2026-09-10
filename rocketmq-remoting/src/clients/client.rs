@@ -101,10 +101,12 @@ where
         let client_inner = ArcMut::new(client);
         let mut client_ = client_inner.clone();
         tokio::spawn(async move {
+            let _task = crate::metrics::recv_task_started();
             let _ = client_.run_recv().await;
         });
         let mut client_ = client_inner.clone();
         tokio::spawn(async move {
+            let _task = crate::metrics::send_task_started();
             client_.run_send(rx).await;
         });
 

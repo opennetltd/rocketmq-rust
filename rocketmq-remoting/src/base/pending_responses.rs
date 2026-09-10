@@ -86,6 +86,7 @@ impl PendingResponses {
             return Err(future);
         }
         entries.insert(key.clone(), PendingEntry { token, future });
+        crate::metrics::pending_registered();
         Ok(PendingRegistration {
             table: self.clone(),
             identity: PendingIdentity { key, token },
@@ -110,7 +111,10 @@ impl PendingResponses {
                 connection_id: connection_id.to_owned(),
                 opaque,
             })
-            .map(|entry| entry.future)
+            .map(|entry| {
+                crate::metrics::pending_removed();
+                entry.future
+            })
     }
 
     pub(crate) fn remove_if_token_matches(&self, identity: &PendingIdentity) -> Option<ResponseFuture> {
@@ -118,7 +122,10 @@ impl PendingResponses {
         let matches = entries
             .get(&identity.key)
             .is_some_and(|entry| entry.token == identity.token);
-        matches.then(|| entries.remove(&identity.key).expect("pending entry disappeared").future)
+        matches.then(|| {
+            crate::metrics::pending_removed();
+            entries.remove(&identity.key).expect("pending entry disappeared").future
+        })
     }
 
     pub(crate) fn fail_identity(&self, identity: &PendingIdentity, message: impl Into<String>) {
@@ -139,7 +146,12 @@ impl PendingResponses {
                 .cloned()
                 .collect();
             keys.into_iter()
-                .filter_map(|key| pending.remove(&key).map(|entry| entry.future))
+                .filter_map(|key| {
+                    pending.remove(&key).map(|entry| {
+                        crate::metrics::pending_removed();
+                        entry.future
+                    })
+                })
                 .collect::<Vec<_>>()
         };
         let message = message.into();
@@ -151,8 +163,12 @@ impl PendingResponses {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.entries.lock().expect("pending response lock poisoned").len()
+    }
+
     #[cfg(test)]
-    fn len(&self) -> usize {
+    fn len_for_test(&self) -> usize {
         self.inner.entries.lock().expect("pending response lock poisoned").len()
     }
 }
@@ -206,7 +222,7 @@ mod tests {
         assert!(table.register("a", future(7).0).is_err());
         let registration_b = table.register("b", future(7).0).map_err(|_| ()).unwrap();
         assert!(table.remove_if_token_matches(&registration_a.identity).is_some());
-        assert_eq!(table.len(), 1);
+        assert_eq!(table.len_for_test(), 1);
         drop(registration_b);
     }
 
@@ -216,6 +232,6 @@ mod tests {
         let (future, _rx) = future(9);
         let _registration = table.register("a", future).map_err(|_| ()).unwrap();
         assert!(table.take("a", 9).is_some());
-        assert_eq!(table.len(), 0);
+        assert_eq!(table.len_for_test(), 0);
     }
 }

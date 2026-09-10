@@ -28,6 +28,7 @@ pub use crate::protocol::rocketmq_serializable;
 
 pub mod base;
 pub mod common;
+pub mod metrics;
 pub mod remoting;
 pub mod remoting_server;
 pub mod request_processor;
