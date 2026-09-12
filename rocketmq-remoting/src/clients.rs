@@ -49,7 +49,7 @@ pub trait RemotingClient: RemotingService {
     ///
     /// # Returns
     /// A vector containing the current list of name remoting_server addresses.
-    fn get_name_server_address_list(&self) -> &[CheetahString];
+    fn get_name_server_address_list(&self) -> Vec<CheetahString>;
 
     /// Retrieves a list of available name remoting_server addresses.
     ///

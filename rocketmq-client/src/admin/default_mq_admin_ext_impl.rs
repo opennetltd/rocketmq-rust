@@ -368,7 +368,6 @@ impl MQAdminExt for DefaultMQAdminExtImpl {
             .unwrap()
             .get_mq_client_api_impl()
             .get_name_server_address_list()
-            .to_vec()
     }
 
     async fn wipe_write_perm_of_broker(

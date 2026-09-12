@@ -270,4 +270,53 @@ mod tests {
         assert!(table.take("a", 9).is_some());
         assert_eq!(table.len_for_test(), 0);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_growth_response_and_connection_cleanup_are_race_safe() {
+        const CONNECTIONS: usize = 4;
+        const REQUESTS_PER_CONNECTION: usize = 1024;
+        let table = PendingResponses::with_capacity(1);
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONNECTIONS));
+        let mut workers = Vec::with_capacity(CONNECTIONS);
+
+        for connection in 0..CONNECTIONS {
+            let table = table.clone();
+            let barrier = barrier.clone();
+            workers.push(tokio::spawn(async move {
+                let connection_id = format!("connection-{connection}");
+                let mut registrations = Vec::with_capacity(REQUESTS_PER_CONNECTION);
+                let mut receivers = Vec::with_capacity(REQUESTS_PER_CONNECTION);
+                for offset in 0..REQUESTS_PER_CONNECTION {
+                    let opaque = (connection * REQUESTS_PER_CONNECTION + offset) as i32;
+                    let (request, receiver) = future(opaque);
+                    receivers.push(receiver);
+                    registrations.push(
+                        table
+                            .register(&connection_id, request)
+                            .unwrap_or_else(|_| panic!("unique opaque must register: {opaque}")),
+                    );
+                }
+                barrier.wait().await;
+
+                for offset in (0..REQUESTS_PER_CONNECTION).step_by(2) {
+                    let opaque = (connection * REQUESTS_PER_CONNECTION + offset) as i32;
+                    assert!(table.take(&connection_id, opaque).is_some());
+                }
+                table.fail_connection(&connection_id, "test disconnect");
+
+                for receiver in receivers {
+                    match receiver.await {
+                        Ok(Err(_)) | Err(_) => {}
+                        Ok(Ok(_)) => panic!("test disconnect must not produce a response"),
+                    }
+                }
+                drop(registrations);
+            }));
+        }
+
+        for worker in workers {
+            worker.await.expect("worker must not panic");
+        }
+        assert!(table.is_empty());
+    }
 }

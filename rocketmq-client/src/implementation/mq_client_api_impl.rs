@@ -158,7 +158,7 @@ impl MQClientAPIImpl {
         for name_srv_addr in name_server_address_list {
             let response = self
                 .remoting_client
-                .invoke_request(Some(name_srv_addr), request.clone(), timeout_millis)
+                .invoke_request(Some(&name_srv_addr), request.clone(), timeout_millis)
                 .await?;
             match ResponseCode::from(response.code()) {
                 ResponseCode::Success => {}
@@ -190,7 +190,7 @@ impl MQClientAPIImpl {
         for name_srv_addr in name_server_address_list {
             let response = self
                 .remoting_client
-                .invoke_request(Some(name_srv_addr), request.clone(), timeout_millis)
+                .invoke_request(Some(&name_srv_addr), request.clone(), timeout_millis)
                 .await?;
             match ResponseCode::from(response.code()) {
                 ResponseCode::Success => {}
@@ -221,10 +221,10 @@ impl MQClientAPIImpl {
             if !name_servers.is_empty() {
                 name_servers
             } else {
-                Vec::from(self.get_name_server_address_list())
+                self.get_name_server_address_list()
             }
         } else {
-            Vec::from(self.get_name_server_address_list())
+            self.get_name_server_address_list()
         };
         if invoke_name_servers.is_empty() {
             return Ok(());
@@ -468,7 +468,7 @@ impl MQClientAPIImpl {
         }
     }
 
-    pub fn get_name_server_address_list(&self) -> &[CheetahString] {
+    pub fn get_name_server_address_list(&self) -> Vec<CheetahString> {
         self.remoting_client.get_name_server_address_list()
     }
 
@@ -1999,7 +1999,7 @@ impl MQClientAPIImpl {
         // Determine which name servers to invoke
         let invoke_name_servers = match name_servers {
             Some(servers) if !servers.is_empty() => servers,
-            _ => self.remoting_client.get_name_server_address_list().to_vec(),
+            _ => self.remoting_client.get_name_server_address_list(),
         };
 
         if invoke_name_servers.is_empty() {

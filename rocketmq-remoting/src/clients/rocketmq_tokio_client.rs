@@ -13,15 +13,13 @@
 // limitations under the License.
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use cheetah_string::CheetahString;
 use dashmap::DashMap;
-use rand::Rng;
 use rocketmq_runtime::RocketMQRuntime;
-use rocketmq_rust::ArcMut;
 use rocketmq_rust::WeakArcMut;
 use tokio::time;
 use tracing::debug;
@@ -44,7 +42,12 @@ use crate::runtime::config::client_config::TokioClientConfig;
 use crate::runtime::processor::RequestProcessor;
 use crate::runtime::RPCHook;
 
-const LOCK_TIMEOUT_MILLIS: u64 = 3000;
+struct NameserverState {
+    addresses: Vec<CheetahString>,
+    selected: Option<CheetahString>,
+    available: HashSet<CheetahString>,
+    generation: u64,
+}
 
 /// High-performance async RocketMQ client with connection pooling and auto-reconnection.
 ///
@@ -135,22 +138,11 @@ pub struct RocketmqDefaultClient<PR = DefaultRemotingRequestProcessor> {
     /// List of all nameserver addresses (in priority order)
     ///
     /// Updated via `update_name_server_address_list()`
-    namesrv_addr_list: ArcMut<Vec<CheetahString>>,
-
-    /// Currently selected nameserver (cached for fast path)
+    /// Nameserver configuration, selection, availability, and scan generation.
     ///
-    /// May be `None` if no nameserver available or all unhealthy
-    namesrv_addr_choosed: ArcMut<Option<CheetahString>>,
-
-    /// Set of healthy/reachable nameservers
-    ///
-    /// Updated asynchronously by health check task (`scan_available_name_srv`)
-    available_namesrv_addr_set: ArcMut<HashSet<CheetahString>>,
-
-    /// Round-robin index for nameserver selection
-    ///
-    /// ⚠️ Deprecated: Use `latency_tracker` for smart selection
-    namesrv_index: Arc<AtomicI32>,
+    /// Callers hold this lock only for short snapshots or state updates; network
+    /// probes and connection creation happen after it is released.
+    nameserver: RwLock<NameserverState>,
 
     /// Latency tracker for smart nameserver selection
     ///
@@ -206,10 +198,12 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         Self {
             tokio_client_config,
             connection_tables: Arc::new(DashMap::with_capacity(64)),
-            namesrv_addr_list: ArcMut::new(Default::default()),
-            namesrv_addr_choosed: ArcMut::new(Default::default()),
-            available_namesrv_addr_set: ArcMut::new(Default::default()),
-            namesrv_index: Arc::new(AtomicI32::new(init_value_index())),
+            nameserver: RwLock::new(NameserverState {
+                addresses: Vec::new(),
+                selected: None,
+                available: HashSet::new(),
+                generation: 0,
+            }),
             latency_tracker: LatencyTracker::new(),
             circuit_breakers: Arc::new(DashMap::with_capacity(64)),
             connection_pool: None, // Disabled by default, enable via enable_connection_pool()
@@ -334,7 +328,12 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
     /// * `None` - No nameservers available or all unhealthy
     async fn get_and_create_nameserver_client(&self) -> Option<Client<PR>> {
         // Try cached nameserver ===
-        let cached_addr = self.namesrv_addr_choosed.as_ref().clone();
+        let cached_addr = self
+            .nameserver
+            .read()
+            .expect("nameserver state lock poisoned")
+            .selected
+            .clone();
 
         if let Some(ref addr) = cached_addr {
             // Quick lookup in connection pool (lock-free with DashMap)
@@ -348,7 +347,10 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         }
 
         // Smart nameserver selection ===
-        let addr_list = self.namesrv_addr_list.as_ref();
+        let (addr_list, generation) = {
+            let state = self.nameserver.read().expect("nameserver state lock poisoned");
+            (state.addresses.clone(), state.generation)
+        };
 
         if addr_list.is_empty() {
             warn!("No nameservers configured in namesrv_addr_list");
@@ -356,7 +358,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         }
 
         // Use latency tracker to select best nameserver
-        let selected_addr = self.latency_tracker.select_best(addr_list)?;
+        let selected_addr = self.latency_tracker.select_best(&addr_list)?;
 
         info!(
             "Selected nameserver: {} (P99: {:?}, errors: {})",
@@ -367,8 +369,14 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
             self.latency_tracker.get_error_count(selected_addr)
         );
 
-        // Update cached selection
-        self.namesrv_addr_choosed.mut_from_ref().replace(selected_addr.clone());
+        // Cache the selection only if the configuration did not change while selecting.
+        {
+            let mut state = self.nameserver.write().expect("nameserver state lock poisoned");
+            if state.generation != generation || !state.addresses.contains(&selected_addr) {
+                return None;
+            }
+            state.selected = Some(selected_addr.clone());
+        }
 
         //Create connection to selected nameserver ===
         self.create_client(
@@ -668,29 +676,19 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
     /// T+3s:  Next scan begins...
     /// ```
     async fn scan_available_name_srv(&self) {
-        let addr_list = self.namesrv_addr_list.as_ref();
+        let (addr_list, generation) = {
+            let state = self.nameserver.read().expect("nameserver state lock poisoned");
+            (state.addresses.clone(), state.generation)
+        };
 
         if addr_list.is_empty() {
             debug!("No nameservers configured, skipping availability scan");
             return;
         }
 
-        // Cleanup - Remove stale entries ===
-        // Collect addresses to remove (avoid holding borrow during mutation)
-        let stale_addrs: Vec<CheetahString> = self
-            .available_namesrv_addr_set
-            .as_ref()
-            .iter()
-            .filter(|addr| !addr_list.contains(addr))
-            .cloned()
-            .collect();
+        // Parallel probe all configured nameservers. Results are applied only if
+        // the configuration generation is still current.
 
-        for stale_addr in stale_addrs {
-            warn!("Removing stale nameserver from available set: {}", stale_addr);
-            self.available_namesrv_addr_set.mut_from_ref().remove(&stale_addr);
-        }
-
-        // Parallel probe all configured nameservers ===
         // Parallel probing reduces scan time from O(N * 50ms) to O(max(50ms))
         use futures::future::join_all;
 
@@ -709,28 +707,24 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         let results = join_all(probe_futures).await;
 
         // Update availability set based on probe results
+        let mut state = self.nameserver.write().expect("nameserver state lock poisoned");
+        if state.generation != generation {
+            return;
+        }
         for (namesrv_addr, is_available) in results {
             if is_available {
-                // Connection successful - mark as available
-                if self
-                    .available_namesrv_addr_set
-                    .mut_from_ref()
-                    .insert(namesrv_addr.clone())
-                {
+                if state.available.insert(namesrv_addr.clone()) {
                     info!("Nameserver {} is now available", namesrv_addr);
                 }
-            } else {
-                // Connection failed - mark as unavailable
-                if self.available_namesrv_addr_set.mut_from_ref().remove(&namesrv_addr) {
-                    warn!("Nameserver {} is now unavailable", namesrv_addr);
-                }
+            } else if state.available.remove(&namesrv_addr) {
+                warn!("Nameserver {} is now unavailable", namesrv_addr);
             }
         }
 
         debug!(
             "Availability scan complete: {}/{} nameservers available",
-            self.available_namesrv_addr_set.as_ref().len(),
-            addr_list.len()
+            state.available.len(),
+            state.addresses.len()
         );
     }
 }
@@ -758,8 +752,11 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingService for Rocketmq
         }
         // DashMap::clear() is already thread-safe, no need for async lock
         self.connection_tables.clear();
-        self.namesrv_addr_list.clear();
-        self.available_namesrv_addr_set.clear();
+        let mut state = self.nameserver.write().expect("nameserver state lock poisoned");
+        state.addresses.clear();
+        state.selected = None;
+        state.available.clear();
+        state.generation = state.generation.wrapping_add(1);
 
         info!(">>>>>>>>>>>>>>>RemotingClient shutdown success<<<<<<<<<<<<<<<<<");
     }
@@ -776,51 +773,52 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingService for Rocketmq
 #[allow(unused_variables)]
 impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingClient for RocketmqDefaultClient<PR> {
     async fn update_name_server_address_list(&self, addrs: Vec<CheetahString>) {
-        let old = self.namesrv_addr_list.mut_from_ref();
-        let mut update = false;
-
-        if !addrs.is_empty() {
-            if old.is_empty() || addrs.len() != old.len() {
-                update = true;
-            } else {
-                for addr in &addrs {
-                    if !old.contains(addr) {
-                        update = true;
-                        break;
-                    }
-                }
+        if addrs.is_empty() {
+            return;
+        }
+        let mut replacement = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if !replacement.contains(&addr) {
+                replacement.push(addr);
             }
+        }
+        let mut state = self.nameserver.write().expect("nameserver state lock poisoned");
+        let old = state.addresses.clone();
+        if old == replacement {
+            return;
+        }
 
-            if update {
-                // Shuffle the addresses
-                // Shuffle logic is not implemented here as it is not available in standard library
-                // You can implement it using various algorithms like Fisher-Yates shuffle
-
-                info!(
-                    "name remoting_server address updated. NEW : {:?} , OLD: {:?}",
-                    addrs, old
-                );
-                /* let mut rng = thread_rng();
-                addrs.shuffle(&mut rng);*/
-                self.namesrv_addr_list.mut_from_ref().extend(addrs.clone());
-
-                // should close the channel if choosed addr is not exist.
-                if let Some(namesrv_addr) = self.namesrv_addr_choosed.as_ref() {
-                    if !addrs.contains(namesrv_addr) {
-                        // DashMap allows direct removal without collecting
-                        self.connection_tables.remove(namesrv_addr);
-                    }
-                }
-            }
+        info!(
+            "name remoting_server address updated. NEW : {:?} , OLD: {:?}",
+            replacement, old
+        );
+        state.addresses = replacement.clone();
+        state.available.retain(|addr| replacement.contains(addr));
+        let removed_addresses: Vec<_> = old.iter().filter(|addr| !replacement.contains(addr)).cloned().collect();
+        state.selected.take_if(|addr| !replacement.contains(addr));
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        for addr in removed_addresses {
+            self.connection_tables.remove(&addr);
         }
     }
 
-    fn get_name_server_address_list(&self) -> &[CheetahString] {
-        self.namesrv_addr_list.as_ref()
+    fn get_name_server_address_list(&self) -> Vec<CheetahString> {
+        self.nameserver
+            .read()
+            .expect("nameserver state lock poisoned")
+            .addresses
+            .clone()
     }
 
     fn get_available_name_srv_list(&self) -> Vec<CheetahString> {
-        self.available_namesrv_addr_set.as_ref().clone().into_iter().collect()
+        self.nameserver
+            .read()
+            .expect("nameserver state lock poisoned")
+            .available
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Send request and wait for response with timeout.
@@ -882,7 +880,13 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingClient for RocketmqD
         let start = time::Instant::now();
 
         // Determine target address (for metrics recording)
-        let target_addr = addr.cloned().or_else(|| self.namesrv_addr_choosed.as_ref().clone());
+        let target_addr = addr.cloned().or_else(|| {
+            self.nameserver
+                .read()
+                .expect("nameserver state lock poisoned")
+                .selected
+                .clone()
+        });
 
         // === Get client connection ===
         let mut client = self.get_and_create_client(addr).await.ok_or_else(|| {
@@ -1012,7 +1016,41 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingClient for RocketmqD
     }
 }
 
-fn init_value_index() -> i32 {
-    let mut rng = rand::rng();
-    rng.random_range(0..999)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nameserver_updates_replace_and_invalidate_state() {
+        let mut client: RocketmqDefaultClient =
+            RocketmqDefaultClient::new(Arc::new(TokioClientConfig::default()), DefaultRemotingRequestProcessor);
+        let first = CheetahString::from("127.0.0.1:9876");
+        let second = CheetahString::from("127.0.0.1:9877");
+
+        client
+            .update_name_server_address_list(vec![first.clone(), first.clone()])
+            .await;
+        {
+            let mut state = client.nameserver.write().unwrap();
+            state.selected = Some(first.clone());
+            state.available.insert(first.clone());
+        }
+        let generation = client.nameserver.read().unwrap().generation;
+
+        client
+            .update_name_server_address_list(vec![first.clone(), first.clone()])
+            .await;
+        assert_eq!(client.nameserver.read().unwrap().generation, generation);
+
+        client
+            .update_name_server_address_list(vec![second.clone(), second.clone()])
+            .await;
+        let state = client.nameserver.read().unwrap();
+        assert_eq!(state.addresses, vec![second]);
+        assert!(state.selected.is_none());
+        assert!(state.available.is_empty());
+        assert_eq!(state.generation, generation + 1);
+        drop(state);
+        client.shutdown();
+    }
 }
