@@ -243,14 +243,21 @@ impl MQClientInstance {
                     match value {
                         ConnectionNetEvent::CONNECTED(remote_address) => {
                             info!("ConnectionNetEvent CONNECTED");
-                            let broker_addr_table = instance_.broker_addr_table.read().await;
-                            for (broker_name, broker_addrs) in broker_addr_table.iter() {
-                                for (id, addr) in broker_addrs.iter() {
-                                    if addr == remote_address.to_string().as_str()
-                                        && instance_.send_heartbeat_to_broker(*id, broker_name, addr).await
-                                    {
-                                        instance_.re_balance_immediately();
-                                    }
+                            let matching_brokers = {
+                                let broker_addr_table = instance_.broker_addr_table.read().await;
+                                broker_addr_table
+                                    .iter()
+                                    .flat_map(|(broker_name, broker_addrs)| {
+                                        broker_addrs.iter().filter_map(|(id, addr)| {
+                                            (addr == remote_address.to_string().as_str())
+                                                .then(|| (broker_name.clone(), *id, addr.clone()))
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            for (broker_name, id, addr) in matching_brokers {
+                                if instance_.send_heartbeat_to_broker(id, &broker_name, &addr).await {
+                                    instance_.re_balance_immediately();
                                 }
                             }
                         }
@@ -652,10 +659,13 @@ impl MQClientInstance {
 
                 // Update sub info
                 {
-                    let consumer_table = self.consumer_table.read().await;
-                    if !consumer_table.is_empty() {
+                    let consumers = {
+                        let consumer_table = self.consumer_table.read().await;
+                        consumer_table.values().cloned().collect::<Vec<_>>()
+                    };
+                    if !consumers.is_empty() {
                         let subscribe_info = topic_route_data2topic_subscribe_info(topic, &topic_route_data);
-                        for value in consumer_table.values() {
+                        for value in consumers {
                             value.update_topic_subscribe_info(topic.clone(), &subscribe_info).await;
                         }
                     }
@@ -688,8 +698,11 @@ impl MQClientInstance {
             return true;
         }
 
-        let consumer_table = self.consumer_table.read().await;
-        for (key, value) in consumer_table.iter() {
+        let consumers = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table.values().cloned().collect::<Vec<_>>()
+        };
+        for value in consumers {
             if !result {
                 result = value.is_subscribe_topic_need_update(topic).await;
                 break;
@@ -699,8 +712,11 @@ impl MQClientInstance {
     }
 
     pub async fn persist_all_consumer_offset(&mut self) {
-        let consumer_table = self.consumer_table.read().await;
-        for value in consumer_table.values() {
+        let consumers = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table.values().cloned().collect::<Vec<_>>()
+        };
+        for value in consumers {
             value.persist_consumer_offset().await;
         }
     }
@@ -913,7 +929,10 @@ impl MQClientInstance {
     }
 
     async fn emit_heartbeat_transport_event(&self, outcome: ConsumerTransportOutcome) {
-        let consumer_groups = self.consumer_table.read().await.keys().cloned().collect::<Vec<_>>();
+        let consumer_groups = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table.keys().cloned().collect::<Vec<_>>()
+        };
         for consumer_group in consumer_groups {
             self.emit_consumer_transport_event(&consumer_group, ConsumerTransportOperation::Heartbeat, outcome);
         }
@@ -939,8 +958,11 @@ impl MQClientInstance {
             ..Default::default()
         };
 
-        let consumer_table = self.consumer_table.read().await;
-        for value in consumer_table.values() {
+        let consumers = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table.values().cloned().collect::<Vec<_>>()
+        };
+        for value in consumers {
             let mut consumer_data = ConsumerData {
                 group_name: value.group_name(),
                 consume_type: value.consume_type(),
@@ -956,15 +978,13 @@ impl MQClientInstance {
             }
             heartbeat_data.consumer_data_set.insert(consumer_data);
         }
-        drop(consumer_table);
-        let producer_table = self.producer_table.read().await;
-        for group_name in producer_table.keys() {
-            let producer_data = ProducerData {
-                group_name: group_name.clone(),
-            };
-            heartbeat_data.producer_data_set.insert(producer_data);
+        let producer_groups = {
+            let producer_table = self.producer_table.read().await;
+            producer_table.keys().cloned().collect::<Vec<_>>()
+        };
+        for group_name in producer_groups {
+            heartbeat_data.producer_data_set.insert(ProducerData { group_name });
         }
-        drop(producer_table);
         heartbeat_data.is_without_sub = is_without_sub;
         heartbeat_data
     }
@@ -1029,9 +1049,15 @@ impl MQClientInstance {
     }
 
     pub async fn do_rebalance(&mut self) -> bool {
+        let consumers = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        };
         let mut balanced = true;
-        let consumer_table = self.consumer_table.read().await;
-        for (key, value) in consumer_table.iter() {
+        for (key, value) in consumers {
             match value.try_rebalance().await {
                 Ok(result) => {
                     if !result {
@@ -1144,28 +1170,36 @@ impl MQClientInstance {
         producer_group: Option<CheetahString>,
         consumer_group: Option<CheetahString>,
     ) {
-        let broker_addr_table = self.broker_addr_table.read().await;
-        for (broker_name, broker_addrs) in broker_addr_table.iter() {
-            for (id, addr) in broker_addrs.iter() {
-                if let Err(err) = self
-                    .mq_client_api_impl
-                    .as_mut()
-                    .unwrap()
-                    .unregister_client(
-                        addr,
-                        self.client_id.clone(),
-                        producer_group.clone(),
-                        consumer_group.clone(),
-                        self.client_config.mq_client_api_timeout,
-                    )
-                    .await
-                {
-                } else {
-                    info!(
-                        "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] success",
-                        producer_group, consumer_group, broker_name, id, addr,
-                    );
-                }
+        let broker_targets = {
+            let broker_addr_table = self.broker_addr_table.read().await;
+            broker_addr_table
+                .iter()
+                .flat_map(|(broker_name, broker_addrs)| {
+                    broker_addrs
+                        .iter()
+                        .map(|(id, addr)| (broker_name.clone(), *id, addr.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (broker_name, id, addr) in broker_targets {
+            if self
+                .mq_client_api_impl
+                .as_mut()
+                .unwrap()
+                .unregister_client(
+                    &addr,
+                    self.client_id.clone(),
+                    producer_group.clone(),
+                    consumer_group.clone(),
+                    self.client_config.mq_client_api_timeout,
+                )
+                .await
+                .is_ok()
+            {
+                info!(
+                    "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] success",
+                    producer_group, consumer_group, broker_name, id, addr,
+                );
             }
         }
     }
@@ -1248,10 +1282,12 @@ impl MQClientInstance {
         consumer_group: &CheetahString,
         broker_name: Option<CheetahString>,
     ) -> Option<ConsumeMessageDirectlyResult> {
-        let consumer_table = self.consumer_table.read().await;
-        let consumer_inner = consumer_table.get(consumer_group);
-        if let Some(consumer) = consumer_inner {
-            consumer.consume_message_directly(message, broker_name).await;
+        let consumer = {
+            let consumer_table = self.consumer_table.read().await;
+            consumer_table.get(consumer_group).cloned()
+        };
+        if let Some(consumer) = consumer {
+            return consumer.consume_message_directly(message, broker_name).await;
         }
 
         None

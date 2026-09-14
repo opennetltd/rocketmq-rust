@@ -389,6 +389,8 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub async fn shutdown(&mut self, await_terminate_millis: u64) {
+        self.pause.store(true, Ordering::Release);
+        self.rebalance_impl.invalidate_rebalance_generation();
         let _lock = self.global_lock.lock().await;
         match *self.service_state {
             ServiceState::CreateJust | ServiceState::StartFailed | ServiceState::Starting => {
@@ -450,12 +452,14 @@ impl DefaultMQPushConsumerImpl {
         // if DO_NOT_UPDATE_TOPIC_SUBSCRIBE_INFO_WHEN_SUBSCRIPTION_CHANGED {
         //     return;
         // }
-        let sub_table = self.rebalance_impl.get_subscription_inner();
-        let sub_table_inner = sub_table.read().await;
-        let keys = sub_table_inner.keys().clone();
+        let keys = {
+            let sub_table = self.rebalance_impl.get_subscription_inner();
+            let sub_table_inner = sub_table.read().await;
+            sub_table_inner.keys().cloned().collect::<Vec<_>>()
+        };
         let client = self.client_instance.as_mut().unwrap();
         for topic in keys {
-            client.update_topic_route_info_from_name_server_topic(topic).await;
+            client.update_topic_route_info_from_name_server_topic(&topic).await;
         }
     }
 
@@ -1540,13 +1544,15 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
                 self.consumer_config.consumer_group, err
             );
         } else {
-            let guard = self
-                .rebalance_impl
-                .rebalance_impl_inner
-                .process_queue_table
-                .read()
-                .await;
-            let allocate_mq = guard.keys().cloned().collect::<HashSet<_>>();
+            let allocate_mq = {
+                let guard = self
+                    .rebalance_impl
+                    .rebalance_impl_inner
+                    .process_queue_table
+                    .read()
+                    .await;
+                guard.keys().cloned().collect::<HashSet<_>>()
+            };
             self.offset_store
                 .as_ref()
                 .unwrap()

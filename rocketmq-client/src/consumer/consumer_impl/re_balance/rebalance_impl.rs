@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use cheetah_string::CheetahString;
@@ -60,6 +61,7 @@ pub(crate) struct RebalanceImpl<R> {
     pub(crate) sub_rebalance_impl: Option<WeakArcMut<R>>,
     pub(crate) topic_broker_rebalance: Arc<RwLock<HashMap<CheetahString, CheetahString>>>,
     pub(crate) topic_client_rebalance: Arc<RwLock<HashMap<CheetahString, CheetahString>>>,
+    rebalance_generation: Arc<AtomicU64>,
 }
 
 impl<R> RebalanceImpl<R>
@@ -84,7 +86,22 @@ where
             sub_rebalance_impl: None,
             topic_broker_rebalance: Arc::new(RwLock::new(HashMap::with_capacity(64))),
             topic_client_rebalance: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            rebalance_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn invalidate_rebalance_generation(&self) {
+        self.rebalance_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    fn rebalance_generation(&self) -> u64 {
+        self.rebalance_generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn is_rebalance_generation_current(&self, generation: u64) -> bool {
+        self.rebalance_generation() == generation
     }
 
     #[inline]
@@ -101,23 +118,33 @@ where
 
     #[inline]
     pub async fn do_rebalance(&mut self, is_order: bool) -> bool {
+        let generation = self.rebalance_generation();
         let mut balanced = true;
         let sub_table = self.subscription_inner.read().await;
         if !sub_table.is_empty() {
             let topics = sub_table.keys().cloned().collect::<Vec<CheetahString>>();
             drop(sub_table);
             for topic in &topics {
+                if !self.is_rebalance_generation_current(generation) {
+                    return false;
+                }
                 if !self.client_rebalance(topic) && self.try_query_assignment(topic).await {
                     //pop consumer
-                    if !self.get_rebalance_result_from_broker(topic, is_order).await {
+                    if !self.is_rebalance_generation_current(generation)
+                        || !self.get_rebalance_result_from_broker(topic, is_order).await
+                    {
                         balanced = false;
                     }
-                } else if !self.rebalance_by_topic(topic, is_order).await {
+                } else if !self.is_rebalance_generation_current(generation)
+                    || !self.rebalance_by_topic(topic, is_order).await
+                {
                     balanced = false;
                 }
             }
         }
-        self.truncate_message_queue_not_my_topic().await;
+        if self.is_rebalance_generation_current(generation) {
+            self.truncate_message_queue_not_my_topic().await;
+        }
         balanced
     }
 
@@ -358,6 +385,7 @@ where
         assignments: &HashSet<MessageQueueAssignment>,
         is_order: bool,
     ) -> bool {
+        let generation = self.rebalance_generation();
         let mut changed = false;
         let mut mq2push_assignment = HashMap::new();
         let mut mq2pop_assignment = HashMap::new();
@@ -426,22 +454,21 @@ where
             }
         }
 
-        {
-            if !remove_queue_map.is_empty() {
+        for (mq, pq) in remove_queue_map {
+            let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
+                sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
+            } else {
+                false
+            };
+            if removed {
                 let mut process_queue_table = self.process_queue_table.write().await;
-                // Remove message queues no longer belong to me
-                for (mq, pq) in remove_queue_map {
-                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        if sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await {
-                            process_queue_table.remove(&mq);
-                            changed = true;
-                            info!(
-                                "doRebalance, {:?}, remove unnecessary mq, {}",
-                                self.consumer_group,
-                                mq.get_topic()
-                            );
-                        }
-                    }
+                if process_queue_table.remove(&mq).is_some() {
+                    changed = true;
+                    info!(
+                        "doRebalance, {:?}, remove unnecessary mq, {}",
+                        self.consumer_group,
+                        mq.get_topic()
+                    );
                 }
             }
         }
@@ -473,22 +500,23 @@ where
             }
         }
 
-        {
-            if !remove_queue_map.is_empty() {
+        for (mq, pq) in remove_queue_map {
+            let removed = self
+                .sub_rebalance_impl
+                .as_mut()
+                .unwrap()
+                .upgrade()
+                .map(|mut sub_rebalance| sub_rebalance.remove_unnecessary_pop_message_queue(&mq, &pq))
+                .unwrap_or(false);
+            if removed {
                 let mut pop_process_queue_table = self.pop_process_queue_table.write().await;
-                // Remove message queues no longer belong to me
-                for (mq, pq) in remove_queue_map {
-                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        if sub_rebalance.remove_unnecessary_pop_message_queue(&mq, &pq) {
-                            pop_process_queue_table.remove(&mq);
-                            changed = true;
-                            info!(
-                                "doRebalance, {:?}, remove unnecessary pop mq, {}",
-                                self.consumer_group,
-                                mq.get_topic()
-                            );
-                        }
-                    }
+                if pop_process_queue_table.remove(&mq).is_some() {
+                    changed = true;
+                    info!(
+                        "doRebalance, {:?}, remove unnecessary pop mq, {}",
+                        self.consumer_group,
+                        mq.get_topic()
+                    );
                 }
             }
         }
@@ -503,10 +531,13 @@ where
             }
             let mut sub_rebalance_impl = sub_rebalance_impl.unwrap();
             let process_queue_table_clone = self.process_queue_table.clone();
-            let mut process_queue_table = process_queue_table_clone.write().await;
             for (mq, assignment) in mq2push_assignment {
-                if !process_queue_table.contains_key(mq) {
-                    if is_order && !self.lock_with(mq, process_queue_table.deref()).await {
+                let missing = {
+                    let process_queue_table = process_queue_table_clone.read().await;
+                    !process_queue_table.contains_key(mq)
+                };
+                if missing {
+                    if is_order && !self.lock(mq).await {
                         warn!(
                             "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
                             self.consumer_group,
@@ -524,7 +555,8 @@ where
                         continue;
                     }
                     let next_offset = next_offset.unwrap();
-                    if next_offset >= 0 {
+                    if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
+                        let mut process_queue_table = process_queue_table_clone.write().await;
                         if process_queue_table.insert(mq.clone(), pq.clone()).is_none() {
                             info!(
                                 "doRebalance, {:?}, add a new mq, {}",
@@ -589,6 +621,9 @@ where
             }
         }
 
+        if !self.is_rebalance_generation_current(generation) {
+            return false;
+        }
         changed
     }
 
@@ -598,6 +633,7 @@ where
         mq_set: &HashSet<MessageQueue>,
         is_order: bool,
     ) -> bool {
+        let generation = self.rebalance_generation();
         let mut changed = false;
         let mut remove_queue_map = HashMap::new();
         let process_queue_table_cloned = self.process_queue_table.clone();
@@ -627,22 +663,21 @@ where
             }
         }
 
-        {
-            if !remove_queue_map.is_empty() {
+        for (mq, pq) in remove_queue_map {
+            let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
+                sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
+            } else {
+                false
+            };
+            if removed {
                 let mut process_queue_table = process_queue_table_cloned.write().await;
-                // Remove message queues no longer belong to me
-                for (mq, pq) in remove_queue_map {
-                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        if sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await {
-                            process_queue_table.remove(&mq);
-                            changed = true;
-                            info!(
-                                "doRebalance, {:?}, remove unnecessary mq, {}",
-                                self.consumer_group,
-                                mq.get_topic()
-                            );
-                        }
-                    }
+                if process_queue_table.remove(&mq).is_some() {
+                    changed = true;
+                    info!(
+                        "doRebalance, {:?}, remove unnecessary mq, {}",
+                        self.consumer_group,
+                        mq.get_topic()
+                    );
                 }
             }
         }
@@ -654,10 +689,13 @@ where
             return false;
         }
         let mut sub_rebalance_impl = sub_rebalance_impl.unwrap();
-        let mut process_queue_table = process_queue_table_cloned.write().await;
         for mq in mq_set {
-            if !process_queue_table.contains_key(mq) {
-                if is_order && !self.lock_with(mq, process_queue_table.deref()).await {
+            let missing = {
+                let process_queue_table = process_queue_table_cloned.read().await;
+                !process_queue_table.contains_key(mq)
+            };
+            if missing {
+                if is_order && !self.lock(mq).await {
                     warn!(
                         "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
                         self.consumer_group,
@@ -671,7 +709,8 @@ where
                 let pq = Arc::new(sub_rebalance_impl.create_process_queue());
                 pq.set_locked(true);
                 let next_offset = sub_rebalance_impl.compute_pull_from_where(mq).await;
-                if next_offset >= 0 {
+                if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
+                    let mut process_queue_table = process_queue_table_cloned.write().await;
                     if process_queue_table.insert(mq.clone(), pq.clone()).is_none() {
                         info!(
                             "doRebalance, {:?}, add a new mq, {}",
@@ -707,6 +746,9 @@ where
         }
         sub_rebalance_impl.dispatch_pull_request(pull_request_list, 500).await;
 
+        if !self.is_rebalance_generation_current(generation) {
+            return false;
+        }
         changed
     }
 
@@ -846,10 +888,15 @@ where
     }
 
     pub async fn lock(&mut self, mq: &MessageQueue) -> bool {
-        let process_queue_table_ = self.process_queue_table.clone();
-        let process_queue_table = process_queue_table_.read().await;
-        let table = process_queue_table.deref();
-        self.lock_with(mq, table).await
+        let locked = self.lock_with(mq, &HashMap::new()).await;
+        if locked {
+            let process_queue_table = self.process_queue_table.read().await;
+            if let Some(pq) = process_queue_table.get(mq) {
+                pq.set_locked(true);
+                pq.set_last_pull_timestamp(get_current_millis());
+            }
+        }
+        locked
     }
 
     pub async fn lock_with(
@@ -1070,5 +1117,20 @@ where
             entry.insert(mq.to_owned());
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consumer::consumer_impl::re_balance::rebalance_push_impl::RebalancePushImpl;
+
+    #[test]
+    fn invalidating_rebalance_generation_discards_prepared_work() {
+        let rebalance = RebalanceImpl::<RebalancePushImpl>::new(None, None, None, None);
+        let generation = rebalance.rebalance_generation();
+        rebalance.invalidate_rebalance_generation();
+
+        assert!(!rebalance.is_rebalance_generation_current(generation));
     }
 }
