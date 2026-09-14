@@ -52,6 +52,7 @@ use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tokio::time::Instant as TokioInstant;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -100,6 +101,13 @@ const CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: u64 = 1000 * 30;
 const MAX_POP_INVISIBLE_TIME: u64 = 300000;
 const MIN_POP_INVISIBLE_TIME: u64 = 5000;
 const ASYNC_TIMEOUT: u64 = 3000;
+
+fn remaining_millis(deadline: TokioInstant) -> u64 {
+    deadline
+        .saturating_duration_since(TokioInstant::now())
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 //const DO_NOT_UPDATE_TOPIC_SUBSCRIBE_INFO_WHEN_SUBSCRIPTION_CHANGED: bool = false;
 const _1MB: u64 = 1024 * 1024;
 
@@ -389,6 +397,11 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub async fn shutdown(&mut self, await_terminate_millis: u64) {
+        let deadline = TokioInstant::now() + std::time::Duration::from_millis(await_terminate_millis);
+        self.shutdown_until(deadline).await;
+    }
+
+    async fn shutdown_until(&mut self, deadline: TokioInstant) {
         self.pause.store(true, Ordering::Release);
         self.rebalance_impl.invalidate_rebalance_generation();
         let _lock = self.global_lock.lock().await;
@@ -401,15 +414,23 @@ impl DefaultMQPushConsumerImpl {
                 let had_client_instance = self.client_instance.is_some();
                 if let Some(client) = self.client_instance.as_mut() {
                     client
-                        .unregister_consumer(self.consumer_config.consumer_group.as_str())
+                        .unregister_consumer_until(self.consumer_config.consumer_group.as_str(), deadline)
                         .await;
-                    client.shutdown().await;
+                    let _ = tokio::time::timeout_at(deadline, client.shutdown()).await;
                 }
                 if let Some(consume_message_service) = self.consume_message_service.as_mut() {
-                    consume_message_service.shutdown(await_terminate_millis).await;
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        consume_message_service.shutdown(remaining_millis(deadline)),
+                    )
+                    .await;
                 }
                 if let Some(consume_message_pop_service) = self.consume_message_pop_service.as_mut() {
-                    consume_message_pop_service.shutdown(await_terminate_millis).await;
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        consume_message_pop_service.shutdown(remaining_millis(deadline)),
+                    )
+                    .await;
                 }
                 if had_client_instance {
                     self.rebalance_impl.destroy();
@@ -418,19 +439,25 @@ impl DefaultMQPushConsumerImpl {
             }
             ServiceState::Running => {
                 if let Some(consume_message_concurrently_service) = self.consume_message_service.as_mut() {
-                    consume_message_concurrently_service
-                        .shutdown(await_terminate_millis)
-                        .await;
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        consume_message_concurrently_service.shutdown(remaining_millis(deadline)),
+                    )
+                    .await;
                 }
                 if let Some(consume_message_pop_service) = self.consume_message_pop_service.as_mut() {
-                    consume_message_pop_service.shutdown(await_terminate_millis).await;
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        consume_message_pop_service.shutdown(remaining_millis(deadline)),
+                    )
+                    .await;
                 }
-                self.persist_consumer_offset().await;
+                let _ = tokio::time::timeout_at(deadline, self.persist_consumer_offset()).await;
                 let client = self.client_instance.as_mut().unwrap();
                 client
-                    .unregister_consumer(self.consumer_config.consumer_group.as_str())
+                    .unregister_consumer_until(self.consumer_config.consumer_group.as_str(), deadline)
                     .await;
-                client.shutdown().await;
+                let _ = tokio::time::timeout_at(deadline, client.shutdown()).await;
                 info!(
                     "the consumer [{}] shutdown OK",
                     self.consumer_config.consumer_group.as_str()

@@ -45,6 +45,7 @@ use rocketmq_rust::ArcMut;
 use rocketmq_rust::RocketMQTokioMutex;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -1151,11 +1152,23 @@ impl MQClientInstance {
     }
 
     pub async fn unregister_consumer(&mut self, group: impl Into<CheetahString>) {
+        self.unregister_consumer_until(group, Instant::now() + Duration::from_millis(self.client_config.mq_client_api_timeout))
+            .await;
+    }
+
+    pub async fn unregister_consumer_until(&mut self, group: impl Into<CheetahString>, deadline: Instant) {
         let group = group.into();
         // Always remove the local entry first. Broker unregistration is best effort;
         // retaining a stale local entry makes a later retry permanently duplicate.
-        self.consumer_table.write().await.remove(&group);
-        self.unregister_client(None, Some(group)).await;
+        let Some(mut consumer_table) = tokio::time::timeout_at(deadline, self.consumer_table.write())
+            .await
+            .ok()
+        else {
+            return;
+        };
+        consumer_table.remove(&group);
+        drop(consumer_table);
+        self.unregister_client_until(None, Some(group), deadline).await;
     }
     pub async fn unregister_producer(&mut self, group: impl Into<CheetahString>) {
         self.unregister_client(Some(group.into()), None).await;
@@ -1170,35 +1183,88 @@ impl MQClientInstance {
         producer_group: Option<CheetahString>,
         consumer_group: Option<CheetahString>,
     ) {
-        let broker_targets = {
-            let broker_addr_table = self.broker_addr_table.read().await;
-            broker_addr_table
-                .iter()
-                .flat_map(|(broker_name, broker_addrs)| {
-                    broker_addrs
-                        .iter()
-                        .map(|(id, addr)| (broker_name.clone(), *id, addr.clone()))
-                })
-                .collect::<Vec<_>>()
+        self.unregister_client_until(
+            producer_group,
+            consumer_group,
+            Instant::now() + Duration::from_millis(self.client_config.mq_client_api_timeout),
+        )
+        .await;
+    }
+
+    async fn unregister_client_until(
+        &mut self,
+        producer_group: Option<CheetahString>,
+        consumer_group: Option<CheetahString>,
+        deadline: Instant,
+    ) {
+        let broker_addr_table = match tokio::time::timeout_at(deadline, self.broker_addr_table.read()).await {
+            Ok(guard) => guard,
+            Err(_) => return,
         };
-        for (broker_name, id, addr) in broker_targets {
-            if self
-                .mq_client_api_impl
-                .as_mut()
-                .unwrap()
-                .unregister_client(
-                    &addr,
-                    self.client_id.clone(),
-                    producer_group.clone(),
-                    consumer_group.clone(),
-                    self.client_config.mq_client_api_timeout,
-                )
+        let mut seen_addresses = HashSet::new();
+        let broker_targets = broker_addr_table
+            .iter()
+            .flat_map(|(broker_name, broker_addrs)| {
+                broker_addrs.iter().filter_map(|(id, addr)| {
+                    seen_addresses
+                        .insert(addr.clone())
+                        .then(|| (broker_name.clone(), *id, addr.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(broker_addr_table);
+        let Some(api) = self.mq_client_api_impl.as_ref().cloned() else {
+            return;
+        };
+        let timeout_millis = self.client_config.mq_client_api_timeout;
+        let mut pending = futures::stream::FuturesUnordered::new();
+        let mut targets = broker_targets.into_iter();
+        loop {
+            while pending.len() < 8 {
+                let Some((broker_name, id, addr)) = targets.next() else {
+                    break;
+                };
+                let api = api.clone();
+                let client_id = self.client_id.clone();
+                let producer_group = producer_group.clone();
+                let consumer_group = consumer_group.clone();
+                let request_timeout = timeout_millis.min(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                );
+                if request_timeout == 0 {
+                    return;
+                }
+                pending.push(async move {
+                    let result = api
+                        .as_ref()
+                        .unregister_client(
+                            &addr,
+                            client_id,
+                            producer_group,
+                            consumer_group,
+                            request_timeout,
+                        )
+                        .await;
+                    (broker_name, id, addr, result)
+                });
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let Some(result) = tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut pending))
                 .await
-                .is_ok()
-            {
+                .ok()
+                .flatten()
+            else {
+                break;
+            };
+            if result.3.is_ok() {
                 info!(
                     "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] success",
-                    producer_group, consumer_group, broker_name, id, addr,
+                    producer_group, consumer_group, result.0, result.1, result.2,
                 );
             }
         }

@@ -1373,7 +1373,7 @@ impl MQClientAPIImpl {
     }
 
     pub async fn unregister_client(
-        &mut self,
+        &self,
         addr: &CheetahString,
         client_id: CheetahString,
         producer_group: Option<CheetahString>,
