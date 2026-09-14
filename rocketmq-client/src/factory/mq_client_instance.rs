@@ -1202,16 +1202,14 @@ impl MQClientInstance {
             Err(_) => return,
         };
         let mut seen_addresses = HashSet::new();
-        let broker_targets = broker_addr_table
-            .iter()
-            .flat_map(|(broker_name, broker_addrs)| {
-                broker_addrs.iter().filter_map(|(id, addr)| {
-                    seen_addresses
-                        .insert(addr.clone())
-                        .then(|| (broker_name.clone(), *id, addr.clone()))
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut broker_targets = Vec::new();
+        for (broker_name, broker_addrs) in broker_addr_table.iter() {
+            for (id, addr) in broker_addrs {
+                if seen_addresses.insert(addr.clone()) {
+                    broker_targets.push((broker_name.clone(), *id, addr.clone()));
+                }
+            }
+        }
         drop(broker_addr_table);
         let Some(api) = self.mq_client_api_impl.as_ref().cloned() else {
             return;

@@ -76,6 +76,10 @@ impl RebalancePushImpl {
 }
 
 impl RebalancePushImpl {
+    pub(crate) fn invalidate_rebalance_generation(&self) {
+        self.rebalance_impl_inner.invalidate_rebalance_generation();
+    }
+
     pub fn get_subscription_inner(&self) -> Arc<RwLock<HashMap<CheetahString, SubscriptionData>>> {
         self.rebalance_impl_inner.subscription_inner.clone()
     }
