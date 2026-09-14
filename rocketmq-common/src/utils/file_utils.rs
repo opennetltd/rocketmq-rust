@@ -24,7 +24,7 @@ use rocketmq_error::RocketMQResult;
 use tokio::io::AsyncReadExt;
 #[cfg(feature = "async_fs")]
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{debug, warn};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -38,7 +38,7 @@ pub fn file_to_string(file_name: impl AsRef<Path>) -> RocketMQResult<String> {
     match std::fs::read_to_string(path) {
         Ok(sr) => Ok(sr),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            warn!("file not exist: {}", path.display());
+            debug!("file not exist: {}", path.display());
             Ok(String::new())
         }
         Err(e) => Err(RocketMQError::IO(e)),
