@@ -639,6 +639,15 @@ impl MQPushConsumer for DefaultMQPushConsumer {
 }
 
 impl DefaultMQPushConsumer {
+    /// Shuts down the consumer with a caller-provided total cleanup budget.
+    pub async fn shutdown_with_timeout(&mut self, await_termination_millis: u64) {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .expect("default_mqpush_consumer_impl is None")
+            .shutdown(await_termination_millis)
+            .await;
+    }
+
     pub fn builder() -> DefaultMQPushConsumerBuilder {
         DefaultMQPushConsumerBuilder::default()
     }
