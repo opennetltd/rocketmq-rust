@@ -48,7 +48,7 @@ pub trait MQConsumerInnerLocal: MQConsumerInnerAny + Sync + 'static {
     fn consume_from_where(&self) -> ConsumeFromWhere;
 
     /// Returns the set of subscriptions for the consumer.
-    fn subscriptions(&self) -> HashSet<SubscriptionData>;
+    async fn subscriptions(&self) -> HashSet<SubscriptionData>;
 
     /// Performs the rebalancing of the consumer.
     fn do_rebalance(&self);
@@ -83,7 +83,7 @@ pub trait MQConsumerInnerLocal: MQConsumerInnerAny + Sync + 'static {
     fn is_unit_mode(&self) -> bool;
 
     /// Returns the running information of the consumer.
-    fn consumer_running_info(&self) -> ConsumerRunningInfo;
+    async fn consumer_running_info(&self) -> rocketmq_error::RocketMQResult<ConsumerRunningInfo>;
 }
 
 pub trait MQConsumerInnerAny: std::any::Any {
@@ -153,8 +153,8 @@ impl MQConsumerInner for MQConsumerInnerImpl {
     }
 
     #[inline]
-    fn subscriptions(&self) -> HashSet<SubscriptionData> {
-        MQConsumerInner::subscriptions(self.default_mqpush_consumer_impl.as_ref())
+    async fn subscriptions(&self) -> HashSet<SubscriptionData> {
+        MQConsumerInner::subscriptions(self.default_mqpush_consumer_impl.as_ref()).await
     }
 
     #[inline]
@@ -189,7 +189,7 @@ impl MQConsumerInner for MQConsumerInnerImpl {
     }
 
     #[inline]
-    fn consumer_running_info(&self) -> ConsumerRunningInfo {
-        MQConsumerInner::consumer_running_info(self.default_mqpush_consumer_impl.as_ref())
+    async fn consumer_running_info(&self) -> rocketmq_error::RocketMQResult<ConsumerRunningInfo> {
+        MQConsumerInner::consumer_running_info(self.default_mqpush_consumer_impl.as_ref()).await
     }
 }

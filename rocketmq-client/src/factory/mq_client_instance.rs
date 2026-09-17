@@ -490,7 +490,7 @@ impl MQClientInstance {
         {
             let consumer_table = self.consumer_table.read().await;
             for value in consumer_table.values() {
-                value.subscriptions().iter().for_each(|sub| {
+                value.subscriptions().await.iter().for_each(|sub| {
                     topic_list.insert(sub.topic.clone());
                 });
             }
@@ -969,11 +969,11 @@ impl MQClientInstance {
                 consume_type: value.consume_type(),
                 message_model: value.message_model(),
                 consume_from_where: value.consume_from_where(),
-                subscription_data_set: value.subscriptions(),
+                subscription_data_set: value.subscriptions().await,
                 unit_mode: value.is_unit_mode(),
             };
             if !is_without_sub {
-                value.subscriptions().iter().for_each(|sub| {
+                value.subscriptions().await.iter().for_each(|sub| {
                     consumer_data.subscription_data_set.insert(sub.clone());
                 });
             }
@@ -1003,7 +1003,7 @@ impl MQClientInstance {
     pub async fn check_client_in_broker(&mut self) -> rocketmq_error::RocketMQResult<()> {
         let consumer_table = self.consumer_table.read().await;
         for (key, value) in consumer_table.iter() {
-            let subscription_inner = value.subscriptions();
+            let subscription_inner = value.subscriptions().await;
             if subscription_inner.is_empty() {
                 return Ok(());
             }
@@ -1152,8 +1152,11 @@ impl MQClientInstance {
     }
 
     pub async fn unregister_consumer(&mut self, group: impl Into<CheetahString>) {
-        self.unregister_consumer_until(group, Instant::now() + Duration::from_millis(self.client_config.mq_client_api_timeout))
-            .await;
+        self.unregister_consumer_until(
+            group,
+            Instant::now() + Duration::from_millis(self.client_config.mq_client_api_timeout),
+        )
+        .await;
     }
 
     pub async fn unregister_consumer_until(&mut self, group: impl Into<CheetahString>, deadline: Instant) {
@@ -1238,13 +1241,7 @@ impl MQClientInstance {
                 pending.push(async move {
                     let result = api
                         .as_ref()
-                        .unregister_client(
-                            &addr,
-                            client_id,
-                            producer_group,
-                            consumer_group,
-                            request_timeout,
-                        )
+                        .unregister_client(&addr, client_id, producer_group, consumer_group, request_timeout)
                         .await;
                     (broker_name, id, addr, result)
                 });

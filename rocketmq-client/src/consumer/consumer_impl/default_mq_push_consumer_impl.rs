@@ -17,7 +17,6 @@ use std::error::Error;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
 use std::time::Instant;
 
 use cheetah_string::CheetahString;
@@ -50,7 +49,6 @@ use rocketmq_remoting::rpc::rpc_request_header::RpcRequestHeader;
 use rocketmq_remoting::rpc::topic_request_header::TopicRequestHeader;
 use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 use tracing::error;
@@ -419,11 +417,9 @@ impl DefaultMQPushConsumerImpl {
                     let _ = tokio::time::timeout_at(deadline, client.shutdown()).await;
                 }
                 if let Some(consume_message_service) = self.consume_message_service.as_mut() {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        consume_message_service.shutdown(remaining_millis(deadline)),
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout_at(deadline, consume_message_service.shutdown(remaining_millis(deadline)))
+                            .await;
                 }
                 if let Some(consume_message_pop_service) = self.consume_message_pop_service.as_mut() {
                     let _ = tokio::time::timeout_at(
@@ -1535,18 +1531,10 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
         self.consumer_config.consume_from_where
     }
 
-    fn subscriptions(&self) -> HashSet<SubscriptionData> {
+    async fn subscriptions(&self) -> HashSet<SubscriptionData> {
         let inner = self.rebalance_impl.rebalance_impl_inner.subscription_inner.clone();
-
-        let handle = Handle::current();
-        thread::spawn(move || {
-            handle.block_on(async move {
-                let inner = inner.read().await;
-                inner.values().cloned().collect()
-            })
-        })
-        .join()
-        .unwrap()
+        let inner = inner.read().await;
+        inner.values().cloned().collect()
     }
 
     fn do_rebalance(&self) {
@@ -1623,79 +1611,60 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
         self.consumer_config.unit_mode
     }
 
-    fn consumer_running_info(&self) -> ConsumerRunningInfo {
-        // Build a Java 4.7.1-compatible ConsumerRunningInfo snapshot.
-        // We reuse the thread::spawn + Handle::current() pattern (same as subscriptions()) to
-        // block on async reads from within this sync trait method.
-        let offset_store = self.offset_store.clone();
-        let process_queue_table = self.rebalance_impl
-            .rebalance_impl_inner
-            .process_queue_table
-            .clone();
-        let subscription_inner = self.rebalance_impl
-            .rebalance_impl_inner
-            .subscription_inner
-            .clone();
-        let client_config = self.client_config.clone();
-        let consumer_config = self.consumer_config.clone();
-        let consume_orderly = self.consume_orderly;
+    async fn consumer_running_info(&self) -> rocketmq_error::RocketMQResult<ConsumerRunningInfo> {
+        // Build the snapshot without blocking the runtime thread. Copy queue entries before
+        // awaiting offset reads so rebalance can continue while diagnostics run.
+        let mut info = ConsumerRunningInfo::default();
+        let ns_addr = self.client_config.get_namesrv_addr().unwrap_or_default().to_string();
+        info.properties.insert(
+            CheetahString::from_static_str(ConsumerRunningInfo::PROP_NAMESERVER_ADDR),
+            CheetahString::from_string(ns_addr),
+        );
+        info.properties.insert(
+            CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_TYPE),
+            CheetahString::from_static_str("CONSUME_PASSIVELY"),
+        );
+        info.properties.insert(
+            CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_ORDERLY),
+            CheetahString::from_string(self.consume_orderly.to_string()),
+        );
+        info.properties.insert(
+            CheetahString::from_static_str(ConsumerRunningInfo::PROP_CLIENT_VERSION),
+            CheetahString::from_static_str(env!("CARGO_PKG_VERSION")),
+        );
+        info.properties.insert(
+            CheetahString::from_static_str(ConsumerRunningInfo::PROP_THREADPOOL_CORE_SIZE),
+            CheetahString::from_string(self.consumer_config.consume_thread_max.to_string()),
+        );
 
-        let handle = Handle::current();
-        thread::spawn(move || {
-            handle.block_on(async move {
-                let mut info = ConsumerRunningInfo::default();
-
-                // Properties
-                let ns_addr = client_config.get_namesrv_addr()
-                    .unwrap_or_default()
-                    .to_string();
-                info.properties.insert(
-                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_NAMESERVER_ADDR),
-                    CheetahString::from_string(ns_addr),
-                );
-                info.properties.insert(
-                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_TYPE),
-                    CheetahString::from_static_str("CONSUME_PASSIVELY"),
-                );
-                info.properties.insert(
-                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CONSUME_ORDERLY),
-                    CheetahString::from_string(consume_orderly.to_string()),
-                );
-                info.properties.insert(
-                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_CLIENT_VERSION),
-                    CheetahString::from_static_str(env!("CARGO_PKG_VERSION")),
-                );
-                info.properties.insert(
-                    CheetahString::from_static_str(ConsumerRunningInfo::PROP_THREADPOOL_CORE_SIZE),
-                    CheetahString::from_string(
-                        consumer_config.consume_thread_max.to_string()
-                    ),
-                );
-
-                // Subscription set
-                {
-                    let sub = subscription_inner.read().await;
-                    info.subscription_set = sub.values().cloned().collect();
-                }
-
-                // Process queue table
-                {
-                    let pq_table = process_queue_table.read().await;
-                    for (mq, pq) in pq_table.iter() {
-                        let commit_offset = if let Some(ref store) = offset_store {
-                            store.read_offset(mq, crate::consumer::store::read_offset_type::ReadOffsetType::MemoryFirstThenStore).await
-                        } else {
-                            -1
-                        };
-                        let pq_info = pq.fill_process_queue_info(commit_offset.max(0) as u64);
-                        info.mq_table.insert(mq.clone(), pq_info);
-                    }
-                }
-
-                info
-            })
-        })
-        .join()
-        .unwrap_or_default()
+        let subscription_inner = self.rebalance_impl.rebalance_impl_inner.subscription_inner.clone();
+        info.subscription_set = subscription_inner.read().await.values().cloned().collect();
+        let queue_entries = {
+            let table = self
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .read()
+                .await;
+            table
+                .iter()
+                .map(|(mq, pq)| (mq.clone(), pq.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (mq, pq) in queue_entries {
+            let commit_offset = if let Some(store) = &self.offset_store {
+                store
+                    .read_offset(
+                        &mq,
+                        crate::consumer::store::read_offset_type::ReadOffsetType::MemoryFirstThenStore,
+                    )
+                    .await
+            } else {
+                -1
+            };
+            info.mq_table
+                .insert(mq, pq.fill_process_queue_info(commit_offset.max(0) as u64));
+        }
+        Ok(info)
     }
 }

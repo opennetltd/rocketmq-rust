@@ -74,8 +74,9 @@ impl RequestProcessor for ClientRemotingProcessor {
         info!("process_request: {:?}", request_code);
         match request_code {
             RequestCode::CheckTransactionState => self.check_transaction_state(channel, ctx, request).await,
-            RequestCode::ResetConsumerClientOffset
-            | RequestCode::GetConsumerStatusFromClient => Ok(Some(unsupported_request_response())),
+            RequestCode::ResetConsumerClientOffset | RequestCode::GetConsumerStatusFromClient => {
+                Ok(Some(unsupported_request_response()))
+            }
             RequestCode::GetConsumerRunningInfo => self.get_consumer_running_info(channel, ctx, request).await,
             RequestCode::ConsumeMessageDirectly => self.consume_message_directly(channel, ctx, request).await,
             //RPC message handle code
@@ -302,22 +303,26 @@ impl ClientRemotingProcessor {
 
         let Some(consumer) = consumer else {
             return Ok(Some(
-                RemotingCommand::create_response_command_with_code(ResponseCode::ConsumerNotOnline)
-                    .set_remark(format!(
+                RemotingCommand::create_response_command_with_code(ResponseCode::ConsumerNotOnline).set_remark(
+                    format!(
                         "The Consumer Group <{}> not exist in this consumer",
                         request_header.consumer_group
-                    )),
+                    ),
+                ),
             ));
         };
 
-        let running_info = consumer.consumer_running_info();
+        let running_info = tokio::time::timeout(std::time::Duration::from_secs(3), consumer.consumer_running_info())
+            .await
+            .map_err(|_| rocketmq_error::RocketMQError::Timeout {
+                operation: "consumer_running_info",
+                timeout_ms: 3_000,
+            })??;
         let body = running_info
             .encode()
             .map_err(|e| rocketmq_error::RocketMQError::IllegalArgument(format!("encode running info: {e}")))?;
 
-        Ok(Some(
-            RemotingCommand::create_response_command().set_body(body),
-        ))
+        Ok(Some(RemotingCommand::create_response_command().set_body(body)))
     }
 }
 
