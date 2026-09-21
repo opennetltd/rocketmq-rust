@@ -403,6 +403,15 @@ where
         unimplemented!("read unimplemented")
     }
 
+    pub(crate) async fn close_and_wait(&self) {
+        self.channel.channel_inner().shutdown_and_wait().await;
+        let task = self.tasks.receive.lock().expect("receive task lock poisoned").take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.channel.shutdown();
         if let Some(task) = self.tasks.receive.lock().expect("receive task lock poisoned").take() {

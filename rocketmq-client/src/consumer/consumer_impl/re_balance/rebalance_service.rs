@@ -87,7 +87,8 @@ impl RebalanceService {
         let notify = self.notify.clone();
         let (mut shutdown, tx_shutdown) = Shutdown::new(1);
         self.tx_shutdown = Some(tx_shutdown);
-        tokio::spawn(async move {
+        let work = instance.work.clone();
+        work.spawn(&tokio::runtime::Handle::current(), async move {
             let mut last_rebalance_timestamp = Instant::now();
             let min_interval = *MIN_INTERVAL;
             let mut real_wait_interval = *WAIT_INTERVAL;

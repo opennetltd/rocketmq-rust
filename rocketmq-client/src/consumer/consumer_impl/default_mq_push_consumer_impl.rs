@@ -111,6 +111,10 @@ const _1MB: u64 = 1024 * 1024;
 
 pub struct DefaultMQPushConsumerImpl {
     pub(crate) global_lock: Arc<Mutex<()>>,
+    pub(crate) work: Arc<super::consumer_work::ConsumerWork>,
+    pub(crate) pull_progress_listener: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    registered: bool,
+    pop_used: bool,
     pub(crate) pull_time_delay_mills_when_exception: u64,
     pub(crate) client_config: ArcMut<ClientConfig>,
     pub(crate) consumer_config: ArcMut<ConsumerConfig>,
@@ -148,6 +152,10 @@ impl DefaultMQPushConsumerImpl {
     ) -> Self {
         let mut this = Self {
             global_lock: Arc::new(Default::default()),
+            work: Arc::new(super::consumer_work::ConsumerWork::default()),
+            pull_progress_listener: None,
+            registered: false,
+            pop_used: false,
             pull_time_delay_mills_when_exception: 3_000,
             client_config: ArcMut::new(client_config.clone()),
             consumer_config: consumer_config.clone(),
@@ -219,6 +227,25 @@ impl DefaultMQPushConsumerImpl {
                 let client_instance = MQClientManager::get_instance()
                     .get_or_create_mq_client_instance(self.client_config.as_ref().clone(), self.rpc_hook.clone());
                 self.client_instance = Some(client_instance.clone());
+                let registered = self
+                    .client_instance
+                    .as_mut()
+                    .unwrap()
+                    .register_consumer(
+                        self.consumer_config.consumer_group.as_ref(),
+                        MQConsumerInnerImpl {
+                            default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone().unwrap(),
+                        },
+                    )
+                    .await;
+                if !registered {
+                    *self.service_state = ServiceState::StartFailed;
+                    return Err(mq_client_err!(format!(
+                        "the consumer group[{}] exist already.",
+                        self.consumer_config.consumer_group
+                    )));
+                }
+                self.registered = true;
                 self.rebalance_impl
                     .set_consumer_group(self.consumer_config.consumer_group.clone());
                 self.rebalance_impl
@@ -326,34 +353,8 @@ impl DefaultMQPushConsumerImpl {
                     *self.service_state = ServiceState::StartFailed;
                     return Err(error);
                 }
-                let registered = self
-                    .client_instance
-                    .as_mut()
-                    .unwrap()
-                    .register_consumer(
-                        self.consumer_config.consumer_group.as_ref(),
-                        MQConsumerInnerImpl {
-                            default_mqpush_consumer_impl: self
-                                .default_mqpush_consumer_impl
-                                .clone()
-                                .expect("default_mqpush_consumer_impl is None"),
-                        },
-                    )
-                    .await;
-                if !registered {
-                    *self.service_state = ServiceState::StartFailed;
-                    return Err(mq_client_err!(format!(
-                        "the consumer group[{}] exist already.",
-                        self.consumer_config.consumer_group
-                    )));
-                }
                 self.update_topic_subscribe_info_when_subscription_changed().await;
                 if let Err(error) = self.client_instance.as_mut().unwrap().check_client_in_broker().await {
-                    self.client_instance
-                        .as_mut()
-                        .unwrap()
-                        .unregister_consumer(self.consumer_config.consumer_group.as_str())
-                        .await;
                     *self.service_state = ServiceState::StartFailed;
                     return Err(error);
                 }
@@ -396,79 +397,88 @@ impl DefaultMQPushConsumerImpl {
 
     pub async fn shutdown(&mut self, await_terminate_millis: u64) {
         let deadline = TokioInstant::now() + std::time::Duration::from_millis(await_terminate_millis);
-        self.shutdown_until(deadline).await;
+        if !self.shutdown_until(deadline).await {
+            warn!("consumer cleanup incomplete: {}", self.consumer_config.consumer_group);
+        }
     }
 
-    async fn shutdown_until(&mut self, deadline: TokioInstant) {
+    /// False means local cleanup is unproved; callers must not start a replacement.
+    pub(crate) async fn shutdown_until(&mut self, deadline: TokioInstant) -> bool {
         self.pause.store(true, Ordering::Release);
+        self.work.close();
         self.rebalance_impl.invalidate_rebalance_generation();
-        let _lock = self.global_lock.lock().await;
-        match *self.service_state {
-            ServiceState::CreateJust | ServiceState::StartFailed | ServiceState::Starting => {
-                warn!(
-                    "the consumer [{}] did not complete startup; cleaning up local state",
-                    self.consumer_config.consumer_group
-                );
-                let had_client_instance = self.client_instance.is_some();
-                if let Some(client) = self.client_instance.as_mut() {
-                    client
-                        .unregister_consumer_until(self.consumer_config.consumer_group.as_str(), deadline)
-                        .await;
-                    let _ = tokio::time::timeout_at(deadline, client.shutdown()).await;
-                }
-                if let Some(consume_message_service) = self.consume_message_service.as_mut() {
-                    let _ =
-                        tokio::time::timeout_at(deadline, consume_message_service.shutdown(remaining_millis(deadline)))
-                            .await;
-                }
-                if let Some(consume_message_pop_service) = self.consume_message_pop_service.as_mut() {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        consume_message_pop_service.shutdown(remaining_millis(deadline)),
-                    )
-                    .await;
-                }
-                if had_client_instance {
-                    self.rebalance_impl.destroy();
-                }
-                *self.service_state = ServiceState::ShutdownAlready;
-            }
-            ServiceState::Running => {
-                if let Some(consume_message_concurrently_service) = self.consume_message_service.as_mut() {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        consume_message_concurrently_service.shutdown(remaining_millis(deadline)),
-                    )
-                    .await;
-                }
-                if let Some(consume_message_pop_service) = self.consume_message_pop_service.as_mut() {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        consume_message_pop_service.shutdown(remaining_millis(deadline)),
-                    )
-                    .await;
-                }
-                let _ = tokio::time::timeout_at(deadline, self.persist_consumer_offset()).await;
-                let client = self.client_instance.as_mut().unwrap();
-                client
-                    .unregister_consumer_until(self.consumer_config.consumer_group.as_str(), deadline)
-                    .await;
-                let _ = tokio::time::timeout_at(deadline, client.shutdown()).await;
-                info!(
-                    "the consumer [{}] shutdown OK",
-                    self.consumer_config.consumer_group.as_str()
-                );
-                self.rebalance_impl.destroy();
-                *self.service_state = ServiceState::ShutdownAlready;
-            }
-            ServiceState::ShutdownAlready => {
-                warn!(
-                    "the consumer [{}] has been shutdown, do nothing",
-                    self.consumer_config.consumer_group
-                );
+        tokio::time::timeout_at(deadline, self.cleanup_until(deadline))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn cleanup_until(&mut self, deadline: TokioInstant) -> bool {
+        let lock = self.global_lock.clone();
+        let _lock = lock.lock().await;
+        if *self.service_state == ServiceState::ShutdownAlready {
+            return true;
+        }
+        // ponytail: verified drain covers concurrent PULL consumers; orderly/POP
+        // must implement task ownership before they can advertise safe recreation.
+        if self.consume_orderly || self.pop_used {
+            return false;
+        }
+        self.work.wait().await;
+        if let Some(service) = self.consume_message_service.as_mut() {
+            service.shutdown(remaining_millis(deadline)).await;
+        }
+        if let Some(service) = self.consume_message_pop_service.as_mut() {
+            service.shutdown(remaining_millis(deadline)).await;
+        }
+        if let Some(store) = self.offset_store.as_mut() {
+            let queues = self
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .read()
+                .await;
+            let assigned = queues.keys().cloned().collect();
+            drop(queues);
+            store.persist_all(&assigned).await;
+            if !store.io_complete().await {
+                return false;
             }
         }
-        drop(_lock);
+        let queues = self
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await;
+        for queue in queues.values() {
+            queue.set_dropped(true);
+        }
+        drop(queues);
+        if let Some(client) = self.client_instance.as_mut() {
+            // A duplicate-registration failure does not own the sibling's entry.
+            if self.registered {
+                client
+                    .unregister_consumer_local(&self.consumer_config.consumer_group)
+                    .await;
+                self.registered = false;
+                // Only the owner may unregister this group remotely; notify before closing transport.
+                let remote_deadline = deadline.min(TokioInstant::now() + std::time::Duration::from_secs(1));
+                client
+                    .unregister_client_until(None, Some(self.consumer_config.consumer_group.clone()), remote_deadline)
+                    .await;
+            }
+            client.shutdown().await;
+        }
+        self.consume_message_service = None;
+        self.consume_message_pop_service = None;
+        self.pull_api_wrapper = None;
+        self.offset_store = None;
+        self.client_instance = None;
+        self.rebalance_impl.default_mqpush_consumer_impl = None;
+        self.rebalance_impl.rebalance_impl_inner.client_instance = None;
+        self.default_mqpush_consumer_impl = None;
+        *self.service_state = ServiceState::ShutdownAlready;
+        true
     }
 
     async fn update_topic_subscribe_info_when_subscription_changed(&mut self) {
@@ -716,6 +726,9 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub async fn execute_pull_request_immediately(&mut self, pull_request: PullRequest) {
+        if self.work.is_closed() {
+            return;
+        }
         self.client_instance
             .as_mut()
             .unwrap()
@@ -724,11 +737,14 @@ impl DefaultMQPushConsumerImpl {
             .await;
     }
     pub fn execute_pull_request_later(&mut self, pull_request: PullRequest, time_delay: u64) {
-        self.client_instance
-            .as_mut()
-            .unwrap()
-            .pull_message_service
-            .execute_pull_request_later(pull_request, time_delay);
+        if self.work.is_closed() {
+            return;
+        }
+        let service = self.client_instance.as_ref().unwrap().pull_message_service.clone();
+        self.work.spawn(&tokio::runtime::Handle::current(), async move {
+            tokio::time::sleep(std::time::Duration::from_millis(time_delay)).await;
+            service.execute_pull_request_immediately(pull_request).await;
+        });
     }
 
     pub async fn execute_pop_request_immediately(&mut self, pop_request: PopRequest) {
@@ -766,6 +782,8 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub(crate) async fn pop_message(&mut self, pop_request: PopRequest) {
+        let Some(_work) = self.work.enter() else { return };
+        self.pop_used = true;
         let process_queue = pop_request.get_pop_process_queue();
         if process_queue.is_dropped() {
             info!("the pop request[{}] is dropped.", pop_request);
@@ -852,6 +870,7 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub(crate) async fn pull_message(&mut self, mut pull_request: PullRequest) {
+        let Some(_work) = self.work.enter() else { return };
         //let process_queue = pull_request.get_process_queue_mut();
         if pull_request.process_queue.is_dropped() {
             info!("the pull request[{}] is dropped.", pull_request);
@@ -1066,6 +1085,7 @@ impl DefaultMQPushConsumerImpl {
         let sys_flag = PullSysFlag::build_sys_flag(commit_offset_enable, true, sub_expression.is_some(), class_filter);
         let subscription_data = subscription_data.unwrap();
         let this = self.default_mqpush_consumer_impl.clone().unwrap();
+        let Some(work) = self.work.enter() else { return };
         let result = self
             .pull_api_wrapper
             .as_mut()
@@ -1084,6 +1104,7 @@ impl DefaultMQPushConsumerImpl {
                 CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND,
                 CommunicationMode::Async,
                 DefaultPullCallback {
+                    work,
                     push_consumer_impl: this,
                     message_queue_inner: Some(message_queue_inner),
                     subscription_data: Some(subscription_data),
@@ -1542,6 +1563,9 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
     }
 
     async fn try_rebalance(&self) -> rocketmq_error::RocketMQResult<bool> {
+        let Some(_work) = self.work.enter() else {
+            return Ok(false);
+        };
         if !self.pause.load(Ordering::Acquire) {
             return Ok(self
                 .rebalance_impl
@@ -1553,6 +1577,7 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
     }
 
     async fn persist_consumer_offset(&self) {
+        let Some(_work) = self.work.enter() else { return };
         if let Err(err) = self.make_sure_state_ok() {
             error!(
                 "group: {} persistConsumerOffset exception:{}",
@@ -1578,6 +1603,7 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
     }
 
     async fn update_topic_subscribe_info(&self, topic: CheetahString, info: &HashSet<MessageQueue>) {
+        let Some(_work) = self.work.enter() else { return };
         let sub_table = self.rebalance_impl.get_subscription_inner();
         let sub_table_inner = sub_table.read().await;
         if sub_table_inner.contains_key(&topic) {
@@ -1612,6 +1638,10 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
     }
 
     async fn consumer_running_info(&self) -> rocketmq_error::RocketMQResult<ConsumerRunningInfo> {
+        let _work = self
+            .work
+            .enter()
+            .ok_or_else(|| mq_client_err!("consumer is shutting down"))?;
         // Build the snapshot without blocking the runtime thread. Copy queue entries before
         // awaiting offset reads so rebalance can continue while diagnostics run.
         let mut info = ConsumerRunningInfo::default();

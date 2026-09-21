@@ -36,6 +36,9 @@ pub type PullCallbackFn =
 pub trait PullCallbackLocal: Sync {
     async fn on_success(&mut self, pull_result: PullResultExt);
     fn on_exception(&mut self, e: Box<dyn std::error::Error + Send>);
+    fn cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        None
+    }
 }
 
 pub(crate) struct DefaultPullCallback {
@@ -43,10 +46,33 @@ pub(crate) struct DefaultPullCallback {
     pub(crate) message_queue_inner: Option<MessageQueue>,
     pub(crate) subscription_data: Option<SubscriptionData>,
     pub(crate) pull_request: Option<PullRequest>,
+    pub(crate) work: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 
 impl PullCallback for DefaultPullCallback {
+    fn cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        Some(self.push_consumer_impl.work.cancellation())
+    }
+
     async fn on_success(&mut self, mut pull_result_ext: PullResultExt) {
+        let Some(_work) = self.push_consumer_impl.work.enter() else {
+            return;
+        };
+        if self
+            .pull_request
+            .as_ref()
+            .is_none_or(|request| request.process_queue.is_dropped())
+        {
+            return;
+        }
+        if matches!(
+            pull_result_ext.pull_result.pull_status,
+            PullStatus::Found | PullStatus::NoNewMsg | PullStatus::NoMatchedMsg
+        ) {
+            if let Some(listener) = &self.push_consumer_impl.pull_progress_listener {
+                listener(pull_result_ext.pull_result.pull_status == PullStatus::Found);
+            }
+        }
         /*let push_consumer_impl = self.push_consumer_impl.upgrade();
         if push_consumer_impl.is_none() {
             warn!("push_consumer_impl is None");
@@ -151,6 +177,9 @@ impl PullCallback for DefaultPullCallback {
     }
 
     fn on_exception(&mut self, err: Box<dyn std::error::Error + Send>) {
+        let Some(_work) = self.push_consumer_impl.work.enter() else {
+            return;
+        };
         let message_queue_inner = self.message_queue_inner.take().unwrap();
         let pull_request = self.pull_request.take().unwrap();
         let topic = message_queue_inner.get_topic();

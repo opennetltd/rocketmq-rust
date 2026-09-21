@@ -638,7 +638,45 @@ impl MQPushConsumer for DefaultMQPushConsumer {
     }
 }
 
+/// A replacement is permitted only after `Complete`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsumerCleanup {
+    Complete,
+    Incomplete,
+}
+
 impl DefaultMQPushConsumer {
+    /// Uses the same deadline for lock acquisition and every local cleanup phase.
+    pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> ConsumerCleanup {
+        if self
+            .default_mqpush_consumer_impl
+            .as_mut()
+            .unwrap()
+            .shutdown_until(deadline)
+            .await
+        {
+            ConsumerCleanup::Complete
+        } else {
+            ConsumerCleanup::Incomplete
+        }
+    }
+
+    /// Dropping/cancelling the startup future is not cleanup. Always invoke
+    /// `shutdown_until` before retrying an error returned by this entry point.
+    pub async fn start_until(&mut self, deadline: tokio::time::Instant) -> rocketmq_error::RocketMQResult<()> {
+        tokio::time::timeout_at(deadline, self.start())
+            .await
+            .unwrap_or_else(|_| Err(mq_client_err!("consumer startup deadline elapsed")))
+    }
+
+    /// The closure belongs to this consumer instance, including empty successful pulls.
+    pub fn set_pull_progress_listener(&mut self, listener: impl Fn(bool) + Send + Sync + 'static) {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .unwrap()
+            .pull_progress_listener = Some(Arc::new(listener));
+    }
+
     /// Shuts down the consumer with a caller-provided total cleanup budget.
     pub async fn shutdown_with_timeout(&mut self, await_termination_millis: u64) {
         self.default_mqpush_consumer_impl
@@ -697,6 +735,32 @@ mod tests {
 
         consumer.shutdown().await;
         consumer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn canceled_start_releases_lifecycle_lock_for_verified_cleanup() {
+        let mut consumer = DefaultMQPushConsumer::builder()
+            .consumer_group("cancelled-start")
+            .build();
+        let lock = consumer
+            .default_mqpush_consumer_impl
+            .as_ref()
+            .unwrap()
+            .global_lock
+            .clone();
+        let guard = lock.lock().await;
+        assert!(consumer.start_until(tokio::time::Instant::now()).await.is_err());
+        assert_eq!(
+            consumer.shutdown_until(tokio::time::Instant::now()).await,
+            ConsumerCleanup::Incomplete
+        );
+        drop(guard);
+        assert_eq!(
+            consumer
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            ConsumerCleanup::Complete
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub struct ConsumeMessagePopConcurrentlyService {
     pub(crate) consumer_config: ArcMut<ConsumerConfig>,
     pub(crate) consumer_group: CheetahString,
     pub(crate) message_listener: ArcBoxMessageListenerConcurrently,
-    pub(crate) pop_consume_runtime: RocketMQRuntime,
+    pub(crate) pop_consume_runtime: Option<RocketMQRuntime>,
 }
 
 impl ConsumeMessagePopConcurrentlyService {
@@ -72,7 +72,10 @@ impl ConsumeMessagePopConcurrentlyService {
             consumer_config,
             consumer_group,
             message_listener,
-            pop_consume_runtime: RocketMQRuntime::new_multi(consume_thread as usize, consumer_group_tag.as_str()),
+            pop_consume_runtime: Some(RocketMQRuntime::new_multi(
+                consume_thread as usize,
+                consumer_group_tag.as_str(),
+            )),
         }
     }
 }
@@ -83,11 +86,11 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopConcurrentlyService {
     }
 
     async fn shutdown(&mut self, await_terminate_millis: u64) {
-        // The POP concurrent service does not start a background task in its
-        // current implementation. Keep shutdown idempotent until POP task
-        // ownership is implemented, rather than panicking during push-consumer
-        // lifecycle cleanup.
-        let _ = await_terminate_millis;
+        // Called by verified PULL cleanup only when no POP request was admitted.
+        if let Some(runtime) = self.pop_consume_runtime.take() {
+            runtime.shutdown();
+        }
+        self.default_mqpush_consumer_impl = None;
     }
 
     async fn consume_message_directly(
@@ -159,9 +162,13 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopConcurrentlyService {
             .collect::<Vec<ArcMut<MessageClientExt>>>();
         if msgs.len() < consume_batch_size as usize {
             let mut request = ConsumeRequest::new(msgs, Arc::new(process_queue.clone()), message_queue.clone());
-            self.pop_consume_runtime.get_handle().spawn(async move {
-                request.run(this).await;
-            });
+            self.pop_consume_runtime
+                .as_ref()
+                .unwrap()
+                .get_handle()
+                .spawn(async move {
+                    request.run(this).await;
+                });
         } else {
             msgs.chunks(consume_batch_size as usize)
                 .map(|t| t.to_vec())
@@ -170,6 +177,8 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopConcurrentlyService {
                         ConsumeRequest::new(msgs, Arc::new(process_queue.clone()), message_queue.clone());
                     let pop_consume_message_concurrently_service = this.clone();
                     self.pop_consume_runtime
+                        .as_ref()
+                        .unwrap()
                         .get_handle()
                         .spawn(async move { consume_request.run(pop_consume_message_concurrently_service).await });
                 });

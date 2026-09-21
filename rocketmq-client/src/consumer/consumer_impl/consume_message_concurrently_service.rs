@@ -49,7 +49,8 @@ pub struct ConsumeMessageConcurrentlyService {
     pub(crate) consumer_config: ArcMut<ConsumerConfig>,
     pub(crate) consumer_group: CheetahString,
     pub(crate) message_listener: ArcBoxMessageListenerConcurrently,
-    pub(crate) consume_runtime: RocketMQRuntime,
+    pub(crate) consume_runtime: Option<RocketMQRuntime>,
+    work: Arc<super::consumer_work::ConsumerWork>,
 }
 
 impl ConsumeMessageConcurrentlyService {
@@ -68,7 +69,11 @@ impl ConsumeMessageConcurrentlyService {
             consumer_config,
             consumer_group,
             message_listener,
-            consume_runtime: RocketMQRuntime::new_multi(consume_thread as usize, consumer_group_tag.as_str()),
+            consume_runtime: Some(RocketMQRuntime::new_multi(
+                consume_thread as usize,
+                consumer_group_tag.as_str(),
+            )),
+            work: Arc::new(super::consumer_work::ConsumerWork::default()),
         }
     }
 }
@@ -205,12 +210,13 @@ impl ConsumeMessageConcurrentlyService {
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
     ) {
-        self.consume_runtime.get_handle().spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let this_ = this.clone();
-            this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
-                .await;
-        });
+        self.work
+            .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let this_ = this.clone();
+                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                    .await;
+            });
     }
 
     fn submit_consume_request_later_with_delay(
@@ -221,12 +227,13 @@ impl ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         delay: Duration,
     ) {
-        self.consume_runtime.get_handle().spawn(async move {
-            tokio::time::sleep(delay).await;
-            let this_ = this.clone();
-            this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
-                .await;
-        });
+        self.work
+            .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                tokio::time::sleep(delay).await;
+                let this_ = this.clone();
+                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                    .await;
+            });
     }
 
     pub async fn send_message_back(&mut self, msg: &mut MessageExt, context: &ConsumeConcurrentlyContext) -> bool {
@@ -250,19 +257,27 @@ impl ConsumeMessageConcurrentlyService {
 
 impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
     fn start(&mut self, mut this: ArcMut<Self>) {
-        self.consume_runtime.get_handle().spawn(async move {
-            let timeout = this.consumer_config.consume_timeout;
-            let mut interval = tokio::time::interval(Duration::from_secs(timeout * 60));
-            interval.tick().await;
-            loop {
+        self.work
+            .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                let timeout = this.consumer_config.consume_timeout;
+                let mut interval = tokio::time::interval(Duration::from_secs(timeout * 60));
                 interval.tick().await;
-                this.clean_expire_msg().await;
-            }
-        });
+                loop {
+                    interval.tick().await;
+                    this.clean_expire_msg().await;
+                }
+            });
     }
 
-    async fn shutdown(&mut self, await_terminate_millis: u64) {
-        // todo!()
+    async fn shutdown(&mut self, _await_terminate_millis: u64) {
+        // The caller owns the absolute timeout. A blocked synchronous listener
+        // keeps its task token, so a timeout cannot be mistaken for safe cleanup.
+        self.work.close();
+        self.work.wait().await;
+        if let Some(runtime) = self.consume_runtime.take() {
+            runtime.shutdown();
+        }
+        self.default_mqpush_consumer_impl = None;
     }
 
     async fn consume_message_directly(
@@ -270,6 +285,11 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
         mut msg: MessageExt,
         broker_name: Option<CheetahString>,
     ) -> ConsumeMessageDirectlyResult {
+        let Some(_callback) = self.work.enter() else {
+            let mut result = ConsumeMessageDirectlyResult::default();
+            result.set_consume_result(CMResult::CRLater);
+            return result;
+        };
         info!("consumeMessageDirectly receive new message: {}", msg);
         msg.broker_name = broker_name.unwrap_or_default();
         let mq = MessageQueue::from_parts(msg.topic().clone(), msg.broker_name.clone(), msg.queue_id());
@@ -317,6 +337,9 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
     ) {
+        if self.work.is_closed() {
+            return;
+        }
         let consume_batch_size = self.consumer_config.consume_message_batch_max_size;
         if msgs.len() <= consume_batch_size as usize {
             let mut consume_request = ConsumeRequest {
@@ -329,9 +352,10 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                 default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
             };
 
-            self.consume_runtime
-                .get_handle()
-                .spawn(async move { consume_request.run(this).await });
+            self.work
+                .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                    consume_request.run(this).await
+                });
         } else {
             msgs.chunks(consume_batch_size as usize)
                 .map(|t| t.to_vec())
@@ -346,9 +370,10 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                         default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
                     };
                     let consume_message_concurrently_service = this.clone();
-                    self.consume_runtime
-                        .get_handle()
-                        .spawn(async move { consume_request.run(consume_message_concurrently_service).await });
+                    self.work
+                        .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                            consume_request.run(consume_message_concurrently_service).await
+                        });
                 });
         }
     }

@@ -28,13 +28,22 @@ pub struct LatencyFaultToleranceImpl<R, S> {
     start_detector_enable: AtomicBool,
     resolver: Option<R>,
     service_detector: Option<S>,
+    work: crate::consumer::consumer_impl::consumer_work::ConsumerWork,
 }
 
 impl<R, S> LatencyFaultToleranceImpl<R, S> {
+    pub(crate) async fn shutdown_and_wait(&mut self) {
+        self.work.close();
+        self.work.wait().await;
+        self.resolver = None;
+        self.service_detector = None;
+    }
+
     pub fn new(/*fetcher: impl Resolver, service_detector: impl ServiceDetector*/) -> Self {
         Self {
             resolver: None,
             service_detector: None,
+            work: Default::default(),
             fault_item_table: Default::default(),
             detect_timeout: 200,
             detect_interval: 2000,
@@ -105,7 +114,8 @@ where
     }
 
     fn start_detector(this: ArcMut<Self>) {
-        tokio::spawn(async move {
+        let owner = this.clone();
+        owner.work.spawn(&tokio::runtime::Handle::current(), async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 if !this.start_detector_enable.load(std::sync::atomic::Ordering::Relaxed) {
@@ -117,7 +127,9 @@ where
         });
     }
 
-    fn shutdown(&self) {}
+    fn shutdown(&self) {
+        self.work.close();
+    }
 
     async fn detect_by_one_round(&self) {
         let mut remove_set = HashSet::new();

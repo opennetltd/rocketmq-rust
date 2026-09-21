@@ -51,6 +51,13 @@ impl OffsetStore {
         }
     }
 
+    pub(crate) async fn io_complete(&self) -> bool {
+        match &self.local_file_offset_store {
+            Some(store) => store.io_complete().await,
+            None => true,
+        }
+    }
+
     pub async fn load(&self) -> rocketmq_error::RocketMQResult<()> {
         if let Some(store) = &self.remote_broker_offset_store {
             store.load().await?;

@@ -41,7 +41,8 @@ impl PullMessageService {
         let (mut shutdown, tx_shutdown) = Shutdown::new(1);
         self.tx = Some(tx);
         self.tx_shutdown = Some(tx_shutdown);
-        tokio::spawn(async move {
+        let work = instance.work.clone();
+        work.spawn(&tokio::runtime::Handle::current(), async move {
             info!(">>>>>>>>>>>>>>>>>>>>>>>PullMessageService  started<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
             /*while let Some(request) = rx.recv().await {
                 if request.get_message_request_mode() == MessageRequestMode::Pull {

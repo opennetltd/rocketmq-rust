@@ -351,6 +351,10 @@ impl MQClientAPIImpl {
         }
     }
 
+    pub async fn shutdown(&mut self) {
+        self.remoting_client.shutdown_and_wait().await;
+    }
+
     pub async fn start(&self) {
         let client = ArcMut::downgrade(&self.remoting_client);
         self.remoting_client.start(client).await;
@@ -1230,10 +1234,18 @@ impl MQClientAPIImpl {
             }
             CommunicationMode::Async => {
                 tokio::spawn(async move {
-                    let instant = Instant::now();
-                    let _ = this
-                        .pull_message_async(&addr, request, timeout_millis, pull_callback)
-                        .await;
+                    let cancellation = pull_callback.cancellation();
+                    let cancelled = async {
+                        match cancellation {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancelled => {}
+                        _ = this.pull_message_async(&addr, request, timeout_millis, pull_callback) => {}
+                    }
                 });
                 Ok(None)
             }

@@ -56,6 +56,8 @@ pub struct LocalFileOffsetStore {
     group_name: CheetahString,
     store_path: CheetahString,
     offset_table: Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>>,
+    file_io: Arc<Mutex<()>>,
+    io_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalFileOffsetStore {
@@ -72,13 +74,15 @@ impl LocalFileOffsetStore {
             group_name,
             store_path: CheetahString::from(store_path),
             offset_table: Arc::new(Mutex::new(HashMap::new())),
+            file_io: Arc::new(Mutex::new(())),
+            io_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    fn read_local_offset(&self) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
-        let content = file_utils::file_to_string(self.store_path.as_str()).unwrap_or("".to_string());
+    fn read_local_offset_at(path: &str) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
+        let content = file_utils::file_to_string(path).unwrap_or("".to_string());
         if content.is_empty() {
-            self.read_local_offset_bak()
+            Self::read_local_offset_bak(path)
         } else {
             match OffsetSerialize::decode(content.as_bytes()) {
                 Ok(value) => Ok(Some(value.into())),
@@ -86,8 +90,8 @@ impl LocalFileOffsetStore {
             }
         }
     }
-    fn read_local_offset_bak(&self) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
-        let content = file_utils::file_to_string(format!("{}{}", self.store_path, ".bak")).unwrap_or("".to_string());
+    fn read_local_offset_bak(path: &str) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
+        let content = file_utils::file_to_string(format!("{}{}", path, ".bak")).unwrap_or("".to_string());
         if content.is_empty() {
             Ok(None)
         } else {
@@ -102,9 +106,28 @@ impl LocalFileOffsetStore {
     }
 }
 
+impl LocalFileOffsetStore {
+    async fn read_local_offset(&self) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
+        let guard = self.file_io.clone().lock_owned().await;
+        let path = self.store_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            Self::read_local_offset_at(path.as_str())
+        })
+        .await
+        .map_err(|e| mq_client_err!(e.to_string()))?
+    }
+
+    pub(crate) async fn io_complete(&self) -> bool {
+        // The blocking closure owns the guard even if its awaiting future was cancelled.
+        let _guard = self.file_io.lock().await;
+        !self.io_failed.load(Ordering::Acquire)
+    }
+}
+
 impl OffsetStoreTrait for LocalFileOffsetStore {
     async fn load(&self) -> rocketmq_error::RocketMQResult<()> {
-        let offset_serialize_wrapper = self.read_local_offset()?;
+        let offset_serialize_wrapper = self.read_local_offset().await?;
         if let Some(offset_serialize_wrapper) = offset_serialize_wrapper {
             let offset_table = offset_serialize_wrapper.offset_table;
             let mut offset_table_inner = self.offset_table.lock().await;
@@ -147,7 +170,7 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
                     -1
                 }
             }
-            ReadOffsetType::ReadFromStore => match self.read_local_offset() {
+            ReadOffsetType::ReadFromStore => match self.read_local_offset().await {
                 Ok(offset_serialize_wrapper) => {
                     if let Some(offset_serialize_wrapper) = offset_serialize_wrapper {
                         if let Some(offset) = offset_serialize_wrapper.offset_table.get(mq) {
@@ -168,55 +191,38 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         if mqs.is_empty() {
             return;
         }
-        let mut offset_serialize_wrapper = match self.read_local_offset() {
-            Ok(value) => value.unwrap_or_default(),
-            Err(e) => {
-                error!("read local offset failed: {}", e);
-                return;
-            }
-        };
-
-        let offset_table = self.offset_table.lock().await;
-        for (mq, offset) in offset_table.iter() {
-            if mqs.contains(mq) {
-                offset_serialize_wrapper
-                    .offset_table
-                    .insert(mq.clone(), AtomicI64::new(offset.get_offset()));
-            }
-        }
-
-        let content = OffsetSerialize::from(offset_serialize_wrapper)
-            .serialize_json_pretty()
-            .expect("persistAll failed");
-        if !content.is_empty() {
-            if let Err(e) = file_utils::string_to_file(&content, self.store_path.as_str()) {
-                error!("persistAll consumer offset Exception, {},{}", self.store_path, e);
-            }
+        let guard = self.file_io.clone().lock_owned().await;
+        let offsets = self
+            .offset_table
+            .lock()
+            .await
+            .iter()
+            .filter(|(mq, _)| mqs.contains(mq))
+            .map(|(mq, offset)| (mq.clone(), AtomicI64::new(offset.get_offset())))
+            .collect::<HashMap<_, _>>();
+        let path = self.store_path.clone();
+        let failed = self.io_failed.clone();
+        // Mark unfinished work unsafe before spawning; panic/cancellation cannot report success.
+        failed.store(true, Ordering::Release);
+        let result = tokio::task::spawn_blocking(move || -> rocketmq_error::RocketMQResult<()> {
+            let _guard = guard;
+            let mut wrapper = Self::read_local_offset_at(path.as_str())?.unwrap_or_default();
+            wrapper.offset_table.extend(offsets);
+            let content = OffsetSerialize::from(wrapper)
+                .serialize_json_pretty()
+                .map_err(|e| mq_client_err!(e.to_string()))?;
+            file_utils::string_to_file(&content, path.as_str()).map_err(|e| mq_client_err!(e.to_string()))?;
+            failed.store(false, Ordering::Release);
+            Ok(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            error!("persistAll consumer offset failed: {}", self.store_path);
         }
     }
 
     async fn persist(&mut self, mq: &MessageQueue) {
-        let offset_table = self.offset_table.lock().await;
-        if let Some(offset) = offset_table.get(mq) {
-            let mut offset_serialize_wrapper = match self.read_local_offset() {
-                Ok(value) => value.unwrap_or_default(),
-                Err(e) => {
-                    error!("read local offset failed: {}", e);
-                    return;
-                }
-            };
-            offset_serialize_wrapper
-                .offset_table
-                .insert(mq.clone(), AtomicI64::new(offset.get_offset()));
-            let content = OffsetSerialize::from(offset_serialize_wrapper)
-                .serialize_json_pretty()
-                .expect("persist failed");
-            if !content.is_empty() {
-                if let Err(e) = file_utils::string_to_file(&content, self.store_path.as_str()) {
-                    error!("persist consumer offset Exception, {},{}", self.store_path, e);
-                }
-            }
-        }
+        self.persist_all(&HashSet::from([mq.clone()])).await;
     }
 
     async fn remove_offset(&self, mq: &MessageQueue) {

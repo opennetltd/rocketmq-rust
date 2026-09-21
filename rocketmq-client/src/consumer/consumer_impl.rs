@@ -19,6 +19,7 @@ pub(crate) mod consume_message_orderly_service;
 pub(crate) mod consume_message_pop_concurrently_service;
 pub(crate) mod consume_message_pop_orderly_service;
 pub(crate) mod consume_message_service;
+pub(crate) mod consumer_work;
 pub(crate) mod default_mq_push_consumer_impl;
 pub(crate) mod message_request;
 pub(crate) mod pop_process_queue;

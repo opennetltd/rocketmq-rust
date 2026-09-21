@@ -168,6 +168,7 @@ pub struct RocketmqDefaultClient<PR = DefaultRemotingRequestProcessor> {
     ///
     /// `None` after `shutdown()` is called
     client_runtime: Option<RocketMQRuntime>,
+    scanner: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 
     /// Shared command handler (processor + response table)
     ///
@@ -180,6 +181,24 @@ pub struct RocketmqDefaultClient<PR = DefaultRemotingRequestProcessor> {
     tx: Option<tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
 }
 impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
+    /// Stop the scanner before closing channels, so it cannot publish a late connection.
+    pub async fn shutdown_and_wait(&mut self) {
+        let scanner = self.scanner.lock().unwrap().take();
+        if let Some(scanner) = scanner {
+            scanner.abort();
+            let _ = scanner.await;
+        }
+        let clients: Vec<_> = self
+            .connection_tables
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for client in clients {
+            client.close_and_wait().await;
+        }
+        self.shutdown();
+    }
+
     pub fn new(tokio_client_config: Arc<TokioClientConfig>, processor: PR) -> Self {
         Self::new_with_cl(tokio_client_config, processor, None)
     }
@@ -208,6 +227,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
             circuit_breakers: Arc::new(DashMap::with_capacity(64)),
             connection_pool: None, // Disabled by default, enable via enable_connection_pool()
             client_runtime: Some(RocketMQRuntime::new_multi(10, "client-thread")),
+            scanner: std::sync::Mutex::new(None),
             cmd_handler: Arc::new(handler),
             tx,
         }
@@ -734,16 +754,20 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingService for Rocketmq
     async fn start(&self, this: WeakArcMut<Self>) {
         if let Some(client) = this.upgrade() {
             let connect_timeout_millis = self.tokio_client_config.connect_timeout_millis as u64;
-            self.client_runtime.as_ref().unwrap().get_handle().spawn(async move {
+            let task = self.client_runtime.as_ref().unwrap().get_handle().spawn(async move {
                 loop {
                     client.scan_available_name_srv().await;
                     time::sleep(Duration::from_millis(connect_timeout_millis)).await;
                 }
             });
+            *self.scanner.lock().unwrap() = Some(task);
         }
     }
 
     fn shutdown(&mut self) {
+        if let Some(scanner) = self.scanner.lock().unwrap().take() {
+            scanner.abort();
+        }
         for client in self.connection_tables.iter() {
             client.value().close();
         }
@@ -902,12 +926,12 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingClient for RocketmqD
         })?;
 
         // === Send request with timeout ===
-        let runtime = self.client_runtime.as_ref().ok_or_else(|| {
+        self.client_runtime.as_ref().ok_or_else(|| {
             error!("Client runtime has been shut down");
             rocketmq_error::RocketMQError::ClientNotStarted
         })?;
 
-        let send_task = runtime.get_handle().spawn(async move {
+        let send_result = async move {
             // Apply timeout at the send_read level
             match time::timeout(
                 Duration::from_millis(timeout_millis),
@@ -921,84 +945,56 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RemotingClient for RocketmqD
                     timeout_ms: timeout_millis,
                 }),
             }
-        });
+        }
+        .await;
 
-        // === Await result and record metrics ===
-        match send_task.await {
-            Ok(send_result) => {
-                let latency = start.elapsed();
+        // Keep request ownership in the caller: cancellation drops pending registration.
+        {
+            let latency = start.elapsed();
 
-                match send_result {
-                    Ok(response) => {
-                        // Record successful request latency
-                        if let Some(ref addr) = target_addr {
-                            let latency_ms = latency.as_millis() as u64;
-                            self.latency_tracker.record_success(addr, latency);
+            match send_result {
+                Ok(response) => {
+                    // Record successful request latency
+                    if let Some(ref addr) = target_addr {
+                        let latency_ms = latency.as_millis() as u64;
+                        self.latency_tracker.record_success(addr, latency);
 
-                            // Record in connection pool metrics (if enabled)
-                            if let Some(ref pool) = self.connection_pool {
-                                pool.record_success(addr, latency_ms);
-                            }
-
-                            debug!("Request to {} completed in {:?}", addr, latency);
+                        // Record in connection pool metrics (if enabled)
+                        if let Some(ref pool) = self.connection_pool {
+                            pool.record_success(addr, latency_ms);
                         }
-                        Ok(response)
+
+                        debug!("Request to {} completed in {:?}", addr, latency);
                     }
-                    Err(err) => {
-                        // Record error
-                        if let Some(ref addr) = target_addr {
-                            self.latency_tracker.record_error(addr);
+                    Ok(response)
+                }
+                Err(err) => {
+                    // Record error
+                    if let Some(ref addr) = target_addr {
+                        self.latency_tracker.record_error(addr);
 
-                            // Record in connection pool metrics (if enabled)
-                            if let Some(ref pool) = self.connection_pool {
-                                pool.record_error(addr);
-                            }
-
-                            warn!("Request to {} failed after {:?}: {:?}", addr, latency, err);
+                        // Record in connection pool metrics (if enabled)
+                        if let Some(ref pool) = self.connection_pool {
+                            pool.record_error(addr);
                         }
-                        Err(err)
+
+                        warn!("Request to {} failed after {:?}: {:?}", addr, latency, err);
                     }
+                    Err(err)
                 }
-            }
-            Err(join_err) => {
-                // Task panic or cancellation
-                error!("Send task failed: {:?}", join_err);
-
-                // Record error
-                if let Some(ref addr) = target_addr {
-                    self.latency_tracker.record_error(addr);
-                }
-
-                Err(rocketmq_error::RocketMQError::Internal(format!(
-                    "Send task error: {}",
-                    join_err
-                )))
             }
         }
     }
 
-    async fn invoke_request_oneway(&self, addr: &CheetahString, request: RemotingCommand, timeout_millis: u64) {
+    async fn invoke_request_oneway(&self, addr: &CheetahString, mut request: RemotingCommand, timeout_millis: u64) {
         let client = self.get_and_create_client(Some(addr)).await;
         match client {
             None => {
                 error!("get client failed");
             }
             Some(mut client) => {
-                self.client_runtime.as_ref().unwrap().get_handle().spawn(async move {
-                    match time::timeout(Duration::from_millis(timeout_millis), async move {
-                        let mut request = request;
-                        request.mark_oneway_rpc_ref();
-                        client.send(request).await
-                    })
-                    .await
-                    {
-                        Ok(_) => Ok::<(), rocketmq_error::RocketMQError>(()),
-                        Err(_) => Err(rocketmq_error::RocketMQError::Timeout {
-                            operation: "send_oneway",
-                            timeout_ms: timeout_millis,
-                        }),
-                    }
-                });
+                request.mark_oneway_rpc_ref();
+                let _ = time::timeout(Duration::from_millis(timeout_millis), client.send(request)).await;
             }
         }
     }

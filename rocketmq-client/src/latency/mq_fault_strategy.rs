@@ -62,6 +62,10 @@ impl MQFaultStrategy {
         }
     }
 
+    pub(crate) async fn shutdown_and_wait(&mut self) {
+        self.latency_fault_tolerance.shutdown_and_wait().await;
+    }
+
     pub fn start_detector(&mut self) {
         LatencyFaultTolerance::start_detector(self.latency_fault_tolerance.clone());
     }

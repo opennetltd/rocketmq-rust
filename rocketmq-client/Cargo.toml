@@ -24,6 +24,7 @@ serde.workspace      = true
 serde_json.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
 
 trait-variant = { workspace = true }
 num_cpus      = { workspace = true }

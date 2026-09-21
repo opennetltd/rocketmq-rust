@@ -568,8 +568,16 @@ impl ChannelInner {
         self.connection.close();
         self.pending_responses
             .fail_connection(&self.connection_id, "connection closed");
-        if let Some(task) = self.send_task.lock().expect("send task lock poisoned").take() {
+        if let Some(task) = self.send_task.lock().expect("send task lock poisoned").as_ref() {
             task.abort();
+        }
+    }
+
+    pub(crate) async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        let task = self.send_task.lock().expect("send task lock poisoned").take();
+        if let Some(task) = task {
+            let _ = task.await;
         }
     }
 

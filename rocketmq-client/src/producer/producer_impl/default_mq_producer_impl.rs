@@ -141,6 +141,25 @@ impl DefaultMQProducerImpl {
         }
     }
 
+    /// Only the factory-owned producer, after consumer work has drained.
+    pub(crate) async fn shutdown_internal(&mut self) {
+        self.mq_fault_strategy.shutdown_and_wait().await;
+        assert_eq!(
+            self.producer_config.producer_group().as_str(),
+            mix_all::CLIENT_INNER_PRODUCER_GROUP
+        );
+        if let Some(runtime) = self
+            .default_async_sender_runtime
+            .take()
+            .and_then(|rt| Arc::try_unwrap(rt).ok())
+        {
+            runtime.shutdown();
+        }
+        self.default_mqproducer_impl_inner = None;
+        self.client_instance = None;
+        self.service_state = ServiceState::ShutdownAlready;
+    }
+
     #[inline]
     pub async fn send_with_timeout<T>(
         &mut self,
