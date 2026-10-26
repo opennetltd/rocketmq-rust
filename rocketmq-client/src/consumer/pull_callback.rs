@@ -22,12 +22,55 @@ use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_rust::ArcMut;
 use tracing::warn;
 
+use crate::consumer::consumer_impl::consumer_lifecycle::PullFailureKind;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
 use crate::consumer::consumer_impl::pull_request_ext::PullResultExt;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::consumer::pull_status::PullStatus;
+
+/// Maps a pull failure onto the smallest repair that can help (plan 49 section 4.2). Route and
+/// broker misses are addressable by a coalesced route refresh; timeouts are expected while a
+/// broker is slow and must not escalate on their own.
+fn classify_pull_failure(err: &(dyn std::error::Error + Send + 'static)) -> PullFailureKind {
+    if let Some(error) = err.downcast_ref::<RocketmqError>() {
+        match error {
+            RocketmqError::RemotingTimeoutError(_, _) => return PullFailureKind::RpcTimeout,
+            RocketmqError::MQClientBrokerError(broker_error) => {
+                return match ResponseCode::from(broker_error.response_code()) {
+                    // Both mean the address book is stale; a coalesced route refresh can fix it.
+                    ResponseCode::TopicNotExist | ResponseCode::ServiceNotAvailable => {
+                        PullFailureKind::RouteOrBrokerMiss
+                    }
+                    _ => classify_text(broker_error.error_message().map_or("", |text| text.as_str())),
+                };
+            }
+            _ => {}
+        }
+    }
+    classify_text(&err.to_string())
+}
+
+fn is_route_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("not exist") || text.contains("route") || text.contains("no broker") || text.contains("connect to")
+}
+
+fn is_timeout_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("timeout") || text.contains("timed out")
+}
+
+fn classify_text(text: &str) -> PullFailureKind {
+    if is_route_text(text) {
+        PullFailureKind::RouteOrBrokerMiss
+    } else if is_timeout_text(text) {
+        PullFailureKind::RpcTimeout
+    } else {
+        PullFailureKind::Other
+    }
+}
 
 pub type PullCallbackFn =
     Arc<dyn FnOnce(Option<PullResultExt>, Option<Box<dyn std::error::Error + Send>>) + Send + Sync>;
@@ -83,6 +126,29 @@ impl PullCallback for DefaultPullCallback {
         let message_queue_inner = self.message_queue_inner.take().unwrap();
         let subscription_data = self.subscription_data.take().unwrap();
         let mut pull_request = self.pull_request.take().unwrap();
+
+        // SDK-owned progress observation (plan 49 section 4.2): a response for an owned queue is
+        // progress whether or not it carried messages, and anything handed to the delivery layer
+        // stays counted until its listener returns, so a stalled callback cannot look like
+        // idleness.
+        {
+            let found = matches!(pull_result_ext.pull_result.pull_status, PullStatus::Found)
+                && pull_result_ext
+                    .pull_result
+                    .msg_found_list
+                    .as_ref()
+                    .is_some_and(|list| !list.is_empty());
+            let pending = pull_result_ext
+                .pull_result
+                .msg_found_list
+                .as_ref()
+                .map_or(0, |list| list.len());
+            let progress = &push_consumer_impl.progress;
+            progress.note_pull_completed(&message_queue_inner, found);
+            if pending > 0 {
+                progress.note_delivery_pending(pending as u64);
+            }
+        }
 
         push_consumer_impl
             .pull_api_wrapper
@@ -182,6 +248,11 @@ impl PullCallback for DefaultPullCallback {
         };
         let message_queue_inner = self.message_queue_inner.take().unwrap();
         let pull_request = self.pull_request.take().unwrap();
+        // Classifying the failure keeps recovery proportional: a route or broker miss is repaired
+        // in place, an RPC timeout is only watched, and neither is reported as a bare count.
+        self.push_consumer_impl
+            .progress
+            .note_pull_failed(&message_queue_inner, classify_pull_failure(err.as_ref()));
         let topic = message_queue_inner.get_topic();
         if !topic.starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
             if let Some(er) = err.downcast_ref::<RocketmqError>() {

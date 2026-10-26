@@ -646,6 +646,57 @@ pub enum ConsumerCleanup {
 }
 
 impl DefaultMQPushConsumer {
+    /// The SDK-owned progress bus of this instance. Shared with the recovery controller so it can
+    /// observe real work transitions without an application observer.
+    pub(crate) fn progress(&self) -> Arc<crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .expect("default_mqpush_consumer_impl is None")
+            .progress
+            .clone()
+    }
+
+    /// Replace the progress bus before startup. Used by the managed entry point so one controller
+    /// can observe each incarnation it builds.
+    pub(crate) fn set_progress(
+        &mut self,
+        progress: Arc<crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress>,
+    ) {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .expect("default_mqpush_consumer_impl is None")
+            .progress = progress;
+    }
+
+    /// In-place repair used by the recovery controller: refresh the route of every subscribed
+    /// topic through the normal publish path, reconcile broker state, then wake this client's own
+    /// rebalance so each queue gets at most one new pull request. Never registers a second client.
+    pub(crate) async fn repair_routes_and_rebalance(&mut self) {
+        let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() else {
+            return;
+        };
+        let topics: Vec<cheetah_string::CheetahString> = impl_
+            .consumer_config
+            .subscription
+            .keys()
+            .cloned()
+            .collect();
+        let Some(instance) = impl_.client_instance.clone() else {
+            return;
+        };
+        let mut instance = instance;
+        for topic in &topics {
+            let refreshed = instance
+                .as_mut()
+                .repair_route_after_broker_miss(topic, Duration::from_millis(500))
+                .await;
+            if !refreshed {
+                tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
+            }
+        }
+        instance.re_balance_immediately();
+    }
+
     /// Uses the same deadline for lock acquisition and every local cleanup phase.
     pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> ConsumerCleanup {
         if self

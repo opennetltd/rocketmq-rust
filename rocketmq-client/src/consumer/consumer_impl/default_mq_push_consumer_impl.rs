@@ -65,6 +65,7 @@ use crate::consumer::consumer_impl::consume_message_pop_concurrently_service::Co
 use crate::consumer::consumer_impl::consume_message_pop_orderly_service::ConsumeMessagePopOrderlyService;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessagePopServiceGeneral;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceGeneral;
+use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
@@ -138,6 +139,8 @@ pub struct DefaultMQPushConsumerImpl {
     queue_max_span_flow_control_times: u64,
     pub(crate) pop_delay_level: Arc<[i32; 16]>,
     default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
+    /// SDK-owned progress bus for this incarnation, updated at real work transitions.
+    pub(crate) progress: Arc<ConsumerProgress>,
 }
 
 impl DefaultMQPushConsumerImpl {
@@ -172,6 +175,7 @@ impl DefaultMQPushConsumerImpl {
             offset_store: None,
             consume_message_service: None,
             consume_message_pop_service: None,
+            progress: ConsumerProgress::new(),
             queue_flow_control_times: 0,
             queue_max_span_flow_control_times: 0,
             pop_delay_level: Arc::new([
@@ -461,7 +465,8 @@ impl DefaultMQPushConsumerImpl {
                     .unregister_consumer_local(&self.consumer_config.consumer_group)
                     .await;
                 self.registered = false;
-                // Only the owner may unregister this group remotely; notify before closing transport.
+                // Only the owner may unregister this group remotely; notify before closing
+                // transport.
                 let remote_deadline = deadline.min(TokioInstant::now() + std::time::Duration::from_secs(1));
                 client
                     .unregister_client_until(None, Some(self.consumer_config.consumer_group.clone()), remote_deadline)
@@ -740,6 +745,7 @@ impl DefaultMQPushConsumerImpl {
         if self.work.is_closed() {
             return;
         }
+        self.progress.note_retry_scheduled();
         let service = self.client_instance.as_ref().unwrap().pull_message_service.clone();
         self.work.spawn(&tokio::runtime::Handle::current(), async move {
             tokio::time::sleep(std::time::Duration::from_millis(time_delay)).await;
@@ -876,6 +882,9 @@ impl DefaultMQPushConsumerImpl {
             info!("the pull request[{}] is dropped.", pull_request);
             return;
         }
+        // Observation only: the SDK counts real work transitions so recovery never has to trust an
+        // application observer. Leases stay with the pull loop itself.
+        self.progress.note_pull_started(pull_request.get_message_queue());
         if let Err(e) = self.make_sure_state_ok() {
             if !self.is_terminal_state() {
                 self.execute_pull_request_later(pull_request, self.pull_time_delay_mills_when_exception);
@@ -909,6 +918,7 @@ impl DefaultMQPushConsumerImpl {
                     self.queue_flow_control_times
                 );
             }
+            self.progress.note_flow_control();
             pull_request.process_queue.mark_flow_control();
             let stall_ms = pull_request.process_queue.flow_control_stall_ms();
             if stall_ms > *crate::consumer::consumer_impl::PULL_MAX_IDLE_TIME / 2 {
@@ -954,6 +964,7 @@ impl DefaultMQPushConsumerImpl {
                     cached_message_size_in_mib,
                 );
             }
+            self.progress.note_flow_control();
             self.execute_pull_request_later(pull_request, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL);
             self.queue_flow_control_times += 1;
             return;
@@ -977,6 +988,7 @@ impl DefaultMQPushConsumerImpl {
                     );
                 }
                 self.queue_max_span_flow_control_times += 1;
+                self.progress.note_flow_control();
                 pull_request.process_queue.mark_flow_control();
                 let stall_ms = pull_request.process_queue.flow_control_stall_ms();
                 if stall_ms > *crate::consumer::consumer_impl::PULL_MAX_IDLE_TIME / 2 {
@@ -1599,6 +1611,9 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
                 .mut_from_ref()
                 .persist_all(&allocate_mq)
                 .await;
+            if !allocate_mq.is_empty() {
+                self.progress.note_offset_persisted();
+            }
         }
     }
 

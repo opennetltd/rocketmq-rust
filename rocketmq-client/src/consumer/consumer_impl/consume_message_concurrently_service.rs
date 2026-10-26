@@ -33,6 +33,7 @@ use tracing::warn;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
+use crate::consumer::consumer_impl::consumer_lifecycle::DeliveryGuard;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -401,6 +402,17 @@ struct ConsumeRequest {
 
 impl ConsumeRequest {
     async fn run(&mut self, mut consume_message_concurrently_service: ArcMut<ConsumeMessageConcurrentlyService>) {
+        // SDK-owned delivery accounting (plan 49 section 4.2): the guard is armed before any early
+        // return so a revoked queue still releases the batch it will never deliver, and a listener
+        // that blocks or unwinds cannot leave pending work counted forever.
+        let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
+        let mut delivery = (!self.msgs.is_empty()).then(|| {
+            DeliveryGuard::new(
+                &default_mqpush_consumer_impl.progress,
+                &self.message_queue,
+                self.msgs.len(),
+            )
+        });
         if self.process_queue.is_dropped() {
             info!(
                 "the message queue not be able to consume, because it's dropped. group={} {}",
@@ -409,8 +421,6 @@ impl ConsumeRequest {
             return;
         }
         let mut context = ConsumeConcurrentlyContext::new(self.message_queue.clone());
-
-        let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
         let consumer_group = self.consumer_group.clone();
         DefaultMQPushConsumerImpl::try_reset_pop_retry_topic(&mut self.msgs, consumer_group.as_str());
         default_mqpush_consumer_impl.reset_retry_and_namespace(&mut self.msgs, consumer_group.as_str());
@@ -448,6 +458,9 @@ impl ConsumeRequest {
                 default_mqpush_consumer_impl.execute_hook_before(&mut consume_message_context);
             }
             let vec = self.msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>();
+            if let Some(delivery) = delivery.as_mut() {
+                delivery.enter_listener();
+            }
             match self.message_listener.consume_message(&vec, &mut context) {
                 Ok(value) => {
                     status = Some(value);

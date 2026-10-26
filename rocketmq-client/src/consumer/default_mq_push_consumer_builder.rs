@@ -23,12 +23,21 @@ use rocketmq_rust::ArcMut;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::allocate_message_queue_strategy::AllocateMessageQueueStrategy;
+use crate::consumer::consumer_impl::consumer_lifecycle::LifecyclePolicy;
 use crate::consumer::default_mq_push_consumer::ConsumerConfig;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
+use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
+use crate::consumer::listener::consume_concurrently_status::ConsumeConcurrentlyStatus;
+use crate::consumer::managed_consumer::start_managed;
+use crate::consumer::managed_consumer::ManagedConsumerHandle;
+use crate::consumer::managed_consumer::ManagedConsumerSpec;
+use crate::consumer::managed_consumer::ManagedListener;
 use crate::consumer::message_queue_listener::MessageQueueListener;
 use crate::consumer::mq_push_consumer::MQPushConsumer;
 use crate::trace::trace_dispatcher::TraceDispatcher;
+use rocketmq_common::common::message::message_ext::MessageExt;
 
+#[derive(Clone)]
 pub struct DefaultMQPushConsumerBuilder {
     client_config: Option<ClientConfig>,
     consumer_group: Option<CheetahString>,
@@ -108,6 +117,73 @@ impl Default for DefaultMQPushConsumerBuilder {
 }
 
 impl DefaultMQPushConsumerBuilder {
+    /// The consumer group that will actually be used. One resolution shared by `build()` and the
+    /// managed entry point so both agree on identity (plan 49 section 3.1).
+    pub(crate) fn effective_group(&self) -> CheetahString {
+        self.consumer_group.clone().unwrap_or_default()
+    }
+
+    /// Consumer group as configured; empty when unset.
+    pub fn consumer_group_ref(&self) -> &str {
+        self.consumer_group.as_deref().unwrap_or("")
+    }
+
+    /// Every topic/expression pair this builder will subscribe.
+    pub fn subscriptions(&self) -> Vec<(CheetahString, CheetahString)> {
+        let mut pairs: Vec<(CheetahString, CheetahString)> = self
+            .subscription
+            .as_ref()
+            .map(|subscription| {
+                subscription
+                    .iter()
+                    .map(|(topic, expression)| (topic.clone(), expression.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let (Some(topic), Some(expression)) = (&self.topic_sub_expression.0, &self.topic_sub_expression.1) {
+            pairs.push((topic.clone(), expression.clone()));
+        }
+        pairs
+    }
+
+    /// Detach the application's queue-assignment listener so the managed path can compose it with
+    /// the SDK's own assignment observation.
+    pub(crate) fn take_message_queue_listener(&mut self) -> Option<Arc<Box<dyn MessageQueueListener>>> {
+        self.message_queue_listener.take()
+    }
+
+    /// Validate and normalise this builder into an immutable, thread-safe spec. Shared by the
+    /// managed entry point; `build()` keeps its existing permissive behaviour for compatibility.
+    pub fn build_spec(self) -> ManagedConsumerSpec {
+        ManagedConsumerSpec::new(self)
+    }
+
+    /// Start an SDK-owned consumer (plan 49 section 3.1). The SDK owns startup budget, bounded
+    /// backoff, in-place repair, incarnation replacement and cleanup blocking; the application
+    /// contributes this listener only. Invalid configuration is reported here and never retried,
+    /// and no failure on this path ever exits the process.
+    pub fn start_managed<L>(self, listener: L) -> Result<ManagedConsumerHandle, rocketmq_error::RocketMQError>
+    where
+        L: Fn(
+                &[&MessageExt],
+                &mut ConsumeConcurrentlyContext,
+            ) -> rocketmq_error::RocketMQResult<ConsumeConcurrentlyStatus>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.start_managed_arc(Arc::new(listener))
+    }
+
+    /// [`Self::start_managed`] with an already shared listener handle.
+    pub fn start_managed_arc(
+        self,
+        listener: ManagedListener,
+    ) -> Result<ManagedConsumerHandle, rocketmq_error::RocketMQError> {
+        let spec = ManagedConsumerSpec::new(self).with_listener(listener);
+        start_managed(spec, LifecyclePolicy::default())
+    }
+
     pub fn name_server_addr(mut self, name_server_addr: impl Into<CheetahString>) -> Self {
         if let Some(client_config) = self.client_config.as_mut() {
             client_config.namesrv_addr = Some(name_server_addr.into());
