@@ -12,5 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod message_util;
 pub(crate) mod log_gate;
+pub mod message_util;

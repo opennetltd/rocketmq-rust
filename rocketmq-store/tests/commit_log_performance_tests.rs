@@ -174,7 +174,9 @@ async fn test_no_latency_spikes() {
     for _i in 0..num_messages {
         let start = Instant::now();
         let _msg = create_test_message("SpikeTest", 0, 500 * 1024); // 500KB
-                                                                    // In real test: commit_log.put_message(msg).await
+                                                                    // In real test:
+                                                                    // commit_log.put_message(msg).
+                                                                    // await
         tokio::time::sleep(Duration::from_micros(100)).await; // Simulate write
         latencies.push(start.elapsed());
     }

@@ -19,7 +19,9 @@ impl TraceConstants {
     pub const CONTENT_SPLITOR: char = '\u{0001}';
     pub const FIELD_SPLITOR: char = '\u{0002}';
     pub const TRACE_INSTANCE_NAME: &'static str = "PID_CLIENT_INNER_TRACE_PRODUCER";
-    pub const TRACE_TOPIC_PREFIX: &'static str = "TRACE_DATA_"; // Adjusted for TopicValidator.SYSTEM_TOPIC_PREFIX
+    pub const TRACE_TOPIC_PREFIX: &'static str = "TRACE_DATA_"; // Adjusted for
+                                                                // TopicValidator.
+                                                                // SYSTEM_TOPIC_PREFIX
     pub const TO_PREFIX: &'static str = "To_";
     pub const FROM_PREFIX: &'static str = "From_";
     pub const END_TRANSACTION: &'static str = "EndTransaction";
