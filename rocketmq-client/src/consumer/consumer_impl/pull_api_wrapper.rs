@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cheetah_string::CheetahString;
 use rand::Rng;
@@ -45,6 +46,10 @@ use crate::hook::filter_message_context::FilterMessageContext;
 use crate::hook::filter_message_hook::FilterMessageHook;
 use crate::implementation::communication_mode::CommunicationMode;
 use crate::implementation::mq_client_api_impl::MQClientAPIImpl;
+
+/// Upper bound on how long a pull or pop waits for another caller's route refresh. The
+/// request's own timeout always wins (plan 49 section 4.1.4).
+const BROKER_MISS_JOIN_BUDGET_MILLIS: u64 = 500;
 
 #[derive(Clone)]
 pub struct PullAPIWrapper {
@@ -253,15 +258,24 @@ impl PullAPIWrapper {
             .await;
 
         if find_broker_result.is_none() {
-            self.client_instance
-                .update_topic_route_info_from_name_server_topic(mq.get_topic_cs())
-                .await;
-            let broker_name_again = self.client_instance.get_broker_name_from_message_queue(mq).await;
-            let broker_id_again = self.recalculate_pull_from_which_node(mq);
-            find_broker_result = self
+            // Coalesce the repair across every queue of this topic: one miss fetches, the rest
+            // join it or take its cooldown, and an exhausted wait budget re-checks the tables
+            // without another round trip (plan 49 section 4.1.4).
+            let repaired = self
                 .client_instance
-                .find_broker_address_in_subscribe(&broker_name_again, broker_id_again, false)
+                .repair_route_after_broker_miss(
+                    mq.get_topic_cs(),
+                    Duration::from_millis(timeout_millis.min(BROKER_MISS_JOIN_BUDGET_MILLIS)),
+                )
                 .await;
+            if repaired {
+                let broker_name_again = self.client_instance.get_broker_name_from_message_queue(mq).await;
+                let broker_id_again = self.recalculate_pull_from_which_node(mq);
+                find_broker_result = self
+                    .client_instance
+                    .find_broker_address_in_subscribe(&broker_name_again, broker_id_again, false)
+                    .await;
+            }
         }
 
         if let Some(find_broker_result) = find_broker_result {
@@ -378,13 +392,20 @@ impl PullAPIWrapper {
             .find_broker_address_in_subscribe(mq.get_broker_name(), mix_all::MASTER_ID, true)
             .await;
         if find_broker_result.is_none() {
-            self.client_instance
-                .update_topic_route_info_from_name_server_topic(mq.get_topic_cs())
-                .await;
-            find_broker_result = self
+            // Same coalesced repair as the pull path (plan 49 section 4.1.4).
+            let repaired = self
                 .client_instance
-                .find_broker_address_in_subscribe(mq.get_broker_name(), mix_all::MASTER_ID, true)
+                .repair_route_after_broker_miss(
+                    mq.get_topic_cs(),
+                    Duration::from_millis(timeout.min(BROKER_MISS_JOIN_BUDGET_MILLIS)),
+                )
                 .await;
+            if repaired {
+                find_broker_result = self
+                    .client_instance
+                    .find_broker_address_in_subscribe(mq.get_broker_name(), mix_all::MASTER_ID, true)
+                    .await;
+            }
         }
         if let Some(find_broker_result) = find_broker_result {
             let mut request_header = PopMessageRequestHeader {

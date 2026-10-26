@@ -13,3 +13,4 @@
 // limitations under the License.
 
 pub mod message_util;
+pub(crate) mod log_gate;

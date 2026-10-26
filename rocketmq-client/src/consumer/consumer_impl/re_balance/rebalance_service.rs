@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,8 +73,13 @@ static MIN_INTERVAL: Lazy<Duration> = Lazy::new(|| {
 
 #[derive(Clone)]
 pub struct RebalanceService {
+    /// Single-waiter wake channel. `notify_one` stores at most one permit, so a
+    /// notification raised while a pass is running is retained instead of lost
+    /// (plan 49 section 4.1.5). Notification count is deliberately not a pass count.
     notify: Arc<Notify>,
     tx_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    wakeups: Arc<AtomicU64>,
+    passes: Arc<AtomicU64>,
 }
 
 impl RebalanceService {
@@ -80,11 +87,24 @@ impl RebalanceService {
         RebalanceService {
             notify: Arc::new(Notify::new()),
             tx_shutdown: None,
+            wakeups: Arc::new(AtomicU64::new(0)),
+            passes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Wakeups observed since construction. Diagnostics only; never a health signal.
+    pub fn wakeup_count(&self) -> u64 {
+        self.wakeups.load(Ordering::Relaxed)
+    }
+
+    /// Rebalance passes actually executed since construction.
+    pub fn pass_count(&self) -> u64 {
+        self.passes.load(Ordering::Relaxed)
     }
 
     pub async fn start(&mut self, mut instance: ArcMut<MQClientInstance>) {
         let notify = self.notify.clone();
+        let passes = self.passes.clone();
         let (mut shutdown, tx_shutdown) = Shutdown::new(1);
         self.tx_shutdown = Some(tx_shutdown);
         let work = instance.work.clone();
@@ -107,6 +127,7 @@ impl RebalanceService {
                     real_wait_interval = min_interval - interval;
                 } else {
                     // Rebalance operation, the core of RebalanceService
+                    passes.fetch_add(1, Ordering::Relaxed);
                     let balanced = instance.do_rebalance().await;
                     real_wait_interval = if balanced { *WAIT_INTERVAL } else { min_interval };
                     last_rebalance_timestamp = Instant::now();
@@ -115,8 +136,11 @@ impl RebalanceService {
         });
     }
 
+    /// Requests one rebalance pass. Bursts coalesce into a single retained wake, but a
+    /// wake raised during a running pass is never dropped.
     pub fn wakeup(&self) {
-        self.notify.notify_waiters();
+        self.wakeups.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_one();
     }
 
     pub fn shutdown(&self) {
@@ -127,5 +151,44 @@ impl RebalanceService {
         } else {
             warn!("Shutdown called before start; no shutdown signal sent");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    async fn take_wake(service: &RebalanceService) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), service.notify.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn notification_burst_retains_exactly_one_pending_wake() {
+        let service = RebalanceService::new();
+        for _ in 0..5_408 {
+            service.wakeup();
+        }
+        assert_eq!(service.wakeup_count(), 5_408);
+        // One retained wake means one pass, and a second wait has nothing left.
+        assert!(take_wake(&service).await);
+        assert!(!take_wake(&service).await);
+    }
+
+    #[tokio::test]
+    async fn wake_raised_while_a_pass_runs_is_not_lost() {
+        let service = RebalanceService::new();
+        let waiter_service = service.clone();
+        // Simulate the pass window: nobody is awaiting notified() yet.
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            waiter_service.wakeup();
+        })
+        .await
+        .unwrap();
+        assert!(take_wake(&service).await);
     }
 }
