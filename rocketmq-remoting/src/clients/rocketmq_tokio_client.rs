@@ -392,7 +392,7 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         // Cache the selection only if the configuration did not change while selecting.
         {
             let mut state = self.nameserver.write().expect("nameserver state lock poisoned");
-            if state.generation != generation || !state.addresses.contains(&selected_addr) {
+            if state.generation != generation || !state.addresses.contains(selected_addr) {
                 return None;
             }
             state.selected = Some(selected_addr.clone());

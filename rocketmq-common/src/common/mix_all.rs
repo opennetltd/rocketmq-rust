@@ -78,7 +78,7 @@ pub fn is_sys_consumer_group(consumer_group: &str) -> bool {
 }
 
 pub fn is_sys_consumer_group_for_no_cold_read_limit(consumer_group: &str) -> bool {
-    if consumer_group == DEFAULT_CONSUMER_GROUP
+    consumer_group == DEFAULT_CONSUMER_GROUP
         || consumer_group == TOOLS_CONSUMER_GROUP
         || consumer_group == SCHEDULE_CONSUMER_GROUP
         || consumer_group == FILTERSRV_CONSUMER_GROUP
@@ -90,10 +90,6 @@ pub fn is_sys_consumer_group_for_no_cold_read_limit(consumer_group: &str) -> boo
         || consumer_group == CID_ONSAPI_PULL_GROUP
         || consumer_group == CID_SYS_RMQ_TRANS
         || consumer_group.starts_with(CID_RMQ_SYS_PREFIX)
-    {
-        return true;
-    }
-    false
 }
 
 pub fn get_retry_topic(consumer_group: &str) -> String {

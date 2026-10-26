@@ -37,6 +37,9 @@ impl ControllableOffset {
         }
     }
 
+    // `fetch_update` was renamed to `try_update` on newer toolchains only; keeping the
+    // old spelling here so older compilers can still build this crate.
+    #[allow(deprecated)]
     pub fn update(&self, target: i64, increase_only: bool) {
         if self.allow_to_update.load(Ordering::SeqCst) {
             self.value
@@ -59,6 +62,7 @@ impl ControllableOffset {
         self.update(target, false);
     }
 
+    #[allow(deprecated)] // see `update`
     pub fn update_and_freeze(&self, target: i64) {
         self.value
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
