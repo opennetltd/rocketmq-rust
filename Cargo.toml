@@ -25,7 +25,6 @@ resolver = "2"
 version = "0.8.0"
 authors = ["mxsm <mxsm@apache.org>"]
 edition = "2021"
-homepage = "https://github.com/mxsm/rocketmq-rust"
 repository = "https://github.com/mxsm/rocketmq-rust"
 license = "MIT OR Apache-2.0"
 keywords = [
