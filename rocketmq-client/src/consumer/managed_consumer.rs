@@ -91,8 +91,10 @@ impl ConsumerPhase {
     }
 }
 
-/// Health of the current phase. `Healthy` explicitly includes empty traffic, zero assignment and
-/// an expected long poll; only real faults or unproved cleanup degrade it.
+/// Health of the current phase. `Healthy` explicitly includes empty traffic, an assignment that was
+/// observed as empty against a known route, and an expected long poll; only real faults or unproved
+/// cleanup degrade it. A zero assignment with no route behind it is a failed assignment refresh,
+/// which is a fault and reports `Degraded`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConsumerHealth {
     #[default]

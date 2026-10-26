@@ -219,6 +219,39 @@ impl DefaultMQPushConsumerImpl {
         *self.service_state == ServiceState::Running
     }
 
+    /// Records whether the latest rebalance pass could see a route for its own subscriptions. Plan
+    /// 49 section 3.2 calls a zero assignment healthy only when it was explicit; without route
+    /// evidence the managed lifecycle reports a failed assignment refresh and repairs. Retry
+    /// and DLQ topics follow their main subscription and never decide the outcome.
+    pub(crate) async fn note_route_observation(&self) {
+        let subscriptions = self.rebalance_impl.rebalance_impl_inner.subscription_inner.read().await;
+        let topics: Vec<CheetahString> = subscriptions
+            .keys()
+            .filter(|topic| {
+                !topic.starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX)
+                    && !topic.starts_with(mix_all::DLQ_GROUP_TOPIC_PREFIX)
+            })
+            .cloned()
+            .collect();
+        drop(subscriptions);
+        if topics.is_empty() {
+            return;
+        }
+        let routes = self
+            .rebalance_impl
+            .rebalance_impl_inner
+            .topic_subscribe_info_table
+            .read()
+            .await;
+        // A topic with no usable queues is not evidence of a route either.
+        let seen = topics
+            .iter()
+            .filter(|topic| routes.get(*topic).is_some_and(|set| !set.is_empty()))
+            .count();
+        drop(routes);
+        self.progress.note_route_observation(seen == topics.len());
+    }
+
     pub fn new(
         client_config: ClientConfig,
         consumer_config: ArcMut<ConsumerConfig>,
@@ -1692,11 +1725,13 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
             return Ok(false);
         };
         if !self.pause.load(Ordering::Acquire) {
-            return Ok(self
+            let changed = self
                 .rebalance_impl
                 .mut_from_ref()
                 .do_rebalance(self.consume_orderly)
-                .await);
+                .await;
+            self.note_route_observation().await;
+            return Ok(changed);
         }
         Ok(false)
     }

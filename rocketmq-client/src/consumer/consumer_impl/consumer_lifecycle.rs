@@ -178,6 +178,10 @@ pub(crate) struct ProgressSnapshot {
     pub last_callback_progress_ms: u64,
     pub last_assignment_ms: u64,
     pub last_offset_ms: u64,
+    /// Timestamps of the latest rebalance observation that could see a topic route, and of the
+    /// latest one that could not. Which is newer decides whether a zero assignment is explicit.
+    pub last_route_ok_ms: u64,
+    pub last_route_miss_ms: u64,
 }
 
 impl ProgressSnapshot {
@@ -246,6 +250,8 @@ pub(crate) struct ConsumerProgress {
     last_callback_progress_ms: AtomicU64,
     last_assignment_ms: AtomicU64,
     last_offset_ms: AtomicU64,
+    last_route_ok_ms: AtomicU64,
+    last_route_miss_ms: AtomicU64,
     queues: parking_lot::RwLock<HashMap<MessageQueue, QueueProgress>>,
 }
 
@@ -335,6 +341,17 @@ impl ConsumerProgress {
 
     pub(crate) fn note_flow_control(&self) {
         self.bump(&self.flow_controls);
+    }
+
+    /// Records what the latest rebalance pass could actually see. A pass with no route for this
+    /// consumer's own subscriptions is a failed assignment refresh, which section 3.2 treats as a
+    /// fault to repair; only a pass that saw routes can prove that a zero assignment was explicit.
+    pub(crate) fn note_route_observation(&self, routed: bool) {
+        if routed {
+            self.stamp(&self.last_route_ok_ms);
+        } else {
+            self.stamp(&self.last_route_miss_ms);
+        }
     }
 
     /// Publishes a new assignment. Queues seen for the first time, or again after revocation,
@@ -451,6 +468,8 @@ impl ConsumerProgress {
             last_callback_progress_ms: self.last_callback_progress_ms.load(Ordering::Relaxed),
             last_assignment_ms: self.last_assignment_ms.load(Ordering::Relaxed),
             last_offset_ms: self.last_offset_ms.load(Ordering::Relaxed),
+            last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
+            last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -717,6 +736,25 @@ impl RecoveryMachine {
 
         // Healthy idle: explicit zero assignment in CLUSTERING, or successful empty pulls.
         if snapshot.assigned_queues == 0 && !snapshot.has_pending_work() {
+            // "Explicitly assigned zero queues" needs evidence: the newest rebalance pass has to
+            // have seen a topic route. When it could not, this is a failed assignment refresh and
+            // is reported as such. It repairs in place and deliberately does not spend
+            // the replacement budget - replacing an incarnation cannot fix a
+            // control-plane outage.
+            if snapshot.last_route_miss_ms > snapshot.last_route_ok_ms {
+                self.state = MachineState {
+                    phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
+                    health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
+                    reason: Reason::AssignmentRefreshFailed,
+                };
+                return (
+                    self.state,
+                    vec![
+                        Effect::Repair(RepairKind::Assignment),
+                        Effect::Idle(self.policy.progress_check),
+                    ],
+                );
+            }
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -939,6 +977,65 @@ mod tests {
         let snap = progress.snapshot(Duration::from_millis(1));
         assert_eq!(snap.assigned_queues, 5_408);
         assert_eq!(snap.stalled_queues, 5_407);
+    }
+
+    /// Section 3.2: only an assignment observed against a known route is "explicitly zero". With no
+    /// route evidence the consumer reports a failed assignment refresh and repairs in place.
+    #[test]
+    fn zero_assignment_without_route_evidence_is_a_fault_not_healthy_idle() {
+        let progress = ConsumerProgress::new();
+        progress.note_route_observation(false);
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (started, _) = machine.on_start_result(true, true, false, 0.5);
+        assert_eq!(started.phase, crate::consumer::managed_consumer::ConsumerPhase::Running);
+        let snap = snapshot(&progress);
+        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        assert_eq!(
+            state.phase,
+            crate::consumer::managed_consumer::ConsumerPhase::Recovering
+        );
+        assert_eq!(
+            state.health,
+            crate::consumer::managed_consumer::ConsumerHealth::Degraded
+        );
+        assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
+        assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
+    }
+
+    #[test]
+    fn an_explicitly_empty_assignment_stays_healthy_idle() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        progress.note_route_observation(true);
+        assigned(&progress, 0);
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, true, false, 0.5);
+        let snap = snapshot(&progress);
+        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        assert_eq!(state.phase, crate::consumer::managed_consumer::ConsumerPhase::Running);
+        assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
+        assert_eq!(state.reason, Reason::WaitingForAssignment);
+        assert_eq!(effects, vec![Effect::Idle(policy.progress_check)]);
+    }
+
+    /// A control-plane outage is not fixed by rolling an incarnation, so repeated fruitless repairs
+    /// on an unroutable consumer must never reach the replacement effect.
+    #[test]
+    fn an_unroutable_consumer_never_spends_the_replacement_budget() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        progress.note_route_observation(false);
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, true, false, 0.5);
+        let snap = snapshot(&progress);
+        for _ in 0..policy.max_repairs_before_replace + 8 {
+            let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+            assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
+            assert!(
+                !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+                "replacement would not restore a missing route: {effects:?}"
+            );
+        }
     }
 
     #[test]
