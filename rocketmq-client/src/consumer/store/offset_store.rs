@@ -15,11 +15,44 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use tokio::time::Instant as TokioInstant;
+
 use rocketmq_common::common::message::message_queue::MessageQueue;
 
 use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+
+/// Outcome of one deadline-bounded offset persistence pass (plan 49 section 4.3). Reported as a
+/// bounded summary; individual queue failures stay at DEBUG so cleanup cannot amplify logs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistSummary {
+    pub attempted: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    /// Assigned offsets left unwritten because the cleanup budget ran out first.
+    pub skipped: u64,
+}
+
+impl std::fmt::Display for PersistSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "attempted={} succeeded={} failed={} skipped={}",
+            self.attempted, self.succeeded, self.failed, self.skipped
+        )
+    }
+}
+
+/// Per-write RPC timeout inside a bounded pass: never more than five seconds and never more than
+/// what the caller's deadline still allows. Zero means there is no budget left to spend.
+pub(crate) fn offset_rpc_timeout(remaining: std::time::Duration) -> u64 {
+    let remaining = remaining.as_millis().min(u64::MAX as u128) as u64;
+    remaining.min(OFFSET_WRITE_TIMEOUT_MILLIS)
+}
+
+/// One remote offset write is a single best-effort RPC; five seconds is the historical ceiling.
+pub(crate) const OFFSET_WRITE_TIMEOUT_MILLIS: u64 = 5_000;
 
 pub struct OffsetStore {
     remote_broker_offset_store: Option<RemoteBrokerOffsetStore>,
@@ -49,6 +82,35 @@ impl OffsetStore {
             remote_broker_offset_store: None,
             local_file_offset_store: Some(local_file_offset_store),
         }
+    }
+
+    /// Persist assigned offsets without exceeding `deadline`. The returned summary is the cleanup
+    /// session's evidence: a short budget leaves offsets recorded as skipped, never silently lost.
+    pub(crate) async fn persist_all_until(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        deadline: TokioInstant,
+    ) -> PersistSummary {
+        let mut summary = PersistSummary::default();
+        if let Some(store) = self.remote_broker_offset_store.as_mut() {
+            let remote = store.persist_all_until(mqs, deadline).await;
+            summary.attempted += remote.attempted;
+            summary.succeeded += remote.succeeded;
+            summary.failed += remote.failed;
+            summary.skipped += remote.skipped;
+        }
+        if let Some(store) = self.local_file_offset_store.as_mut() {
+            // The file writer owns its guard and cannot be parallelised with a second writer.
+            let count = mqs.len() as u64;
+            summary.attempted += count;
+            store.persist_all(mqs).await;
+            if store.io_complete().await {
+                summary.succeeded += count;
+            } else {
+                summary.failed += count;
+            }
+        }
+        summary
     }
 
     pub(crate) async fn io_complete(&self) -> bool {
@@ -158,6 +220,13 @@ pub trait OffsetStoreTrait {
 
     async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>);
 
+    /// Bounded variant used by cleanup. Stores that issue remote writes override this so broker
+    /// lookup, route refresh and the send all share one deadline.
+    async fn persist_all_until(&mut self, mqs: &HashSet<MessageQueue>, _deadline: TokioInstant) -> PersistSummary {
+        self.persist_all(mqs).await;
+        PersistSummary::default()
+    }
+
     async fn persist(&mut self, mq: &MessageQueue);
 
     async fn remove_offset(&self, mq: &MessageQueue);
@@ -170,4 +239,29 @@ pub trait OffsetStoreTrait {
         offset: i64,
         is_oneway: bool,
     ) -> rocketmq_error::RocketMQResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn an_offset_write_never_outruns_the_cleanup_budget() {
+        assert_eq!(offset_rpc_timeout(Duration::from_secs(9)), OFFSET_WRITE_TIMEOUT_MILLIS);
+        assert_eq!(offset_rpc_timeout(Duration::from_millis(120)), 120);
+        assert_eq!(offset_rpc_timeout(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn a_persist_summary_reports_what_the_budget_did_not_reach() {
+        let summary = PersistSummary {
+            attempted: 7,
+            succeeded: 4,
+            failed: 1,
+            skipped: 2,
+        };
+        assert_eq!(summary.to_string(), "attempted=7 succeeded=4 failed=1 skipped=2");
+    }
 }

@@ -25,12 +25,19 @@ use rocketmq_remoting::protocol::header::update_consumer_offset_header::UpdateCo
 use rocketmq_remoting::rpc::rpc_request_header::RpcRequestHeader;
 use rocketmq_rust::ArcMut;
 use tokio::sync::Mutex;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::consumer::store::controllable_offset::ControllableOffset;
+
+use tokio::time::Instant as TokioInstant;
+
+use crate::consumer::store::offset_store::offset_rpc_timeout;
 use crate::consumer::store::offset_store::OffsetStoreTrait;
+use crate::consumer::store::offset_store::PersistSummary;
+use crate::consumer::store::offset_store::OFFSET_WRITE_TIMEOUT_MILLIS;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::factory::mq_client_instance::MQClientInstance;
 
@@ -96,6 +103,98 @@ impl RemoteBrokerOffsetStore {
             Err(mq_client_err!(format!("broker not found, {}", mq.get_broker_name())))
         }
     }
+
+    /// Assigned offsets plus the unused entries pruned from the table. Kept out of the send loop so
+    /// a stalled broker cannot hold the table lock.
+    async fn snapshot_assigned(&mut self, mqs: &HashSet<MessageQueue>) -> Vec<(MessageQueue, i64)> {
+        let mut unused_mq = HashSet::new();
+        let mut used_mq = Vec::new();
+        if mqs.is_empty() {
+            return used_mq;
+        }
+        let mut offset_table = self.offset_table.lock().await;
+        for (mq, offset) in offset_table.iter_mut() {
+            if mqs.contains(mq) {
+                let offset = offset.get_offset();
+                used_mq.push((mq.clone(), offset));
+            } else {
+                unused_mq.insert(mq.clone());
+            }
+        }
+        for mq in unused_mq {
+            offset_table.remove(&mq);
+            info!("remove unused mq, {}, {}", mq, self.group_name);
+        }
+        used_mq
+    }
+
+    /// One offset write including its broker lookup and any route refresh. `timeout_millis` bounds
+    /// the send only; a cleanup pass bounds the whole step from the outside so lookup and refresh
+    /// cannot silently outlive the caller's deadline.
+    async fn write_offset(
+        &mut self,
+        mq: &MessageQueue,
+        offset: i64,
+        is_oneway: bool,
+        timeout_millis: u64,
+    ) -> rocketmq_error::RocketMQResult<()> {
+        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+        let mut find_broker_result = self
+            .client_instance
+            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+            .await;
+
+        if find_broker_result.is_none() {
+            self.client_instance
+                .update_topic_route_info_from_name_server_topic(mq.get_topic_cs())
+                .await;
+            let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+            find_broker_result = self
+                .client_instance
+                .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+                .await;
+        }
+
+        if let Some(find_broker_result) = find_broker_result {
+            let request_header = UpdateConsumerOffsetRequestHeader {
+                consumer_group: self.group_name.clone(),
+                topic: mq.get_topic_cs().clone(),
+                queue_id: mq.get_queue_id(),
+                commit_offset: offset,
+                topic_request_header: Some(TopicRequestHeader {
+                    lo: None,
+                    rpc: Some(RpcRequestHeader {
+                        namespace: None,
+                        namespaced: None,
+                        broker_name: Some(CheetahString::from_string(mq.get_broker_name().to_string())),
+                        oneway: None,
+                    }),
+                }),
+            };
+            if is_oneway {
+                self.client_instance
+                    .mq_client_api_impl
+                    .as_mut()
+                    .unwrap()
+                    .update_consumer_offset_oneway(
+                        find_broker_result.broker_addr.as_str(),
+                        request_header,
+                        timeout_millis,
+                    )
+                    .await?;
+            } else {
+                self.client_instance
+                    .mq_client_api_impl
+                    .as_mut()
+                    .unwrap()
+                    .update_consumer_offset(&find_broker_result.broker_addr, request_header, timeout_millis)
+                    .await?;
+            };
+            Ok(())
+        } else {
+            Err(mq_client_err!(format!("broker not found, {}", mq.get_broker_name())))
+        }
+    }
 }
 
 impl OffsetStoreTrait for RemoteBrokerOffsetStore {
@@ -156,27 +255,45 @@ impl OffsetStoreTrait for RemoteBrokerOffsetStore {
         -3
     }
 
+    /// Writes assigned offsets one at a time. Sequential on purpose: the client handle is borrowed
+    /// mutably per write, so there is never more than one in-flight write (and therefore never more
+    /// than the eight the cleanup budget allows) nor two mutable aliases of the same client.
+    async fn persist_all_until(&mut self, mqs: &HashSet<MessageQueue>, deadline: TokioInstant) -> PersistSummary {
+        let mut summary = PersistSummary::default();
+        // Snapshot only the assigned offsets once; the table lock is never held across I/O.
+        let pending = self.snapshot_assigned(mqs).await;
+        for (mq, offset) in pending {
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
+            let timeout = offset_rpc_timeout(remaining);
+            if timeout == 0 {
+                // No budget: report it instead of starting a write that would be cut off.
+                summary.skipped += 1;
+                continue;
+            }
+            summary.attempted += 1;
+            // A one-way write is best effort and cannot be confirmed, so finishing its dispatch is
+            // the most this pass can claim.
+            let step = self.write_offset(&mq, offset, true, timeout);
+            match tokio::time::timeout(remaining, step).await {
+                Ok(Ok(())) => summary.succeeded += 1,
+                Ok(Err(e)) => {
+                    debug!("[persistAll] updateConsumeOffsetToBroker failed, {},{}", mq, e);
+                    summary.failed += 1;
+                }
+                Err(_) => {
+                    debug!("[persistAll] offset write cut off by the cleanup deadline, {}", mq);
+                    summary.failed += 1;
+                }
+            }
+        }
+        summary
+    }
+
     async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>) {
         if mqs.is_empty() {
             return;
         }
-        let mut unused_mq = HashSet::new();
-        let mut used_mq = Vec::new();
-        let mut offset_table = self.offset_table.lock().await;
-        for (mq, offset) in offset_table.iter_mut() {
-            if mqs.contains(mq) {
-                let offset = offset.get_offset();
-                used_mq.push((mq.clone(), offset));
-            } else {
-                unused_mq.insert(mq.clone());
-            }
-        }
-        for mq in unused_mq {
-            offset_table.remove(&mq);
-            info!("remove unused mq, {}, {}", mq, self.group_name);
-        }
-        drop(offset_table);
-
+        let used_mq = self.snapshot_assigned(mqs).await;
         for (mq, offset) in used_mq {
             match self.update_consume_offset_to_broker(&mq, offset, true).await {
                 Ok(_) => {
@@ -239,57 +356,7 @@ impl OffsetStoreTrait for RemoteBrokerOffsetStore {
         offset: i64,
         is_oneway: bool,
     ) -> rocketmq_error::RocketMQResult<()> {
-        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
-        let mut find_broker_result = self
-            .client_instance
-            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
-            .await;
-
-        if find_broker_result.is_none() {
-            self.client_instance
-                .update_topic_route_info_from_name_server_topic(mq.get_topic_cs())
-                .await;
-            let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
-            find_broker_result = self
-                .client_instance
-                .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
-                .await;
-        }
-
-        if let Some(find_broker_result) = find_broker_result {
-            let request_header = UpdateConsumerOffsetRequestHeader {
-                consumer_group: self.group_name.clone(),
-                topic: mq.get_topic_cs().clone(),
-                queue_id: mq.get_queue_id(),
-                commit_offset: offset,
-                topic_request_header: Some(TopicRequestHeader {
-                    lo: None,
-                    rpc: Some(RpcRequestHeader {
-                        namespace: None,
-                        namespaced: None,
-                        broker_name: Some(CheetahString::from_string(mq.get_broker_name().to_string())),
-                        oneway: None,
-                    }),
-                }),
-            };
-            if is_oneway {
-                self.client_instance
-                    .mq_client_api_impl
-                    .as_mut()
-                    .unwrap()
-                    .update_consumer_offset_oneway(find_broker_result.broker_addr.as_str(), request_header, 5_000)
-                    .await?;
-            } else {
-                self.client_instance
-                    .mq_client_api_impl
-                    .as_mut()
-                    .unwrap()
-                    .update_consumer_offset(&find_broker_result.broker_addr, request_header, 5_000)
-                    .await?;
-            };
-            Ok(())
-        } else {
-            Err(mq_client_err!(format!("broker not found, {}", mq.get_broker_name())))
-        }
+        self.write_offset(mq, offset, is_oneway, OFFSET_WRITE_TIMEOUT_MILLIS)
+            .await
     }
 }

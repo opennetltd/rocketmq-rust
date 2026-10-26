@@ -675,12 +675,7 @@ impl DefaultMQPushConsumer {
         let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() else {
             return;
         };
-        let topics: Vec<cheetah_string::CheetahString> = impl_
-            .consumer_config
-            .subscription
-            .keys()
-            .cloned()
-            .collect();
+        let topics: Vec<cheetah_string::CheetahString> = impl_.consumer_config.subscription.keys().cloned().collect();
         let Some(instance) = impl_.client_instance.clone() else {
             return;
         };
@@ -786,6 +781,25 @@ mod tests {
 
         consumer.shutdown().await;
         consumer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_second_stop_after_proved_cleanup_adds_nothing() {
+        let mut consumer = DefaultMQPushConsumer::builder().consumer_group("repeated-stop").build();
+        assert_eq!(
+            consumer
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            ConsumerCleanup::Complete
+        );
+        // Repeated stop is a no-op: the first proved pass is the answer, and asking again must not
+        // start another cleanup operation or report it as unfinished.
+        assert_eq!(
+            consumer
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            ConsumerCleanup::Complete
+        );
     }
 
     #[tokio::test]

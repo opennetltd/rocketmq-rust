@@ -301,10 +301,10 @@ impl MQClientInstance {
                                 broker_addr_table
                                     .iter()
                                     .flat_map(|(broker_name, broker_addrs)| {
-                                        broker_addrs.iter().filter_map(|(id, addr)| {
-                                            (addr == remote_address.to_string().as_str())
-                                                .then(|| (broker_name.clone(), *id, addr.clone()))
-                                        })
+                                        broker_addrs
+                                            .iter()
+                                            .filter(|(_, addr)| *addr == remote_address.to_string().as_str())
+                                            .map(|(id, addr)| (broker_name.clone(), *id, addr.clone()))
                                     })
                                     .collect::<Vec<_>>()
                             };

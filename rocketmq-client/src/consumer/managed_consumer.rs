@@ -959,6 +959,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_waiter_deadline_bounds_only_the_visible_wait() {
+        let handle = start_managed(spec(), LifecyclePolicy::default()).expect("managed consumer starts");
+        // An already-elapsed deadline cannot wait; it must not be reported as a failure of cleanup
+        // nor start a second session.
+        let first = handle.shutdown_until(tokio::time::Instant::now()).await;
+        assert!(matches!(first, ShutdownOutcome::Complete | ShutdownOutcome::Pending));
+        assert!(handle.stop_requested());
+
+        // A later caller attaches to the same SDK-owned session, which kept running in the
+        // background, and may observe its completion.
+        let second = handle
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        if matches!(first, ShutdownOutcome::Complete) {
+            assert_eq!(second, ShutdownOutcome::Complete, "a proved outcome is remembered");
+        }
+        assert!(matches!(second, ShutdownOutcome::Complete | ShutdownOutcome::Pending));
+        assert_ne!(handle.status().health, ConsumerHealth::ConfigurationError);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_the_handle_requests_stop_without_waiting() {
         let handle = start_managed(spec(), LifecyclePolicy::default()).expect("managed consumer starts");
         drop(handle);

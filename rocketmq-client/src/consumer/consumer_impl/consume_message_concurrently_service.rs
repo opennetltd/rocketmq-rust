@@ -52,6 +52,8 @@ pub struct ConsumeMessageConcurrentlyService {
     pub(crate) message_listener: ArcBoxMessageListenerConcurrently,
     pub(crate) consume_runtime: Option<RocketMQRuntime>,
     work: Arc<super::consumer_work::ConsumerWork>,
+    /// Shared with the push consumer: one close stops admission on both sides.
+    delivery: Arc<super::consumer_work::DeliveryGate>,
 }
 
 impl ConsumeMessageConcurrentlyService {
@@ -61,6 +63,7 @@ impl ConsumeMessageConcurrentlyService {
         consumer_group: CheetahString,
         message_listener: ArcBoxMessageListenerConcurrently,
         default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
+        delivery: Arc<super::consumer_work::DeliveryGate>,
     ) -> Self {
         let consume_thread = consumer_config.consume_thread_max;
         let consumer_group_tag = format!("{}_{}", "ConsumeMessageThread_", consumer_group);
@@ -75,6 +78,7 @@ impl ConsumeMessageConcurrentlyService {
                 consumer_group_tag.as_str(),
             )),
             work: Arc::new(super::consumer_work::ConsumerWork::default()),
+            delivery,
         }
     }
 }
@@ -270,10 +274,17 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
             });
     }
 
+    /// Stops accepting new delivery without waiting for anything; idempotent so every cleanup
+    /// entry point may call it before it awaits a tracker.
+    fn begin_shutdown(&mut self) {
+        self.delivery.close();
+        self.work.close();
+    }
+
     async fn shutdown(&mut self, _await_terminate_millis: u64) {
         // The caller owns the absolute timeout. A blocked synchronous listener
         // keeps its task token, so a timeout cannot be mistaken for safe cleanup.
-        self.work.close();
+        self.begin_shutdown();
         self.work.wait().await;
         if let Some(runtime) = self.consume_runtime.take() {
             runtime.shutdown();
@@ -351,6 +362,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                 dispatch_to_consume,
                 consumer_group: self.consumer_group.clone(),
                 default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                delivery: self.delivery.clone(),
             };
 
             self.work
@@ -369,6 +381,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                         dispatch_to_consume,
                         consumer_group: self.consumer_group.clone(),
                         default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                        delivery: self.delivery.clone(),
                     };
                     let consume_message_concurrently_service = this.clone();
                     self.work
@@ -398,6 +411,7 @@ struct ConsumeRequest {
     dispatch_to_consume: bool,
     consumer_group: CheetahString,
     default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
+    delivery: Arc<super::consumer_work::DeliveryGate>,
 }
 
 impl ConsumeRequest {
@@ -420,6 +434,13 @@ impl ConsumeRequest {
             );
             return;
         }
+        // Listener admission (plan 49 section 4.3): claimed atomically before anything is executed.
+        // A batch that never started is rejected here without advancing its offsets, while a batch
+        // that did start holds the permit until its commit, so cleanup drains it instead of losing
+        // it. The lock is not held across the listener call.
+        let Some(_admission) = self.delivery.admit() else {
+            return;
+        };
         let mut context = ConsumeConcurrentlyContext::new(self.message_queue.clone());
         let consumer_group = self.consumer_group.clone();
         DefaultMQPushConsumerImpl::try_reset_pop_retry_topic(&mut self.msgs, consumer_group.as_str());

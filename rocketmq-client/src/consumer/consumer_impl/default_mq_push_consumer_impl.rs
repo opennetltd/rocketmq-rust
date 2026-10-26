@@ -66,6 +66,7 @@ use crate::consumer::consumer_impl::consume_message_pop_orderly_service::Consume
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessagePopServiceGeneral;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceGeneral;
 use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
+use crate::consumer::consumer_impl::consumer_work::DeliveryGate;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
@@ -100,6 +101,73 @@ const CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: u64 = 1000 * 30;
 const MAX_POP_INVISIBLE_TIME: u64 = 300000;
 const MIN_POP_INVISIBLE_TIME: u64 = 5000;
 const ASYNC_TIMEOUT: u64 = 3000;
+
+/// Bounded summary of one cleanup pass: fixed phase timings, the first blocker and whether local
+/// quiescence was proved. Emitted once when the pass ends so a slow teardown is diagnosable without
+/// turning every teardown step into its own log line (plan 49 section 4.3).
+struct CleanupReport {
+    group: CheetahString,
+    phases: Vec<(&'static str, std::time::Duration)>,
+    blocker: Option<&'static str>,
+    detail: Option<String>,
+    complete: bool,
+}
+
+impl CleanupReport {
+    /// Fixed number of recorded phases; cleanup has a fixed shape, so this cannot grow.
+    const MAX_PHASES: usize = 8;
+
+    fn new(group: CheetahString) -> Self {
+        Self {
+            group,
+            phases: Vec::with_capacity(Self::MAX_PHASES),
+            blocker: None,
+            detail: None,
+            complete: false,
+        }
+    }
+
+    fn record(&mut self, phase: &'static str, started: TokioInstant) {
+        if self.phases.len() < Self::MAX_PHASES {
+            self.phases.push((phase, started.elapsed()));
+        }
+    }
+
+    fn block(&mut self, blocker: &'static str) {
+        self.blocker.get_or_insert(blocker);
+    }
+
+    /// One extra fact about the pass; only the first is kept so the line stays bounded.
+    fn detail(&mut self, detail: String) {
+        if self.detail.is_none() {
+            self.detail = Some(detail);
+        }
+    }
+}
+
+impl Drop for CleanupReport {
+    fn drop(&mut self) {
+        let phases = self
+            .phases
+            .iter()
+            .map(|(name, took)| format!("{name}={}ms", took.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = self.detail.as_deref().unwrap_or("");
+        info!(
+            "consumer cleanup group={}, complete={}, blocker={}, {}{}",
+            self.group,
+            self.complete,
+            self.blocker.unwrap_or("none"),
+            phases,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" {detail}")
+            }
+        );
+    }
+}
 
 fn remaining_millis(deadline: TokioInstant) -> u64 {
     deadline
@@ -141,6 +209,9 @@ pub struct DefaultMQPushConsumerImpl {
     default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
     /// SDK-owned progress bus for this incarnation, updated at real work transitions.
     pub(crate) progress: Arc<ConsumerProgress>,
+    /// Listener admission shared with the consume service; closed first on cleanup so a batch that
+    /// never started is rejected instead of racing teardown.
+    pub(crate) delivery: Arc<DeliveryGate>,
 }
 
 impl DefaultMQPushConsumerImpl {
@@ -176,6 +247,7 @@ impl DefaultMQPushConsumerImpl {
             consume_message_service: None,
             consume_message_pop_service: None,
             progress: ConsumerProgress::new(),
+            delivery: Arc::new(DeliveryGate::default()),
             queue_flow_control_times: 0,
             queue_max_span_flow_control_times: 0,
             pop_delay_level: Arc::new([
@@ -298,6 +370,7 @@ impl DefaultMQPushConsumerImpl {
                             self.consumer_config.consumer_group.clone(),
                             listener.clone().expect("listener is None"),
                             self.default_mqpush_consumer_impl.clone(),
+                            self.delivery.clone(),
                         ));
                         self.consume_message_service = Some(ArcMut::new(ConsumeMessageServiceGeneral::new(
                             Some(consume_message_concurrently_service),
@@ -408,8 +481,11 @@ impl DefaultMQPushConsumerImpl {
 
     /// False means local cleanup is unproved; callers must not start a replacement.
     pub(crate) async fn shutdown_until(&mut self, deadline: TokioInstant) -> bool {
+        // Admission closes immediately and unconditionally: no new pull and no new listener batch.
+        // The cleanup session itself is not cancellable; a caller deadline only bounds the wait.
         self.pause.store(true, Ordering::Release);
         self.work.close();
+        self.delivery.close();
         self.rebalance_impl.invalidate_rebalance_generation();
         tokio::time::timeout_at(deadline, self.cleanup_until(deadline))
             .await
@@ -417,23 +493,41 @@ impl DefaultMQPushConsumerImpl {
     }
 
     async fn cleanup_until(&mut self, deadline: TokioInstant) -> bool {
+        // Declared first so it drops last: the summary is emitted once this pass ends on any path,
+        // including an early return, and after the cleanup lock is released.
+        let mut report = CleanupReport::new(self.consumer_config.consumer_group.clone());
         let lock = self.global_lock.clone();
         let _lock = lock.lock().await;
         if *self.service_state == ServiceState::ShutdownAlready {
+            // Repeated stop: the first pass already proved cleanup, so this one adds nothing.
+            report.complete = true;
             return true;
         }
         // ponytail: verified drain covers concurrent PULL consumers; orderly/POP
         // must implement task ownership before they can advertise safe recreation.
         if self.consume_orderly || self.pop_used {
+            report.block("orderly_or_pop_consumer");
             return false;
         }
+        // Begin consume-service shutdown before awaiting either tracker so a scheduled retry cannot
+        // be re-admitted while the delivery tracker drains.
+        if let Some(service) = self.consume_message_service.as_mut() {
+            service.begin_shutdown();
+        }
+        let started = TokioInstant::now();
         self.work.wait().await;
+        report.record("scheduled_work", started);
+        let started = TokioInstant::now();
+        self.delivery.wait().await;
+        report.record("delivery", started);
+        let started = TokioInstant::now();
         if let Some(service) = self.consume_message_service.as_mut() {
             service.shutdown(remaining_millis(deadline)).await;
         }
         if let Some(service) = self.consume_message_pop_service.as_mut() {
             service.shutdown(remaining_millis(deadline)).await;
         }
+        report.record("consume_service", started);
         if let Some(store) = self.offset_store.as_mut() {
             let queues = self
                 .rebalance_impl
@@ -443,11 +537,20 @@ impl DefaultMQPushConsumerImpl {
                 .await;
             let assigned = queues.keys().cloned().collect();
             drop(queues);
-            store.persist_all(&assigned).await;
+            // One bounded pass: broker lookup, route refresh and the send all share the cleanup
+            // deadline, and anything the budget could not reach is reported, not hidden.
+            let started = TokioInstant::now();
+            let summary = store.persist_all_until(&assigned, deadline).await;
+            report.record("offset_persist", started);
+            report.detail(format!("offsets[{summary}]"));
             if !store.io_complete().await {
+                // The local file writer still owns the pending write; report it instead of claiming
+                // a second writer finished the job.
+                report.block("offset_file_writer_busy");
                 return false;
             }
         }
+        // No offset store means nothing was ever persisted, which is proved, not blocked.
         let queues = self
             .rebalance_impl
             .rebalance_impl_inner
@@ -459,6 +562,7 @@ impl DefaultMQPushConsumerImpl {
         }
         drop(queues);
         if let Some(client) = self.client_instance.as_mut() {
+            let started = TokioInstant::now();
             // A duplicate-registration failure does not own the sibling's entry.
             if self.registered {
                 client
@@ -467,12 +571,20 @@ impl DefaultMQPushConsumerImpl {
                 self.registered = false;
                 // Only the owner may unregister this group remotely; notify before closing
                 // transport.
-                let remote_deadline = deadline.min(TokioInstant::now() + std::time::Duration::from_secs(1));
+                // The attempt gets at most five seconds of what is left, and never less than a
+                // finalization reserve, so teardown cannot be cut off mid-release.
+                let remaining = deadline.saturating_duration_since(TokioInstant::now());
+                let reserve = std::time::Duration::from_secs(2).min(remaining / 4);
+                let remote_budget = remaining.saturating_sub(reserve).min(std::time::Duration::from_secs(5));
+                let remote_deadline = TokioInstant::now() + remote_budget;
                 client
                     .unregister_client_until(None, Some(self.consumer_config.consumer_group.clone()), remote_deadline)
                     .await;
             }
+            report.record("unregister", started);
+            let started = TokioInstant::now();
             client.shutdown().await;
+            report.record("client_shutdown", started);
         }
         self.consume_message_service = None;
         self.consume_message_pop_service = None;
@@ -483,6 +595,7 @@ impl DefaultMQPushConsumerImpl {
         self.rebalance_impl.rebalance_impl_inner.client_instance = None;
         self.default_mqpush_consumer_impl = None;
         *self.service_state = ServiceState::ShutdownAlready;
+        report.complete = true;
         true
     }
 

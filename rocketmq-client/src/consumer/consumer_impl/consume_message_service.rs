@@ -62,6 +62,17 @@ where
         }
     }
 
+    /// Stops accepting new delivery on every owned service. Idempotent and non-blocking, so a
+    /// cleanup session can close admission before it awaits any tracker.
+    pub fn begin_shutdown(&mut self) {
+        if let Some(consume_message_concurrently_service) = &mut self.consume_message_concurrently_service {
+            consume_message_concurrently_service.begin_shutdown();
+        }
+        if let Some(consume_message_orderly_service) = &mut self.consume_message_orderly_service {
+            consume_message_orderly_service.begin_shutdown();
+        }
+    }
+
     pub async fn shutdown(&mut self, await_terminate_millis: u64) {
         if let Some(consume_message_concurrently_service) = &mut self.consume_message_concurrently_service {
             consume_message_concurrently_service
@@ -271,6 +282,10 @@ pub trait ConsumeMessageServiceTrait {
     ///
     /// * `await_terminate_millis` - The number of milliseconds to wait for termination.
     async fn shutdown(&mut self, await_terminate_millis: u64);
+
+    /// Close admission without waiting. Implementations that cannot prove listener quiescence keep
+    /// the default no-op and are reported as unproved by cleanup.
+    fn begin_shutdown(&mut self) {}
 
     /// Updates the core pool size of the service.
     ///
