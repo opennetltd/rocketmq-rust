@@ -3,7 +3,6 @@ name                   = "rocketmq-rust"
 version.workspace      = true
 authors.workspace      = true
 edition.workspace      = true
-homepage.workspace     = true
 repository.workspace   = true
 license.workspace      = true
 keywords.workspace     = true
@@ -42,3 +41,7 @@ path = "examples/basic_usage_more.rs"
 [[example]]
 name = "advanced_usage"
 path = "examples/advanced_usage.rs"
+
+# Cargo's manifest lint does not look at example targets; tracing-subscriber is used by examples/.
+[lints.cargo]
+unused_dependencies = "allow"

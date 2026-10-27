@@ -39,6 +39,13 @@ pub struct WeakArcMut<T: ?Sized> {
     inner: Weak<SyncUnsafeCell<T>>,
 }
 
+// Safety: these are exactly the bounds the compiler derives from `Weak<SyncUnsafeCell<T>>` - a
+// handle may cross threads only when the referent may be shared and moved. Naming them here keeps
+// the requirement from being unfolded through the wrapper again for every type that contains one of
+// itself, which otherwise overflows the evaluation depth (a self-referential admin/broker type).
+unsafe impl<T: Send + Sync + ?Sized> Send for WeakArcMut<T> {}
+unsafe impl<T: Send + Sync + ?Sized> Sync for WeakArcMut<T> {}
+
 // Implementation of PartialEq for WeakArcMut<T>
 impl<T: PartialEq + ?Sized> PartialEq for WeakArcMut<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -87,6 +94,13 @@ impl<T: ?Sized> WeakArcMut<T> {
 pub struct ArcMut<T: ?Sized> {
     inner: Arc<SyncUnsafeCell<T>>,
 }
+
+// Safety: these are exactly the bounds the compiler derives from `Arc<SyncUnsafeCell<T>>` - a
+// handle may cross threads only when the referent may be shared and moved. Naming them here keeps
+// the requirement from being unfolded through the wrapper again for every type that contains one of
+// itself, which otherwise overflows the evaluation depth (a self-referential admin/broker type).
+unsafe impl<T: Send + Sync + ?Sized> Send for ArcMut<T> {}
+unsafe impl<T: Send + Sync + ?Sized> Sync for ArcMut<T> {}
 
 // Implementation of PartialEq for ArcMut<T>
 impl<T: PartialEq + ?Sized> PartialEq for ArcMut<T> {

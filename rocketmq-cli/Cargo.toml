@@ -3,7 +3,6 @@ name                   = "rocketmq-cli"
 version.workspace      = true
 authors.workspace      = true
 edition.workspace      = true
-homepage.workspace     = true
 repository.workspace   = true
 license.workspace      = true
 keywords               = ["rocketmq", "cli", "tools"]

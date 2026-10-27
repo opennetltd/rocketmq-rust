@@ -3,7 +3,6 @@ name                   = "rocketmq-runtime"
 version.workspace      = true
 authors.workspace      = true
 edition.workspace      = true
-homepage.workspace     = true
 repository.workspace   = true
 license.workspace      = true
 keywords               = ["Runtime", "async", "tokio", "futures"]

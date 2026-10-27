@@ -3,7 +3,6 @@ name = "rocketmq-store"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords = [
@@ -120,3 +119,8 @@ harness = false
 name              = "io_uring_performance"
 harness           = false
 required-features = ["io_uring"]
+
+# Cargo's manifest lint evaluates the host platform only; sys-info backs the io_uring kernel-version
+# probe, which is compiled on Linux with the io_uring feature.
+[lints.cargo]
+unused_dependencies = "allow"
