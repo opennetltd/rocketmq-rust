@@ -84,6 +84,9 @@ path = "examples/ordermessage/ordermessage_consumer.rs"
 name = "transaction-producer"
 path = "examples/transaction/transaction_producer.rs"
 
+# Not "pop-consumer": rocketmq-example publishes an example under that target name too, and two
+# packages writing the same file into the shared target directory is a cargo warning today and a
+# hard error upstream. This one is the client-only variant; the examples crate adds admin setup.
 [[example]]
-name = "pop-consumer"
+name = "pop-consumer-basic"
 path = "examples/consumer/pop_consumer.rs"

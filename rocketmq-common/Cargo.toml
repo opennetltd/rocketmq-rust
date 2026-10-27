@@ -58,7 +58,6 @@ iana-time-zone   = "0.1"
 
 parking_lot             = { workspace = true }
 once_cell               = { workspace = true }
-tempfile                = "3.24.0"
 trait-variant.workspace = true
 
 dashmap   = "6.1.0"
@@ -76,6 +75,9 @@ cheetah-string = { workspace = true }
 opentelemetry = { workspace = true }
 
 [dev-dependencies]
+# Used only by #[cfg(test)] code (utils/file_utils.rs); as a normal dependency cargo reports it
+# unused because the manifest lint does not look at test-only use.
+tempfile  = "3.24.0"
 mockall   = "0.14.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 
