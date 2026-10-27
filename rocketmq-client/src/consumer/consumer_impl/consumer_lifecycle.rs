@@ -1274,4 +1274,60 @@ mod tests {
             assert!(reason.as_str().len() <= 32);
         }
     }
+
+    /// Plan 49 section 5: a hundred repair/replacement cycles may not accumulate per-consumer
+    /// bookkeeping. Fruitless repairs roll guarded incarnations; the shared progress state they
+    /// hand to the next incarnation has to come back to baseline - no leaked pull leases, no
+    /// queue entries added or lost by rolling, and a bounded repair counter.
+    #[test]
+    fn a_hundred_replacement_cycles_return_resources_to_baseline() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 8);
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, true, false, 0.5);
+
+        let mut replacements = 0u32;
+        let mut ticks = 0u32;
+        while replacements < 100 {
+            ticks += 1;
+            assert!(ticks < 10_000, "replacements are not being reached");
+            for id in 0..8 {
+                let mq = queue("T", id);
+                // One pull attempt per queue per cycle, taken and given back like the real pull
+                // service does, so a leaked lease would show up as a failed claim next cycle.
+                if let Some(epoch) = progress.claim_pull(&mq) {
+                    progress.release_pull(&mq, epoch);
+                }
+                progress.note_pull_failed(&mq, PullFailureKind::RouteOrBrokerMiss);
+            }
+            let snap = snapshot(&progress);
+            let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+            assert_eq!(
+                state.phase,
+                crate::consumer::managed_consumer::ConsumerPhase::Recovering,
+                "a fruitless repair never becomes terminal: {state:?}"
+            );
+            assert!(machine.stalled_repairs <= policy.max_repairs_before_replace);
+            if effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })) {
+                replacements += 1;
+                // The controller proves cleanup before the next incarnation is built.
+                machine.on_cleanup_complete();
+            }
+        }
+
+        assert_eq!(8, progress.assigned_queues(), "rolling incarnations changed ownership");
+        for id in 0..8 {
+            let mq = queue("T", id);
+            assert!(
+                progress.claim_pull(&mq).is_some(),
+                "pull lease for queue {id} leaked across {} replacements",
+                replacements
+            );
+        }
+        // A retiring incarnation leaves nothing behind: revoking the assignment empties the table.
+        let all: Vec<MessageQueue> = (0..8).map(|id| queue("T", id)).collect();
+        progress.note_revocation(&all);
+        assert_eq!(0, progress.assigned_queues());
+    }
 }

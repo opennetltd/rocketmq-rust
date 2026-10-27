@@ -78,18 +78,20 @@ async fn unreachable_nameserver_is_reported_and_repaired_in_place() {
         .subscribe("TopicTest", "*")
         .start_managed(listener.callback())
         .expect("managed start is asynchronous and must not fail because the NameServer is down");
+    let started = tokio::time::Instant::now();
 
     let first = handle.status();
     assert_eq!(1, first.incarnation, "the first incarnation is 1");
     assert!(!first.reason.is_empty(), "a reason label is always present");
 
-    // Past the old application-side five-second stall threshold and past one rebalance interval, so
-    // a missing route can be concluded. Section 3.2: a route or assignment miss is a fault that
-    // is repaired in place - never healthy idle, never a replacement, never a stopped consumer.
-    // An observer that exists and is dropped immediately cannot change any of this.
+    // Section 3.2: a route or assignment miss is a fault that is repaired in place - never healthy
+    // idle, never a replacement, never a stopped consumer. The window is far shorter than one
+    // rebalance interval (20s) on purpose: the first pass must not wait for a confirmed
+    // heartbeat, otherwise an outage at startup reads as healthy idle for a whole interval. An
+    // observer that exists and is dropped immediately cannot change any of this.
     let mut observed = 0;
     let mut reported_refresh_failure = None;
-    while reported_refresh_failure.is_none() && observed < 120 {
+    while reported_refresh_failure.is_none() && observed < 24 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let status = handle.status();
         assert_eq!(
@@ -107,6 +109,11 @@ async fn unreachable_nameserver_is_reported_and_repaired_in_place() {
         if status.reason == "assignment_refresh_failed" {
             assert_eq!(ConsumerPhase::Recovering, status.phase, "{status}");
             assert_eq!(ConsumerHealth::Degraded, status.health, "{status}");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed <= Duration::from_secs(8),
+                "a cold-start route failure must be reported promptly, not after a rebalance interval: {elapsed:?}"
+            );
             reported_refresh_failure = Some(status);
         }
         if observed == 4 {

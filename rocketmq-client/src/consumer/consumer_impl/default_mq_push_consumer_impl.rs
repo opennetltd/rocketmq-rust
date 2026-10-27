@@ -475,15 +475,19 @@ impl DefaultMQPushConsumerImpl {
                     self.consumer_config.unit_mode
                 );
                 *self.service_state = ServiceState::Running;
-                if self
+                // Plan 49 section 3.2: the first assignment attempt must not be gated on a
+                // confirmed heartbeat. With the NameServer unreachable the
+                // heartbeat reports false, no rebalance is requested, and an
+                // unroutable consumer would look like healthy idle for one whole
+                // rebalance interval before its first route query. Wakes coalesce into one retained
+                // pass, so asking unconditionally cannot multiply work.
+                let _heartbeat_confirmed = self
                     .client_instance
                     .as_mut()
                     .unwrap()
                     .send_heartbeat_to_all_broker_with_lock()
-                    .await
-                {
-                    self.client_instance.as_mut().unwrap().re_balance_immediately();
-                }
+                    .await;
+                self.client_instance.as_mut().unwrap().re_balance_immediately();
             }
             ServiceState::Running => {
                 return Err(mq_client_err!("The PushConsumer service state is Running"));
@@ -1859,5 +1863,113 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
                 .insert(mq, pq.fill_process_queue_info(commit_offset.max(0) as u64));
         }
         Ok(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Plan 49 section 5: a delivery that never yields must cost the caller its deadline and
+    /// nothing else - no wedged process, no lost status, and completion as soon as the batch is
+    /// released. The scenario runs in a child process so that a cleanup session which ignored
+    /// the external deadline fails this test with an overrun instead of hanging the whole
+    /// suite, which is exactly what an application must never suffer.
+    const CHILD_ENV: &str = "ROCKETMQ_TEST_BLOCKED_CLEANUP_CHILD";
+    const MARKERS_ENV: &str = "ROCKETMQ_TEST_BLOCKED_CLEANUP_MARKERS";
+    const SELF_TEST: &str = "consumer::consumer_impl::default_mq_push_consumer_impl::tests::\
+                             a_delivery_that_never_yields_honours_an_external_deadline";
+
+    fn mark(path: &std::path::Path, marker: &str) {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{marker}");
+        }
+    }
+
+    /// One unstarted consumer plus one claimed listener batch that is never released on its own.
+    fn consumer_with_a_blocked_delivery() -> (
+        DefaultMQPushConsumerImpl,
+        crate::consumer::consumer_impl::consumer_work::DeliveryPermit,
+    ) {
+        let mut client_config = ClientConfig::default();
+        client_config.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let consumer_config = ConsumerConfig {
+            consumer_group: CheetahString::from_static_str("blocked-listener-group"),
+            ..Default::default()
+        };
+        let consumer = DefaultMQPushConsumerImpl::new(client_config, ArcMut::new(consumer_config), None);
+        let permit = consumer
+            .delivery
+            .admit()
+            .expect("an open gate admits the batch that is already running");
+        (consumer, permit)
+    }
+
+    async fn blocked_child() {
+        let markers = std::path::PathBuf::from(std::env::var_os(MARKERS_ENV).unwrap());
+        let (mut consumer, permit) = consumer_with_a_blocked_delivery();
+
+        // The caller's budget is short and the listener never returns: Pending is the only honest
+        // answer, and answering it may not block, panic or exit.
+        let pending = consumer
+            .shutdown_until(TokioInstant::now() + Duration::from_millis(300))
+            .await;
+        assert!(!pending, "an unyielding delivery must report Pending");
+        mark(&markers, "pending");
+
+        // The retiring incarnation is still owned and its state is still readable while it drains.
+        assert_ne!(ServiceState::ShutdownAlready, *consumer.service_state);
+        assert!(consumer.delivery.is_closed(), "admission closed at once");
+
+        // Releasing the batch lets the same session finish; no second session was started.
+        drop(permit);
+        let complete = consumer
+            .shutdown_until(TokioInstant::now() + Duration::from_secs(10))
+            .await;
+        assert!(complete, "releasing the delivery permits completion");
+        assert_eq!(ServiceState::ShutdownAlready, *consumer.service_state);
+        mark(&markers, "complete");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delivery_that_never_yields_honours_an_external_deadline() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            blocked_child().await;
+            return;
+        }
+        let markers = std::env::temp_dir().join(format!("rocketmq-blocked-cleanup-{}.markers", std::process::id()));
+        let _ = std::fs::remove_file(&markers);
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg(SELF_TEST)
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(MARKERS_ENV, &markers)
+            .spawn()
+            .expect("spawn the blocked-cleanup child");
+        // An external deadline the child cannot ignore: it is a wall-clock bound owned by the
+        // parent.
+        let limit = Instant::now() + Duration::from_secs(90);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    assert!(
+                        Instant::now() < limit,
+                        "cleanup ignored an external deadline and wedged the process"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => panic!("cannot wait for the child process: {err}"),
+            }
+        };
+        let progress = std::fs::read_to_string(&markers).unwrap_or_default();
+        let _ = std::fs::remove_file(&markers);
+        assert!(status.success(), "child failed ({status}) after: {progress}");
+        assert_eq!("pending\ncomplete\n", progress, "both stages must be reached in order");
     }
 }

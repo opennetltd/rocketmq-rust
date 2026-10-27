@@ -360,3 +360,63 @@ impl OffsetStoreTrait for RemoteBrokerOffsetStore {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::base::client_config::ClientConfig;
+
+    use super::*;
+
+    /// A NameServer nothing listens on: every write has to discover that the broker is unknown and
+    /// fail, which is the worst case the cleanup budget exists to bound.
+    const DEAD_NAMESERVER: &str = "127.0.0.1:1";
+
+    fn dead_instance(client_id: &str) -> ArcMut<MQClientInstance> {
+        let mut client_config = ClientConfig::default();
+        client_config.set_namesrv_addr(CheetahString::from_static_str(DEAD_NAMESERVER));
+        MQClientInstance::new_arc(client_config, 0, client_id, None)
+    }
+
+    fn queues(topic: &str, count: i32) -> HashSet<MessageQueue> {
+        (0..count)
+            .map(|id| MessageQueue::from_parts(topic, "broker-a", id))
+            .collect()
+    }
+
+    /// Plan 49 section 5 at scale: two hundred fifty-six assigned offset queues are written one at
+    /// a time under one deadline. Without budget nothing is attempted and the whole shortfall
+    /// is reported; with budget the phase ends on time and every queue is accounted for exactly
+    /// once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_hundred_fifty_six_offset_writes_stay_inside_the_cleanup_budget() {
+        let mut store =
+            RemoteBrokerOffsetStore::new(dead_instance("bulk-offset-test"), CheetahString::from("bulk-group"));
+        let assigned = queues("BulkTopic", 256);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+
+        // No budget: not one remote opportunity is taken, including the broker lookup.
+        let summary = store.persist_all_until(&assigned, TokioInstant::now()).await;
+        assert_eq!(0, summary.attempted, "a spent budget may not start a write");
+        assert_eq!(256, summary.skipped);
+
+        // A real budget bounds the whole phase however slow each attempt is.
+        let budget = Duration::from_secs(3);
+        let started = TokioInstant::now();
+        let summary = store.persist_all_until(&assigned, TokioInstant::now() + budget).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= budget + Duration::from_secs(2),
+            "bulk offset phase overran: {elapsed:?}"
+        );
+        assert_eq!(256, summary.attempted + summary.skipped, "{summary}");
+        assert_eq!(summary.attempted, summary.succeeded + summary.failed, "{summary}");
+        assert!(
+            summary.attempted > 0,
+            "a budget should reach the first queue: {summary}"
+        );
+    }
+}
