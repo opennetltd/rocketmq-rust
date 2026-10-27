@@ -330,7 +330,9 @@ impl MessageQueueListener for AssignmentTracker {
 pub enum ShutdownOutcome {
     /// Local ownership is proved quiescent.
     Complete,
-    /// The caller's deadline elapsed; the SDK-owned cleanup session continues in the background.
+    /// Cleanup was not proved by the time this caller stopped waiting - its deadline elapsed, or
+    /// the session ended without a proof. The SDK keeps ownership of the cleanup session; a pending
+    /// answer is never a licence to start a second owner, and it is never a process-exit reason.
     Pending,
 }
 
@@ -395,13 +397,20 @@ impl ManagedConsumerHandle {
                         // Consumed earlier: the outcome is already known to this handle.
                         None => return self.inner.proved.load(Ordering::SeqCst),
                         Some(receiver) => match receiver.try_recv() {
+                            // Consume the channel on either terminal answer. A consumed oneshot
+                            // answers neither Empty nor Closed reliably, so leaving it in place
+                            // would make the next caller re-poll a dead channel: it could wait out
+                            // a deadline that has already been answered, or report Pending for a
+                            // cleanup this very handle already proved.
                             Ok(()) => {
+                                *guard = None;
                                 self.inner.proved.store(true, Ordering::SeqCst);
                                 return true;
                             }
                             // The session ended without proof: report Pending at once rather than
                             // making a caller wait out its own deadline.
                             Err(oneshot::error::TryRecvError::Closed) => {
+                                *guard = None;
                                 self.inner.proved.store(false, Ordering::SeqCst);
                                 return false;
                             }
@@ -979,6 +988,30 @@ mod tests {
         }
         assert!(matches!(second, ShutdownOutcome::Complete | ShutdownOutcome::Pending));
         assert_ne!(handle.status().health, ConsumerHealth::ConfigurationError);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_session_answers_every_caller_the_same_way() {
+        let handle = start_managed(spec(), LifecyclePolicy::default()).expect("managed consumer starts");
+        // Generous enough that the answer comes from a settled session rather than a deadline.
+        let first = handle
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        let began = tokio::time::Instant::now();
+        // A second caller, including one holding another clone of the same handle, attaches to the
+        // session that already answered; it must repeat that answer instead of re-waiting on a
+        // channel nobody will send on again.
+        let second = handle
+            .clone()
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        assert_eq!(first, second, "a resolved session gives one answer per outcome");
+        if matches!(first, ShutdownOutcome::Complete) {
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "a proved cleanup must not be waited for twice"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
