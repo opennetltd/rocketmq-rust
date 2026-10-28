@@ -81,10 +81,17 @@ where
 {
     /// Connect on an explicitly supplied runtime.
     ///
-    /// `runtime` owns the connection's send pump and receive loop. A connection reached through a
-    /// shared client outlives whichever caller happened to open it, so spawning its tasks on the
-    /// caller's runtime would let that caller's teardown silently kill I/O for everyone else using
-    /// the same address.
+    /// `runtime` owns the whole connection: address resolution, the TCP connect that registers the
+    /// socket with a reactor, the channel and its send pump, and the receive loop. A connection
+    /// reached through a shared client outlives whichever caller happened to open it, so doing any
+    /// of that work on the caller's runtime would let that caller's teardown silently break I/O
+    /// for everyone else using the same address - a socket registered with a shut-down reactor
+    /// fails with an `it is being shutdown` error even though its tasks still run (plan 49b
+    /// R1).
+    ///
+    /// The caller's own deadline bounds this future; cancellation or a timeout cannot leave an
+    /// unadopted connection behind, because the preparation task closes the socket when nobody
+    /// adopts it. `addr` must be owned data so it can cross into the owner runtime's task.
     pub async fn connect_on<T>(
         addr: T,
         cmd_handler: Arc<RemotingGeneralHandler<PR>>,
@@ -92,13 +99,63 @@ where
         runtime: &tokio::runtime::Handle,
     ) -> RocketMQResult<(Channel, tokio::task::JoinHandle<()>)>
     where
+        T: tokio::net::ToSocketAddrs + Send + 'static,
+    {
+        let event_tx = tx.cloned();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (adopt_tx, adopt_rx) = tokio::sync::oneshot::channel::<()>();
+        let spawner = runtime.clone();
+        let owner = runtime.clone();
+        // Detached on purpose: the preparation belongs to the owner runtime, not to this waiter, so
+        // it finishes and cleans up after itself even if the caller is cancelled first.
+        spawner.spawn(async move {
+            let built = match Self::prepare(addr, cmd_handler, event_tx, &owner).await {
+                Ok(built) => built,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+            // Hand the connection over. Nobody adopting it means the waiter timed out or was
+            // cancelled: close the socket here rather than orphaning a live pair of I/O tasks.
+            let teardown = built.0.clone();
+            if ready_tx.send(Ok(built)).is_err() {
+                teardown.shutdown();
+                return;
+            }
+            // Receiving is not adoption. The waiter confirms with no await in between, so it cannot
+            // be cancelled after taking ownership without the preparer noticing.
+            if adopt_rx.await.is_err() {
+                teardown.shutdown();
+            }
+        });
+        match ready_rx.await {
+            Ok(Ok(built)) => {
+                // No await between taking delivery and confirming it: this is what makes the
+                // handover atomic with respect to cancellation.
+                let _ = adopt_tx.send(());
+                Ok(built)
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(remote_error("connection preparation task on the owner runtime ended")),
+        }
+    }
+
+    /// Resolve, connect and build the channel. Runs as a task on the owning runtime, which is what
+    /// registers the socket with that runtime's reactor.
+    async fn prepare<T>(
+        addr: T,
+        cmd_handler: Arc<RemotingGeneralHandler<PR>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
+        runtime: &tokio::runtime::Handle,
+    ) -> RocketMQResult<(Channel, tokio::task::JoinHandle<()>)>
+    where
         T: tokio::net::ToSocketAddrs,
     {
-        let tcp_stream = tokio::net::TcpStream::connect(addr).await;
-        if tcp_stream.is_err() {
-            return Err(io_error(tcp_stream.err().unwrap()));
-        }
-        let stream = tcp_stream?;
+        let stream = match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => stream,
+            Err(err) => return Err(io_error(err)),
+        };
         let local_addr = stream.local_addr()?;
         let remote_address = stream.peer_addr()?;
         let connection = Connection::new(stream);
@@ -116,7 +173,7 @@ where
             let _task = crate::metrics::recv_task_started();
             let _ = receiver.run_recv().await;
         });
-        if let Some(tx) = tx {
+        if let Some(tx) = event_tx {
             let _ = tx.send(ConnectionNetEvent::CONNECTED(remote_address));
         }
         Ok((channel, receive))
@@ -167,7 +224,7 @@ where
         runtime: &tokio::runtime::Handle,
     ) -> RocketMQResult<Client<PR>>
     where
-        T: tokio::net::ToSocketAddrs,
+        T: tokio::net::ToSocketAddrs + Send + 'static,
     {
         let (channel, receive) = ClientInner::connect_on(addr, cmd_handler, tx, runtime).await?;
         Ok(Client {
@@ -486,5 +543,158 @@ mod tests {
             assert!(rx.await.unwrap().is_err());
             assert!(handler.pending_responses.is_empty());
         }
+    }
+
+    /// Plan 49b R1: the socket belongs to the runtime that owns the client, not to whichever task
+    /// happened to open it. Connecting on a caller runtime registered the socket with that
+    /// runtime's reactor; once the caller went away every later write failed with an `it is
+    /// being shutdown` error even though the send pump and receive loop were still alive.
+    #[test]
+    fn a_connection_survives_the_runtime_of_the_task_that_opened_it() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let owner = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+
+        // A fake broker living on the owning runtime for the whole test.
+        let written = Arc::new(AtomicUsize::new(0));
+        let peer_written = Arc::clone(&written);
+        let addr = {
+            let handle = owner.handle().clone();
+            owner.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let written = Arc::clone(&peer_written);
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            while let Ok(n) = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await {
+                                if n == 0 {
+                                    return;
+                                }
+                                written.fetch_add(n, Ordering::Release);
+                            }
+                        });
+                    }
+                });
+                drop(handle);
+                addr
+            })
+        };
+
+        // A caller runtime opens the shared connection and is then dropped completely.
+        let client = {
+            let caller = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let owner_handle = owner.handle().clone();
+            let connected =
+                caller.block_on(async move { Client::connect_on(addr, test_handler(), None, &owner_handle).await });
+            drop(caller);
+            connected.expect("connect on the owner runtime")
+        };
+
+        // Writing from the owning runtime still works after the caller's reactor is gone.
+        let channel = client.tasks.channel.clone();
+        owner.block_on(async move {
+            for index in 0..8u16 {
+                let request = RemotingCommand::new_request(
+                    i32::from(index),
+                    bytes::Bytes::from_static(b"survives-the-caller-runtime"),
+                );
+                channel
+                    .send_command(request)
+                    .await
+                    .expect("a frame still reaches the broker after the caller runtime is dropped");
+            }
+        });
+        let mut polled = 0;
+        while written.load(Ordering::Acquire) == 0 && polled < 500 {
+            std::thread::sleep(Duration::from_millis(10));
+            polled += 1;
+        }
+        assert!(written.load(Ordering::Acquire) > 0, "frames reached the peer");
+
+        // And a later connection still works on the surviving owner.
+        let again = owner
+            .block_on(Client::connect_on(addr, test_handler(), None, owner.handle()))
+            .expect("reconnect after the caller runtime is gone");
+        assert!(again.connection().is_healthy());
+    }
+
+    /// Plan 49b R1: a waiter that gives up must not leave an unowned live connection behind.
+    /// Aborting the connect call at different points against a successful TCP handshake always
+    /// ends with the peer seeing EOF, so neither a cancelled leader nor its completed
+    /// preparation can orphan a socket and its I/O tasks.
+    #[test]
+    fn abandoning_a_connect_leaves_no_live_connection() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let owner = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+
+        // The fake broker counts how many connections it still holds open.
+        let live = Arc::new(AtomicUsize::new(0));
+        let peer_live = Arc::clone(&live);
+        let addr = owner.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let live = Arc::clone(&peer_live);
+                    tokio::spawn(async move {
+                        live.fetch_add(1, Ordering::Release);
+                        let mut buf = [0u8; 1024];
+                        while let Ok(n) = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                        live.fetch_sub(1, Ordering::Release);
+                    });
+                }
+            });
+            addr
+        });
+
+        for round in 0..32u32 {
+            let handle = owner.handle().clone();
+            let waiter = owner.spawn(async move { Client::connect_on(addr, test_handler(), None, &handle).await });
+            // Cancel at varying distances from the handshake so both interleavings are covered.
+            std::thread::sleep(Duration::from_micros(200 * u64::from(round % 8)));
+            waiter.abort();
+            // Dropping the handle matters: a connect that finished first keeps its client alive in
+            // the join result until somebody takes it away.
+            drop(waiter);
+        }
+
+        let mut polled = 0;
+        while live.load(Ordering::Acquire) != 0 && polled < 1_000 {
+            std::thread::sleep(Duration::from_millis(10));
+            polled += 1;
+        }
+        assert_eq!(
+            live.load(Ordering::Acquire),
+            0,
+            "no connection outlives the waiter that opened it"
+        );
+    }
+
+    fn test_handler() -> Arc<RemotingGeneralHandler<DefaultRemotingRequestProcessor>> {
+        Arc::new(RemotingGeneralHandler {
+            request_processor: tokio::sync::Mutex::new(DefaultRemotingRequestProcessor),
+            rpc_hooks: std::sync::RwLock::new(vec![]),
+            pending_responses: PendingResponses::with_capacity(8),
+        })
     }
 }
