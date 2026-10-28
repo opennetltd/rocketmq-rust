@@ -160,6 +160,38 @@ pub struct MQClientInstance {
     log_gate: crate::utils::log_gate::LogGate,
 }
 
+/// The three answers a nameserver route query can produce. Collapsing them into one `Option` is
+/// what let a missing answer and an authoritative empty answer be treated alike (plan 50 F7).
+enum FetchedRoute {
+    /// A route was returned.
+    Route(TopicRouteData),
+    /// The nameserver answered authoritatively that the topic has no route.
+    Absent,
+    /// No answer: a transport failure, a timeout or a malformed response.
+    Failed,
+}
+
+/// What one route refresh did to this client's knowledge. `Failed` is the only outcome that must
+/// not be recorded as a success by the refresh cooldown (plan 50 F7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteFetchOutcome {
+    /// A route was published and differed from the cached one.
+    Applied,
+    /// A route was published and matched the cached one; still the newest observation.
+    Unchanged,
+    /// An authoritative empty answer retired what was known.
+    Absent,
+    /// No answer; every table is as it was.
+    Failed,
+}
+
+impl RouteFetchOutcome {
+    /// Whether a nameserver answered. Only this lets the refresh cooldown take effect.
+    pub(crate) fn succeeded(self) -> bool {
+        !matches!(self, RouteFetchOutcome::Failed)
+    }
+}
+
 impl MQClientInstance {
     pub fn new(
         client_config: ClientConfig,
@@ -602,7 +634,7 @@ impl MQClientInstance {
     }
 
     #[inline]
-    pub async fn update_topic_route_info_from_name_server_topic(&mut self, topic: &CheetahString) -> bool {
+    pub async fn update_topic_route_info_from_name_server_topic(&mut self, topic: &CheetahString) -> RouteFetchOutcome {
         self.update_topic_route_info_from_name_server_default(topic, false, None)
             .await
     }
@@ -676,7 +708,7 @@ impl MQClientInstance {
         topic: &CheetahString,
         is_default: bool,
         producer_config: Option<&Arc<ProducerConfig>>,
-    ) -> bool {
+    ) -> RouteFetchOutcome {
         // Plan 49 section 4.1.1: the nameserver lock stays held across fetch and publish so
         // route state changes remain serialized; table locks are taken route-then-broker and
         // every one of them is released before a listener callback or any network I/O.
@@ -684,14 +716,35 @@ impl MQClientInstance {
         // table publishes below can still take &mut self.
         let namesrv_lock = self.lock_namesrv.clone();
         let _namesrv_guard = namesrv_lock.lock().await;
+        let fetched = self.fetch_topic_route(topic, is_default, producer_config).await;
+        self.apply_route_fetch(topic, fetched, is_default, producer_config)
+            .await
+    }
 
-        let Some(mut topic_route_data) = self.fetch_topic_route(topic, is_default, producer_config).await else {
-            // A failed fetch must never erase the last known route (plan 49 section 4.1.2).
-            warn!(
-                "updateTopicRouteInfoFromNameServer, getTopicRouteInfoFromNameServer return null, Topic: {}. [{}]",
-                topic, self.client_id
-            );
-            return false;
+    /// Publish one nameserver answer. Split from the fetch so the three different answers -
+    /// a route, an authoritative "no route", and no answer at all - can be tested against the real
+    /// publication path (plan 50 F7).
+    async fn apply_route_fetch(
+        &mut self,
+        topic: &CheetahString,
+        fetched: FetchedRoute,
+        is_default: bool,
+        producer_config: Option<&Arc<ProducerConfig>>,
+    ) -> RouteFetchOutcome {
+        let mut topic_route_data = match fetched {
+            // A failed fetch must never erase the last known route (plan 49 section 4.1.2), and it
+            // is not an answer about the topic either (plan 50 F7).
+            FetchedRoute::Failed => {
+                warn!(
+                    "updateTopicRouteInfoFromNameServer got no answer, keeping the last known route for topic: {}. \
+                     [{}]",
+                    topic, self.client_id
+                );
+                return RouteFetchOutcome::Failed;
+            }
+            // An authoritative empty answer is knowledge: it retires what this client knew.
+            FetchedRoute::Absent => return self.retire_topic_route(topic).await,
+            FetchedRoute::Route(data) => data,
         };
 
         let mut changed = {
@@ -701,11 +754,6 @@ impl MQClientInstance {
         if !changed {
             changed = self.is_need_update_topic_route_info(topic).await;
         }
-        if !changed {
-            debug!("the topic[{}] route info unchanged, client: {}", topic, self.client_id);
-            return false;
-        }
-
         // Default topics carry no priority queues; keep the upstream queue-number clamp.
         if let Some(producer_config) = producer_config.filter(|_| is_default) {
             for data in topic_route_data.queue_datas.iter_mut() {
@@ -729,8 +777,22 @@ impl MQClientInstance {
         self.topic_route_sequence.write().await.insert(topic.clone(), sequence);
 
         // Reconcile the derived broker address table against every cached route instead of
-        // replacing one broker name wholesale (plan 49 section 4.1.1).
+        // replacing one broker name wholesale (plan 49 section 4.1.1). This runs for an unchanged
+        // answer too: a successful fetch is the newest observation whether or not its bytes differ,
+        // and skipping it let an alternating second topic keep holding a shared broker address
+        // after this topic had answered again with the current one (plan 50 F7).
         let retired = self.reconcile_broker_addr_table().await;
+
+        if !changed {
+            debug!(
+                topic = %topic,
+                sequence,
+                retired_brokers = retired.len(),
+                "the topic[{}] route info is unchanged, newest observation recorded, client: {}",
+                topic, self.client_id
+            );
+            return RouteFetchOutcome::Unchanged;
+        }
         if let Some(suppressed) = self.log_gate.try_acquire(&format!("route-changed:{topic}")) {
             info!(
                 topic = %topic,
@@ -790,45 +852,87 @@ impl MQClientInstance {
                 }
             }
         }
-        true
+        RouteFetchOutcome::Applied
     }
 
-    /// Fetches one route from the nameserver. `None` means "no information", which callers
-    /// must treat as "keep the last known route".
+    /// Record an authoritative "this topic has no route" answer: drop the cached route and its
+    /// endpoints, then let reconciliation retire the addresses nothing advertises any more (plan 50
+    /// F7). A failed fetch never reaches here; it keeps every table as it was.
+    async fn retire_topic_route(&mut self, topic: &CheetahString) -> RouteFetchOutcome {
+        let known = { self.topic_route_table.write().await.remove(topic).is_some() };
+        self.topic_end_points_table.write().await.remove(topic);
+        if !known {
+            // Nothing was known about this topic; the empty answer changes no table but is still a
+            // successful observation, so cooldown may apply.
+            return RouteFetchOutcome::Absent;
+        }
+        let sequence = self.route_update_sequence.fetch_add(1, SyncOrdering::SeqCst) + 1;
+        self.topic_route_sequence.write().await.insert(topic.clone(), sequence);
+        let retired = self.reconcile_broker_addr_table().await;
+        // Producers stop publishing to a topic the nameserver no longer routes. Consumer subscribe
+        // info is left alone on purpose: assignment is derived from the route tables, and inventing
+        // an empty subscription entry here would be a second source of truth.
+        let producers: Vec<_> = self.producer_table.read().await.values().cloned().collect();
+        for mut producer in producers {
+            producer.update_topic_publish_info(topic.to_string(), None);
+        }
+        if let Some(suppressed) = self.log_gate.try_acquire(&format!("route-absent:{topic}")) {
+            info!(
+                topic = %topic,
+                sequence,
+                retired_brokers = retired.len(),
+                suppressed,
+                "topic[{}] has no route according to the nameserver, retired {} obsolete broker address(es), client: {}, suppressed {} identical summaries",
+                topic, retired.len(), self.client_id, suppressed
+            );
+        }
+        RouteFetchOutcome::Absent
+    }
+
+    /// Fetches one route from the nameserver, distinguishing the three answers a client can get.
     async fn fetch_topic_route(
         &mut self,
         topic: &CheetahString,
         is_default: bool,
         producer_config: Option<&Arc<ProducerConfig>>,
-    ) -> Option<TopicRouteData> {
+    ) -> FetchedRoute {
         if let (true, Some(_)) = (is_default, producer_config) {
-            match self
-                .mq_client_api_impl
-                .as_mut()?
+            let Some(api) = self.mq_client_api_impl.as_mut() else {
+                return FetchedRoute::Failed;
+            };
+            match api
                 .get_default_topic_route_info_from_name_server(self.client_config.mq_client_api_timeout)
                 .await
             {
-                Ok(value) => value,
+                Ok(Some(data)) => FetchedRoute::Route(data),
+                // The nameserver answered and says there is no route.
+                Ok(None) => FetchedRoute::Absent,
                 Err(e) => {
                     error!(
                         "get_default_topic_route_info_from_name_server failed, topic: {}, error: {}",
                         topic, e
                     );
-                    None
+                    FetchedRoute::Failed
                 }
             }
         } else {
-            self.mq_client_api_impl
-                .as_mut()?
+            let Some(api) = self.mq_client_api_impl.as_mut() else {
+                return FetchedRoute::Failed;
+            };
+            match api
                 .get_topic_route_info_from_name_server(topic, self.client_config.mq_client_api_timeout)
                 .await
-                .unwrap_or_else(|err| {
+            {
+                Ok(Some(data)) => FetchedRoute::Route(data),
+                Ok(None) => FetchedRoute::Absent,
+                Err(err) => {
                     warn!(
                         "getTopicRouteInfoFromNameServer failed, topic: {}, err: {:?}",
                         topic, err
                     );
-                    None
-                })
+                    FetchedRoute::Failed
+                }
+            }
         }
     }
 
@@ -1338,9 +1442,13 @@ impl MQClientInstance {
     /// second round trip.
     pub async fn repair_route_after_broker_miss(&mut self, topic: &CheetahString, join_budget: Duration) -> bool {
         match self.route_refresh_guard.begin(topic) {
-            BeginRefresh::Fetch => {
-                let refreshed = self.update_topic_route_info_from_name_server_topic(topic).await;
-                self.route_refresh_guard.finish(topic, refreshed);
+            BeginRefresh::Fetch(mut ticket) => {
+                // The ticket owns the slot until it completes or drops, so a cancelled or
+                // panicking leader cannot strand this topic in "in flight" (plan 50 F8).
+                let outcome = self.update_topic_route_info_from_name_server_topic(topic).await;
+                // Cooldown is earned by answering, not only by changing something: an unchanged or
+                // authoritative-empty repair is still a completed refresh (plan 50 F7/F8).
+                ticket.complete(outcome.succeeded());
                 true
             }
             BeginRefresh::Joining => {
@@ -2005,5 +2113,108 @@ mod tests {
         }
 
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Plan 50 F7: a successful fetch is knowledge whether or not its bytes differ. Returning early
+    /// on "unchanged" left an older answer from another topic holding a shared broker address after
+    /// this topic had answered again, and made the refresh cooldown think the repair had failed.
+    #[tokio::test]
+    async fn an_unchanged_answer_is_still_the_newest_observation() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-unchanged", None);
+        // One counter orders every topic's answers, so seeding uses values it could really have
+        // produced and the fetch below continues from them.
+        instance.route_update_sequence.store(12, SyncOrdering::SeqCst);
+        let current = route("broker-a", &[(0, "10.0.0.1:10911")]);
+        seed(&instance, "TopicA", current.clone(), 11).await;
+        // Another topic answered later and currently wins the shared key.
+        seed(&instance, "TopicB", route("broker-a", &[(0, "10.9.9.9:10911")]), 12).await;
+        instance.reconcile_broker_addr_table().await;
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.9.9.9:10911".to_string())]
+        );
+
+        // TopicA answers again with the same route it already holds: unchanged, but newer.
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(current),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Unchanged);
+        assert!(outcome.succeeded(), "an unchanged answer earns the cooldown");
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.0.0.1:10911".to_string())],
+            "the newest successful response wins a shared broker address"
+        );
+    }
+
+    /// Plan 50 F7: an authoritative empty answer is knowledge too - it retires the cached route and
+    /// the addresses only it advertised, while another topic's knowledge survives.
+    #[tokio::test]
+    async fn an_authoritative_empty_answer_retires_the_route_it_covers() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-absent", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        seed(&instance, "TopicB", route("broker-b", &[(0, "10.0.0.2:10911")]), 2).await;
+        instance.reconcile_broker_addr_table().await;
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Absent,
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Absent);
+        assert!(outcome.succeeded());
+        assert!(
+            !instance
+                .topic_route_table
+                .read()
+                .await
+                .contains_key(&CheetahString::from_static_str("TopicA")),
+            "the retired route is gone from the cache"
+        );
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-b".to_string(), 0, "10.0.0.2:10911".to_string())],
+            "only the addresses no cached route advertises are retired"
+        );
+    }
+
+    /// Plan 50 F7: no answer is not an answer. Nothing may be erased and the refresh cooldown must
+    /// not treat it as a completed refresh.
+    #[tokio::test]
+    async fn a_failed_fetch_preserves_every_table() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-failed", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Failed,
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Failed);
+        assert!(!outcome.succeeded(), "a missing answer earns no cooldown");
+        assert!(instance
+            .topic_route_table
+            .read()
+            .await
+            .contains_key(&CheetahString::from_static_str("TopicA")));
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.0.0.1:10911".to_string())]
+        );
     }
 }
