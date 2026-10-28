@@ -59,6 +59,7 @@ use crate::consumer::consumer_impl::re_balance::rebalance_service::RebalanceServ
 use crate::consumer::mq_consumer_inner::MQConsumerInner;
 use crate::consumer::mq_consumer_inner::MQConsumerInnerImpl;
 use crate::factory::route_refresh_guard::BeginRefresh;
+use crate::factory::route_refresh_guard::FlightAnswer;
 use crate::factory::route_refresh_guard::RouteRefreshGuard;
 use crate::factory::transport_health::emit_consumer_transport_event;
 use crate::factory::transport_health::ConsumerTransportEvent;
@@ -637,6 +638,30 @@ impl MQClientInstance {
     pub async fn update_topic_route_info_from_name_server_topic(&mut self, topic: &CheetahString) -> RouteFetchOutcome {
         self.update_topic_route_info_from_name_server_default(topic, false, None)
             .await
+    }
+
+    /// One route operation - nameserver lock acquisition, fetch and publication - bounded by one
+    /// absolute `deadline`. A miss-triggered leader holds the single-flight slot plus every
+    /// joiner behind it, so a stalled nameserver or a lock held by another refresh must end
+    /// this call with no answer rather than an open-ended wait (plan 49b R3). Publication is
+    /// not started past the deadline: applying half a route would be worse than applying none,
+    /// so an elapsed deadline reports `None`.
+    pub async fn update_topic_route_info_within(
+        &mut self,
+        topic: &CheetahString,
+        deadline: Instant,
+    ) -> Option<RouteFetchOutcome> {
+        let namesrv_lock = self.lock_namesrv.clone();
+        let Ok(_namesrv_guard) = tokio::time::timeout_at(deadline, namesrv_lock.lock()).await else {
+            return None;
+        };
+        let Ok(fetched) = tokio::time::timeout_at(deadline, self.fetch_topic_route(topic, false, None)).await else {
+            return None;
+        };
+        if Instant::now() >= deadline {
+            return None;
+        }
+        Some(self.apply_route_fetch(topic, fetched, false, None).await)
     }
 
     pub async fn find_consumer_id_list(
@@ -1444,20 +1469,40 @@ impl MQClientInstance {
         match self.route_refresh_guard.begin(topic) {
             BeginRefresh::Fetch(mut ticket) => {
                 // The ticket owns the slot until it completes or drops, so a cancelled or
-                // panicking leader cannot strand this topic in "in flight" (plan 50 F8).
-                let outcome = self.update_topic_route_info_from_name_server_topic(topic).await;
+                // panicking leader cannot strand this topic in "in flight" (plan 50 F8). One
+                // deadline covers lock, fetch and publish: giving up on time
+                // releases the flight as a failure, which is retried behind its own
+                // backoff instead of blocking every joiner forever.
+                let budget = Duration::from_millis(self.client_config.mq_client_api_timeout)
+                    + Duration::from_millis(LOCK_TIMEOUT_MILLIS);
+                let outcome = self
+                    .update_topic_route_info_within(topic, Instant::now() + budget)
+                    .await;
                 // Cooldown is earned by answering, not only by changing something: an unchanged or
                 // authoritative-empty repair is still a completed refresh (plan 50 F7/F8).
-                ticket.complete(outcome.succeeded());
+                ticket.complete(outcome.map(|outcome| outcome.succeeded()).unwrap_or(false));
                 true
             }
             BeginRefresh::Joining => {
-                // Wait for the owner's fetch, then re-check our own tables.
-                self.route_refresh_guard.await_in_flight(topic, join_budget).await;
-                true
+                // Wait for the owner's fetch, then re-check our own tables. The answer describes
+                // the flight this caller joined, so a timeout or someone else's
+                // outcome is never read as a refresh that happened for us (plan 49b
+                // R3).
+                let answer = self.route_refresh_guard.await_flight(topic, join_budget).await;
+                if answer != FlightAnswer::Succeeded {
+                    debug!(
+                        "miss-triggered route refresh for [{}] was joined and ended as {}",
+                        topic,
+                        answer.kind()
+                    );
+                }
+                answer.recheck()
             }
-            // A recent success means the tables are as fresh as the cooldown allows.
-            BeginRefresh::Cooldown => true,
+            // A recent success means the tables are as fresh as the cooldown allows, and a recent
+            // failure means the next attempt is already scheduled behind its own backoff window: in
+            // both cases the caller re-checks what it has instead of adding another round trip
+            // (plan 49b R3).
+            BeginRefresh::Cooldown | BeginRefresh::Backoff(_) => true,
             BeginRefresh::Closed => false,
         }
     }

@@ -44,7 +44,6 @@ use crate::consumer::consumer_impl::consumer_lifecycle::MachineState;
 use crate::consumer::consumer_impl::consumer_lifecycle::ProgressSnapshot;
 use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
 use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
-use crate::consumer::consumer_impl::consumer_lifecycle::RepairKind;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consumer_identity;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
@@ -934,36 +933,54 @@ async fn run_incarnation(
     publisher: &StatusPublisher,
     stop_token: &CancellationToken,
     progress: &Arc<ConsumerProgress>,
-    mut effects: Vec<Effect>,
+    effects: Vec<Effect>,
 ) -> IncarnationEnd {
     let policy = machine.policy();
     let mut ticker = tokio::time::interval(policy.progress_check);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut previous: Option<ProgressSnapshot> = None;
+    let mut effects = std::collections::VecDeque::from(effects);
     loop {
-        for effect in effects.drain(..) {
+        // Effects are executed one at a time and stay interruptible. A repair that outlives the
+        // status cadence is put back for the next round instead of becoming an unwaitable
+        // step: control and status cannot be delayed behind a nameserver any longer than
+        // one cadence, and abandoning our own fetch only releases this consumer's ticket
+        // (as a failure, retried behind its backoff). Another consumer's refresh belongs to
+        // its own flight owner and is never cancelled here.
+        let mut cadence_consumed = false;
+        while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Idle(delay) => {
                     if wait_or_stop(delay, stop_token).await {
                         return IncarnationEnd::StopRequested;
                     }
                 }
-                Effect::Repair(kind) => match kind {
-                    RepairKind::RouteAndPull | RepairKind::Assignment => consumer.repair_routes_and_rebalance().await,
-                },
+                Effect::Repair(_kind) => {
+                    tokio::select! {
+                        biased;
+                        _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
+                        _ = consumer.repair_routes_and_rebalance() => {}
+                        _ = ticker.tick(), if !cadence_consumed => {
+                            cadence_consumed = true;
+                            effects.push_front(effect);
+                        }
+                    }
+                }
                 Effect::Stop { .. } => return IncarnationEnd::Replace,
             }
         }
-        tokio::select! {
-            biased;
-            _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
-            _ = ticker.tick() => {}
+        if !cadence_consumed {
+            tokio::select! {
+                biased;
+                _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
+                _ = ticker.tick() => {}
+            }
         }
         let snapshot = progress.snapshot(stall_after());
         let (state, next) = machine.on_tick(&snapshot, previous.as_ref(), pull_deadline(), jitter_unit());
         publisher.publish(state, machine.incarnation(), &snapshot);
         previous = Some(snapshot);
-        effects = next;
+        effects = next.into();
     }
 }
 
