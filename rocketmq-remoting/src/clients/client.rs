@@ -79,10 +79,17 @@ impl<PR> ClientInner<PR>
 where
     PR: RequestProcessor + Sync + 'static,
 {
-    pub async fn connect<T>(
+    /// Connect on an explicitly supplied runtime.
+    ///
+    /// `runtime` owns the connection's send pump and receive loop. A connection reached through a
+    /// shared client outlives whichever caller happened to open it, so spawning its tasks on the
+    /// caller's runtime would let that caller's teardown silently kill I/O for everyone else using
+    /// the same address.
+    pub async fn connect_on<T>(
         addr: T,
         cmd_handler: Arc<RemotingGeneralHandler<PR>>,
         tx: Option<&tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
+        runtime: &tokio::runtime::Handle,
     ) -> RocketMQResult<(Channel, tokio::task::JoinHandle<()>)>
     where
         T: tokio::net::ToSocketAddrs,
@@ -95,13 +102,17 @@ where
         let local_addr = stream.local_addr()?;
         let remote_address = stream.peer_addr()?;
         let connection = Connection::new(stream);
-        let channel_inner = Arc::new(ChannelInner::new(connection, cmd_handler.pending_responses.clone()));
+        let channel_inner = Arc::new(ChannelInner::new_on(
+            runtime,
+            connection,
+            cmd_handler.pending_responses.clone(),
+        ));
         let channel = Channel::new(channel_inner, local_addr, remote_address);
         let mut receiver = ClientInner {
             cmd_handler,
             ctx: Arc::new(ConnectionHandlerContextWrapper::new(channel.clone())),
         };
-        let receive = tokio::spawn(async move {
+        let receive = runtime.spawn(async move {
             let _task = crate::metrics::recv_task_started();
             let _ = receiver.run_recv().await;
         });
@@ -148,15 +159,17 @@ where
     /// # Returns
     ///
     /// A new `Client` instance wrapped in a `Result`. Returns an error if the connection fails.
-    pub(crate) async fn connect<T>(
+    /// Connect with both connection tasks placed on `runtime`; see [`ClientInner::connect_on`].
+    pub(crate) async fn connect_on<T>(
         addr: T,
         cmd_handler: Arc<RemotingGeneralHandler<PR>>,
         tx: Option<&tokio::sync::broadcast::Sender<ConnectionNetEvent>>,
+        runtime: &tokio::runtime::Handle,
     ) -> RocketMQResult<Client<PR>>
     where
         T: tokio::net::ToSocketAddrs,
     {
-        let (channel, receive) = ClientInner::connect(addr, cmd_handler, tx).await?;
+        let (channel, receive) = ClientInner::connect_on(addr, cmd_handler, tx, runtime).await?;
         Ok(Client {
             tasks: Arc::new(ClientTasks {
                 channel: channel.clone(),
@@ -440,6 +453,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn last_client_drop_releases_receive_task_and_pending_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = tokio::runtime::Handle::current();
         for _ in 0..16 {
             let handler = Arc::new(RemotingGeneralHandler {
                 request_processor: tokio::sync::Mutex::new(DefaultRemotingRequestProcessor),
@@ -447,7 +461,7 @@ mod tests {
                 pending_responses: PendingResponses::with_capacity(1),
             });
             let (client, peer) = tokio::join!(
-                Client::connect(listener.local_addr().unwrap(), handler.clone(), None),
+                Client::connect_on(listener.local_addr().unwrap(), handler.clone(), None, &runtime),
                 listener.accept()
             );
             let client = client.unwrap();

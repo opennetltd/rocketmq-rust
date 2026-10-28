@@ -537,8 +537,18 @@ impl<PR: RequestProcessor + Sync + Clone + 'static> RocketmqDefaultClient<PR> {
         // Perform TCP connect WITHOUT holding lock ===
         let addr_inner = addr.to_string();
 
+        // The connection belongs to this client, not to whichever caller opened it: its send pump
+        // and receive loop are spawned on the runtime this client owns, so a consumer that happens
+        // to open the first connection cannot take shared I/O down with its own runtime.
+        let runtime = self.client_runtime.as_ref()?;
         let connect_result = time::timeout(duration, async {
-            Client::connect(addr_inner, self.cmd_handler.clone(), self.tx.as_ref()).await
+            Client::connect_on(
+                addr_inner,
+                self.cmd_handler.clone(),
+                self.tx.as_ref(),
+                runtime.get_handle(),
+            )
+            .await
         })
         .await;
 

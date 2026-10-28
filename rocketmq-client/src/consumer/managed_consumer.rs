@@ -45,6 +45,7 @@ use crate::consumer::consumer_impl::consumer_lifecycle::ProgressSnapshot;
 use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
 use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
 use crate::consumer::consumer_impl::consumer_lifecycle::RepairKind;
+use crate::consumer::default_mq_push_consumer::ConsumerCleanup;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
 use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
@@ -645,12 +646,40 @@ async fn controller_body(
                     IncarnationEnd::StopRequested => {
                         let state = machine.request_stop();
                         publisher.publish(state, machine.incarnation(), &progress.snapshot(stall_after()));
-                        finish_with_cleanup(&mut consumer, policy, &mut machine, &publisher, &mut proof).await;
+                        // The terminal `stopped` state and the handle's proof belong to the
+                        // requested stop; an unproved pass leaves both
+                        // pending.
+                        if matches!(
+                            observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
+                                .await,
+                            CleanupSettled::Proved
+                        ) {
+                            proof.settle();
+                        }
                         return;
                     }
                     IncarnationEnd::Replace => {
-                        if !replace_or_block(&mut consumer, &mut machine, &publisher, &progress, &mut proof).await {
-                            return;
+                        match observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
+                            .await
+                        {
+                            // Cleanup could not be proved: at most one retiring incarnation is kept and no
+                            // replacement starts. This is never an exit request.
+                            CleanupSettled::Unproved(_) => return,
+                            CleanupSettled::Proved if stop_token.is_cancelled() => {
+                                // A stop raised while the old incarnation was being released wins
+                                // over a replacement;
+                                // observe_cleanup already published the terminal state.
+                                proof.settle();
+                                return;
+                            }
+                            CleanupSettled::Proved => {
+                                machine.advance_incarnation();
+                                publisher.publish(
+                                    machine.state(),
+                                    machine.incarnation(),
+                                    &progress.snapshot(stall_after()),
+                                );
+                            }
                         }
                     }
                 }
@@ -658,24 +687,22 @@ async fn controller_body(
             Err(StartFailure::Stopped) => {
                 let state = machine.request_stop();
                 publisher.publish(state, machine.incarnation(), &empty);
-                finish_with_cleanup(&mut consumer, policy, &mut machine, &publisher, &mut proof).await;
+                if matches!(
+                    observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
+                    CleanupSettled::Proved
+                ) {
+                    proof.settle();
+                }
                 return;
             }
             Err(StartFailure::Failed(message)) => {
-                // Roll back partial resources before deciding anything else.
+                // Roll back partial resources before deciding anything else. An unproved rollback
+                // keeps its session owned and observable: no replacement, no second cleanup worker,
+                // and never an exit.
                 if matches!(
-                    bounded_cleanup(&mut consumer, policy.cleanup_budget).await,
-                    ShutdownOutcome::Pending
+                    observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
+                    CleanupSettled::Unproved(_)
                 ) {
-                    let state = machine.on_cleanup_unproved();
-                    publisher.publish(state, machine.incarnation(), &empty);
-                    // No replacement and no second cleanup worker: wait for this one session.
-                    if matches!(
-                        bounded_cleanup(&mut consumer, policy.cleanup_budget * 8).await,
-                        ShutdownOutcome::Complete
-                    ) {
-                        proof.settle();
-                    }
                     return;
                 }
                 if stop_token.is_cancelled() {
@@ -705,7 +732,12 @@ async fn controller_body(
                 if wait_or_stop(wait_of(&effects), &stop_token).await {
                     let state = machine.request_stop();
                     publisher.publish(state, machine.incarnation(), &empty);
-                    finish_with_cleanup(&mut consumer, policy, &mut machine, &publisher, &mut proof).await;
+                    if matches!(
+                        observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
+                        CleanupSettled::Proved
+                    ) {
+                        proof.settle();
+                    }
                     return;
                 }
             }
@@ -725,62 +757,74 @@ enum IncarnationEnd {
     Replace,
 }
 
-/// Roll an incarnation back and decide whether a replacement may start. Returns `false` when the
-/// controller must stop: cleanup could not be proved, so at most one retiring incarnation is kept.
-async fn replace_or_block(
+/// What waiting for the one cleanup session produced.
+enum CleanupSettled {
+    /// Local ownership is quiescent; a replacement or a terminal stop may proceed.
+    Proved,
+    /// The pass ended without proving cleanup. Ownership stays retained and observable, which
+    /// blocks a guarded replacement and is never an exit request.
+    Unproved(&'static str),
+}
+
+/// Wait for the consumer's one cleanup session to settle, publishing status while it runs.
+///
+/// The SDK owns the pass; this only observes it (plan 50 section 4.1). A slice elapsing is not a
+/// give-up and never cancels anything: while ownership remains unproved the controller keeps
+/// selecting between the cleanup session, a sticky stop request and its own status ticks, so no
+/// caller deadline can strand leases, offset writes or unregistration halfway through.
+async fn observe_cleanup(
     consumer: &mut DefaultMQPushConsumer,
     machine: &mut RecoveryMachine,
     publisher: &StatusPublisher,
-    progress: &Arc<ConsumerProgress>,
-    proof: &mut CleanupProof,
-) -> bool {
-    match bounded_cleanup(consumer, machine.policy().cleanup_budget).await {
-        ShutdownOutcome::Complete => {
+    stop_token: &CancellationToken,
+    progress: Option<&Arc<ConsumerProgress>>,
+) -> CleanupSettled {
+    let budget = machine.policy().cleanup_budget;
+    loop {
+        // One visibility slice of the caller's own budget; joining again later is free.
+        let slice = tokio::time::Instant::now() + budget;
+        if matches!(consumer.shutdown_until(slice).await, ConsumerCleanup::Complete) {
             let state = machine.on_cleanup_complete();
-            machine.advance_incarnation();
-            publisher.publish(state, machine.incarnation(), &progress.snapshot(stall_after()));
-            true
+            publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+            return CleanupSettled::Proved;
         }
-        ShutdownOutcome::Pending => {
-            let state = machine.on_cleanup_unproved();
-            publisher.publish(state, machine.incarnation(), &progress.snapshot(stall_after()));
-            // Wait for the one session; never start a replacement or another cleanup worker.
-            if matches!(
-                bounded_cleanup(consumer, machine.policy().cleanup_budget * 8).await,
-                ShutdownOutcome::Complete
-            ) {
-                proof.settle();
+        match consumer.cleanup_progress() {
+            // Still running: report the wait and keep observing. A stop request only changes which
+            // phase is published; it cannot cancel the pass.
+            Some(session) if session.running => {
+                let state = if stop_token.is_cancelled() {
+                    machine.request_stop()
+                } else {
+                    machine.on_cleanup_unproved()
+                };
+                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+                continue;
             }
-            false
+            // The pass ended without a proof. Report the phase it stopped in and retain ownership.
+            Some(session) => {
+                let state = machine.on_cleanup_unproved();
+                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+                tracing::warn!(
+                    phase = session.phase,
+                    "managed consumer: cleanup session ended unproved"
+                );
+                return CleanupSettled::Unproved(session.phase);
+            }
+            // No session at all means shutdown_until never created one, which cannot happen because
+            // the call above starts it. Treat it as unproved rather than inventing success.
+            None => {
+                let state = machine.on_cleanup_unproved();
+                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+                return CleanupSettled::Unproved("no_cleanup_session");
+            }
         }
     }
 }
 
-/// Final teardown after a stop request: prove cleanup, report it, and settle the proof exactly
-/// once. A caller whose deadline elapsed already saw `Pending` and may attach to this session.
-async fn finish_with_cleanup(
-    consumer: &mut DefaultMQPushConsumer,
-    policy: LifecyclePolicy,
-    machine: &mut RecoveryMachine,
-    publisher: &StatusPublisher,
-    proof: &mut CleanupProof,
-) {
-    match bounded_cleanup(consumer, policy.cleanup_budget).await {
-        ShutdownOutcome::Complete => {
-            let state = machine.on_cleanup_complete();
-            publisher.publish(state, machine.incarnation(), &ProgressSnapshot::default());
-            proof.settle();
-        }
-        ShutdownOutcome::Pending => {
-            let state = machine.on_cleanup_unproved();
-            publisher.publish(state, machine.incarnation(), &ProgressSnapshot::default());
-            if matches!(
-                bounded_cleanup(consumer, policy.cleanup_budget * 8).await,
-                ShutdownOutcome::Complete
-            ) {
-                proof.settle();
-            }
-        }
+fn snapshot_of(progress: Option<&Arc<ConsumerProgress>>) -> ProgressSnapshot {
+    match progress {
+        Some(progress) => progress.snapshot(stall_after()),
+        None => ProgressSnapshot::default(),
     }
 }
 
@@ -821,14 +865,6 @@ async fn run_incarnation(
         publisher.publish(state, machine.incarnation(), &snapshot);
         previous = Some(snapshot);
         effects = next;
-    }
-}
-
-async fn bounded_cleanup(consumer: &mut DefaultMQPushConsumer, budget: Duration) -> ShutdownOutcome {
-    let deadline = tokio::time::Instant::now() + budget;
-    match consumer.shutdown_until(deadline).await {
-        crate::consumer::default_mq_push_consumer::ConsumerCleanup::Complete => ShutdownOutcome::Complete,
-        crate::consumer::default_mq_push_consumer::ConsumerCleanup::Incomplete => ShutdownOutcome::Pending,
     }
 }
 

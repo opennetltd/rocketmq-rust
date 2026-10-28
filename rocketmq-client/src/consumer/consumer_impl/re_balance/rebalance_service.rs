@@ -108,7 +108,11 @@ impl RebalanceService {
         let (mut shutdown, tx_shutdown) = Shutdown::new(1);
         self.tx_shutdown = Some(tx_shutdown);
         let work = instance.work.clone();
-        work.spawn(&tokio::runtime::Handle::current(), async move {
+        // The rebalance loop is shared by every consumer registered on this client instance, so it
+        // runs on the runtime the instance owns: a controller that stops must not take the loop
+        // away from siblings that are still assigned queues.
+        let runtime = instance.runtime_handle();
+        work.spawn(&runtime, async move {
             let mut last_rebalance_timestamp = Instant::now();
             let min_interval = *MIN_INTERVAL;
             let mut real_wait_interval = *WAIT_INTERVAL;

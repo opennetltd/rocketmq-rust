@@ -59,6 +59,10 @@ use crate::base::client_config::ClientConfig;
 use crate::base::validators::Validators;
 use crate::consumer::ack_callback::AckCallback;
 use crate::consumer::ack_result::AckResult;
+use crate::consumer::cleanup_session::spawn_cleanup_session;
+use crate::consumer::cleanup_session::CleanupDriver;
+use crate::consumer::cleanup_session::CleanupProgress as CleanupSessionProgress;
+use crate::consumer::cleanup_session::CleanupSession;
 use crate::consumer::consumer_impl::consume_message_concurrently_service::ConsumeMessageConcurrentlyService;
 use crate::consumer::consumer_impl::consume_message_orderly_service::ConsumeMessageOrderlyService;
 use crate::consumer::consumer_impl::consume_message_pop_concurrently_service::ConsumeMessagePopConcurrentlyService;
@@ -212,6 +216,9 @@ pub struct DefaultMQPushConsumerImpl {
     /// Listener admission shared with the consume service; closed first on cleanup so a batch that
     /// never started is rejected instead of racing teardown.
     pub(crate) delivery: Arc<DeliveryGate>,
+    /// The one cleanup session of this consumer, created by the first stop request. Observers join
+    /// it; nobody may cancel it (plan 50 section 4.1).
+    cleanup_session: Arc<parking_lot::Mutex<Option<CleanupSession>>>,
 }
 
 impl DefaultMQPushConsumerImpl {
@@ -287,6 +294,7 @@ impl DefaultMQPushConsumerImpl {
                 10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200,
             ]),
             default_mqpush_consumer_impl: None,
+            cleanup_session: Arc::new(parking_lot::Mutex::new(None)),
         };
         let wrapper = ArcMut::downgrade(&this.rebalance_impl);
         this.rebalance_impl.set_rebalance_impl(wrapper);
@@ -516,7 +524,8 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
-    /// False means local cleanup is unproved; callers must not start a replacement.
+    /// False means local cleanup is unproved; callers must not start a replacement. The caller's
+    /// deadline bounds only this wait - the session it joins keeps running afterwards.
     pub(crate) async fn shutdown_until(&mut self, deadline: TokioInstant) -> bool {
         // Admission closes immediately and unconditionally: no new pull and no new listener batch.
         // The cleanup session itself is not cancellable; a caller deadline only bounds the wait.
@@ -524,12 +533,48 @@ impl DefaultMQPushConsumerImpl {
         self.work.close();
         self.delivery.close();
         self.rebalance_impl.invalidate_rebalance_generation();
-        tokio::time::timeout_at(deadline, self.cleanup_until(deadline))
-            .await
-            .unwrap_or(false)
+
+        let existing_session = self.cleanup_session.lock().clone();
+        if let Some(session) = existing_session {
+            // A session already exists: join it rather than starting a second pass or writer.
+            return session.join(deadline).await;
+        }
+        match self.begin_cleanup_session(deadline) {
+            Some(session) => session.join(deadline).await,
+            None => {
+                // Degenerate case: this consumer was built without an owned handle, so the pass
+                // cannot be detached from the caller. It stays bounded as it always was.
+                tokio::time::timeout_at(deadline, self.cleanup_pass(deadline, CleanupDriver::detached()))
+                    .await
+                    .unwrap_or(false)
+            }
+        }
     }
 
-    async fn cleanup_until(&mut self, deadline: TokioInstant) -> bool {
+    /// Where the cleanup session stands, or `None` while no stop has been requested. Observation
+    /// only: reading it cannot start, restart or cancel anything.
+    pub(crate) fn cleanup_progress(&self) -> Option<CleanupSessionProgress> {
+        self.cleanup_session.lock().as_ref().map(|session| session.progress())
+    }
+
+    /// Start the one cleanup pass on a thread this SDK owns. The first caller's remaining budget
+    /// sizes the session's own ceiling - eight times what a managed stop used to wait for in two
+    /// fixed steps - but never bounds the pass itself.
+    fn begin_cleanup_session(&mut self, deadline: TokioInstant) -> Option<CleanupSession> {
+        let mut handle = self.default_mqpush_consumer_impl.clone()?;
+        let caller_budget = deadline
+            .saturating_duration_since(TokioInstant::now())
+            .max(std::time::Duration::from_millis(1));
+        let session_deadline = TokioInstant::now() + caller_budget.saturating_mul(8);
+        let group = self.consumer_config.consumer_group.to_string();
+        let session = spawn_cleanup_session(&group, move |driver| async move {
+            handle.cleanup_pass(session_deadline, driver).await
+        });
+        *self.cleanup_session.lock() = Some(session.clone());
+        Some(session)
+    }
+
+    async fn cleanup_pass(&mut self, deadline: TokioInstant, driver: CleanupDriver) -> bool {
         // Declared first so it drops last: the summary is emitted once this pass ends on any path,
         // including an early return, and after the cleanup lock is released.
         let mut report = CleanupReport::new(self.consumer_config.consumer_group.clone());
@@ -551,12 +596,15 @@ impl DefaultMQPushConsumerImpl {
         if let Some(service) = self.consume_message_service.as_mut() {
             service.begin_shutdown();
         }
+        driver.enter("scheduled_work");
         let started = TokioInstant::now();
         self.work.wait().await;
         report.record("scheduled_work", started);
+        driver.enter("delivery");
         let started = TokioInstant::now();
         self.delivery.wait().await;
         report.record("delivery", started);
+        driver.enter("consume_service");
         let started = TokioInstant::now();
         if let Some(service) = self.consume_message_service.as_mut() {
             service.shutdown(remaining_millis(deadline)).await;
@@ -576,6 +624,7 @@ impl DefaultMQPushConsumerImpl {
             drop(queues);
             // One bounded pass: broker lookup, route refresh and the send all share the cleanup
             // deadline, and anything the budget could not reach is reported, not hidden.
+            driver.enter("offset_persist");
             let started = TokioInstant::now();
             let summary = store.persist_all_until(&assigned, deadline).await;
             report.record("offset_persist", started);
@@ -598,6 +647,7 @@ impl DefaultMQPushConsumerImpl {
             queue.set_dropped(true);
         }
         drop(queues);
+        driver.enter("unregister");
         if let Some(client) = self.client_instance.as_mut() {
             let started = TokioInstant::now();
             // A duplicate-registration failure does not own the sibling's entry.
@@ -619,6 +669,7 @@ impl DefaultMQPushConsumerImpl {
                     .await;
             }
             report.record("unregister", started);
+            driver.enter("client_shutdown");
             let started = TokioInstant::now();
             client.shutdown().await;
             report.record("client_shutdown", started);
@@ -1971,5 +2022,77 @@ mod tests {
         let _ = std::fs::remove_file(&markers);
         assert!(status.success(), "child failed ({status}) after: {progress}");
         assert_eq!("pending\ncomplete\n", progress, "both stages must be reached in order");
+    }
+
+    /// One consumer wired the way the public wrapper wires it, plus one claimed listener batch. The
+    /// self-handle matters: it is what lets the cleanup pass move onto the SDK's own thread instead
+    /// of living and dying inside the caller's await.
+    fn wired_consumer_with_a_blocked_delivery() -> (
+        ArcMut<DefaultMQPushConsumerImpl>,
+        crate::consumer::consumer_impl::consumer_work::DeliveryPermit,
+    ) {
+        let mut client_config = ClientConfig::default();
+        client_config.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let consumer_config = ArcMut::new(ConsumerConfig {
+            consumer_group: CheetahString::from_static_str("cleanup-outlives-callers-group"),
+            ..Default::default()
+        });
+        let mut consumer = ArcMut::new(DefaultMQPushConsumerImpl::new(client_config, consumer_config, None));
+        let handle = consumer.clone();
+        consumer.set_default_mqpush_consumer_impl(handle);
+        let permit = consumer
+            .delivery
+            .admit()
+            .expect("an open gate admits the batch that is already running");
+        (consumer, permit)
+    }
+
+    /// Plan 50 F1: cleanup belongs to the SDK, not to whoever asked for it. A caller whose deadline
+    /// has passed walks away with "not proved yet"; the pass it left behind still runs to the end
+    /// and releases what it holds, and a later joiner sees that completion instead of starting a
+    /// second writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_finishes_after_every_caller_has_walked_away() {
+        let (mut consumer, permit) = wired_consumer_with_a_blocked_delivery();
+
+        // A caller that cannot wait at all: it gets Pending and leaves.
+        assert!(
+            !consumer.shutdown_until(TokioInstant::now()).await,
+            "an elapsed deadline reports not proved yet"
+        );
+        let progress = consumer
+            .cleanup_progress()
+            .expect("the stop request started one session");
+        assert!(
+            progress.running,
+            "the pass must keep running without a caller: {progress:?}"
+        );
+
+        // Nobody is waiting any more. Releasing the batch lets the abandoned pass finish on its
+        // own.
+        drop(permit);
+        for _ in 0..200 {
+            if !consumer.cleanup_progress().expect("session still there").running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let progress = consumer.cleanup_progress().expect("session still there");
+        assert!(
+            !progress.running && progress.proved,
+            "cleanup must finish unwatched: {progress:?}"
+        );
+
+        // A later joiner gets the remembered answer; joining again starts neither a pass nor a
+        // second offset writer.
+        assert!(
+            consumer
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(1))
+                .await,
+            "a proved session answers every later caller"
+        );
+        let again = consumer.cleanup_progress().expect("session still there");
+        assert_eq!(again.phase, progress.phase, "no second pass rewrote the outcome");
+        assert!(!again.running && again.proved);
     }
 }

@@ -692,7 +692,17 @@ impl DefaultMQPushConsumer {
         instance.re_balance_immediately();
     }
 
-    /// Uses the same deadline for lock acquisition and every local cleanup phase.
+    /// Where this consumer's single cleanup session stands, or `None` while no stop has been
+    /// requested. Reading it cannot start, restart, or cancel the pass.
+    pub(crate) fn cleanup_progress(&self) -> Option<crate::consumer::cleanup_session::CleanupProgress> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .and_then(|impl_| impl_.cleanup_progress())
+    }
+
+    /// Join the consumer's one cleanup session until `deadline`. The deadline bounds only this
+    /// wait: an elapsed answer means "not proved yet", and the pass keeps running to release what
+    /// it holds. Use [`Self::cleanup_progress`] to tell a still-running pass from a settled one.
     pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> ConsumerCleanup {
         if self
             .default_mqpush_consumer_impl

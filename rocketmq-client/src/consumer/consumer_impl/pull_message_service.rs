@@ -27,6 +27,10 @@ use crate::factory::mq_client_instance::MQClientInstance;
 pub struct PullMessageService {
     tx: Option<tokio::sync::mpsc::Sender<Box<dyn MessageRequest + Send + 'static>>>,
     tx_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Runtime owned by the client instance that runs this shared pull loop. Delayed requests are
+    /// dispatched here rather than on whatever consumer scheduled them, so one controller's
+    /// teardown cannot strand work that belongs to the shared service.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl PullMessageService {
@@ -34,6 +38,7 @@ impl PullMessageService {
         PullMessageService {
             tx: None,
             tx_shutdown: None,
+            runtime: None,
         }
     }
     pub async fn start(&mut self, mut instance: ArcMut<MQClientInstance>) {
@@ -42,7 +47,9 @@ impl PullMessageService {
         self.tx = Some(tx);
         self.tx_shutdown = Some(tx_shutdown);
         let work = instance.work.clone();
-        work.spawn(&tokio::runtime::Handle::current(), async move {
+        let runtime = instance.runtime_handle();
+        self.runtime = Some(runtime.clone());
+        work.spawn(&runtime, async move {
             info!(">>>>>>>>>>>>>>>>>>>>>>>PullMessageService  started<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
             /*while let Some(request) = rx.recv().await {
                 if request.get_message_request_mode() == MessageRequestMode::Pull {
@@ -101,8 +108,12 @@ impl PullMessageService {
     }
 
     pub fn execute_pull_request_later(&self, pull_request: PullRequest, time_delay: u64) {
+        let Some(runtime) = self.runtime.clone() else {
+            warn!("PullMessageService is not running; dropping a delayed pull request");
+            return;
+        };
         let this = self.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(time_delay)).await;
             if let Err(e) = this.tx.as_ref().unwrap().send(Box::new(pull_request)).await {
                 warn!("Failed to send pull request to pull_tx, error: {:?}", e);
@@ -117,8 +128,12 @@ impl PullMessageService {
     }
 
     pub fn execute_pop_pull_request_later(&self, pop_request: PopRequest, time_delay: u64) {
+        let Some(runtime) = self.runtime.clone() else {
+            warn!("PullMessageService is not running; dropping a delayed pop request");
+            return;
+        };
         let this = self.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(time_delay)).await;
             if let Err(e) = this.tx.as_ref().unwrap().send(Box::new(pop_request)).await {
                 warn!("Failed to send pull request to pull_tx, error: {:?}", e);

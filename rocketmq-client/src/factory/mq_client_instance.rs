@@ -280,9 +280,13 @@ impl MQClientInstance {
             Some(tx),
         ));
         instance.mq_client_api_impl = Some(mq_client_api_impl.clone());
+        // Shared services belong to this client, never to whichever consumer created it first: they
+        // run on the runtime stored in the instance so that stopping or replacing one consumer
+        // cannot drop the pull loop, the rebalance loop or the connection observer that siblings
+        // still depend on.
+        let shared_runtime = instance.runtime_handle();
         if let Some(namesrv_addr) = client_config.namesrv_addr.as_deref() {
-            let handle = Handle::current();
-
+            let handle = shared_runtime.clone();
             let namesrv_addr = namesrv_addr.to_string();
             instance.work.spawn(&handle, async move {
                 mq_client_api_impl
@@ -290,7 +294,7 @@ impl MQClientInstance {
                     .await;
             });
         }
-        instance.work.spawn(&Handle::current(), async move {
+        instance.work.spawn(&shared_runtime, async move {
             while let Ok(value) = rx.recv().await {
                 if let Some(instance_) = weak_instance.upgrade() {
                     match value {
@@ -325,6 +329,26 @@ impl MQClientInstance {
         instance
     }
 
+    /// The runtime owned by this client instance.
+    ///
+    /// Every task that outlives the call which created it - shared pull loop, rebalance loop,
+    /// connection-event observer, nameserver initialization and their delayed dispatches - is
+    /// spawned here. Consumers share instances by client id, so a task spawned on the ambient
+    /// handle of the consumer that happened to start first would die with that consumer's
+    /// controller while its siblings were still registered.
+    ///
+    /// Falls back to the caller's runtime only after this client's own runtime has been taken by
+    /// shutdown, which is a teardown path that must not panic.
+    pub(crate) fn runtime_handle(&self) -> Handle {
+        match self.instance_runtime.as_ref() {
+            Some(runtime) => runtime.get_handle().clone(),
+            None => {
+                debug!("client instance runtime is gone; using the caller's runtime for this task");
+                Handle::current()
+            }
+        }
+    }
+
     pub fn re_balance_immediately(&self) {
         self.rebalance_service.wakeup();
     }
@@ -334,7 +358,8 @@ impl MQClientInstance {
             self.rebalance_service.wakeup();
         } else {
             let service = self.rebalance_service.clone();
-            self.work.spawn(&Handle::current(), async move {
+            let runtime = self.runtime_handle();
+            self.work.spawn(&runtime, async move {
                 tokio::time::sleep(delay_millis).await;
                 service.wakeup();
             });
@@ -1709,6 +1734,72 @@ mod tests {
         instance.unregister_consumer(second).await;
         instance.shutdown().await;
         assert_eq!(instance.service_state, ServiceState::ShutdownAlready);
+    }
+
+    /// Plan 50 F2: the shared pull loop, rebalance loop and their delayed dispatches belong to the
+    /// client, not to whichever consumer controller happened to start them. Consumers share a
+    /// client by client id, so a service spawned on that controller's runtime would disappear
+    /// while its siblings were still registered - with no state transition and nothing to
+    /// restart it.
+    #[test]
+    fn shared_services_survive_the_runtime_of_the_consumer_that_started_them() {
+        // A current-thread runtime standing in for one managed consumer controller: the client is
+        // created and its shared loops are started inside it, exactly as consumer startup does.
+        let creator = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = creator.block_on(async {
+            let config = ClientConfig {
+                namesrv_addr: Some(CheetahString::from("127.0.0.1:19876")),
+                ..Default::default()
+            };
+            let instance = MQClientInstance::new_arc(config, 0, "phase50-shared-services", None);
+            instance.clone().pull_message_service.start(instance.clone()).await;
+            instance.clone().rebalance_service.start(instance.clone()).await;
+            instance
+        });
+
+        // The creator is gone. Anything it spawned on its own runtime dies here; the bound keeps a
+        // stranded task from hanging the suite, because shutdown_timeout returns either way.
+        creator.shutdown_timeout(Duration::from_secs(2));
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = observer.block_on(async move {
+            // A delayed rebalance dispatch is a task of its own: it must still fire.
+            let wakes = instance.rebalance_service.wakeup_count();
+            instance.re_balance_later(Duration::from_millis(20));
+            for _ in 0..100 {
+                if instance.rebalance_service.wakeup_count() > wakes {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                instance.rebalance_service.wakeup_count() > wakes,
+                "the delayed rebalance dispatch stopped once the runtime that started it ended"
+            );
+
+            // And the shared rebalance loop must still execute passes for whoever is left.
+            let passes = instance.rebalance_service.pass_count();
+            for _ in 0..200 {
+                if instance.rebalance_service.pass_count() > passes {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                instance.rebalance_service.pass_count() > passes,
+                "the shared rebalance loop stopped once the consumer that started it went away"
+            );
+            instance
+        });
+        // Dropped outside any runtime: this client owns runtimes of its own.
+        drop(instance);
+        drop(observer);
     }
 
     fn addrs(entries: &[(u64, &str)]) -> HashMap<u64, CheetahString> {
