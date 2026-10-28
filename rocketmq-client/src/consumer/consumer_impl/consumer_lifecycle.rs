@@ -78,11 +78,28 @@ impl Default for LifecyclePolicy {
 /// `[0, 1)`; passing it explicitly keeps the arithmetic testable without a clock or RNG.
 pub(crate) fn backoff_delay(policy: &LifecyclePolicy, attempt: u32, unit: f64) -> Duration {
     let unit = unit.clamp(0.0, 1.0);
-    let base = policy.retry_min.as_secs_f64() * 2f64.powi(attempt.saturating_sub(1) as i32);
-    let base = Duration::from_secs_f64(base).min(policy.retry_max);
-    let factor = 1.0 + policy.jitter_ratio * (2.0 * unit - 1.0);
-    let jittered = Duration::from_secs_f64(base.as_secs_f64() * factor);
-    jittered.clamp(policy.retry_min / 2, policy.retry_max)
+    // Growth happens in integer milliseconds with a saturating shift, and the ceiling is applied
+    // before any floating-point number appears. Computing `retry_min * 2^attempt` in seconds and
+    // converting afterwards panics inside `Duration::from_secs_f64` once the product overflows (at
+    // attempt 64 with a three-second floor), and narrowing the attempt to `i32` turns large counts
+    // into negative exponents. Saturating at the ceiling is also the only honest result: this
+    // policy cannot express a delay above `retry_max`, so growth beyond it is invisible.
+    let base_ms = millis_bounded(policy.retry_min).saturating_mul(1u64 << attempt.saturating_sub(1).min(63));
+    let ceiling_ms = millis_bounded(policy.retry_max);
+    let base_ms = base_ms.min(ceiling_ms);
+    // Symmetric jitter around a value already inside the ceiling; clamped again so a wide ratio can
+    // never push a delay past it or below half the floor.
+    let factor = 1.0 + policy.jitter_ratio.clamp(0.0, 1.0) * (2.0 * unit - 1.0);
+    let jittered_ms = (base_ms as f64 * factor).clamp(0.0, ceiling_ms as f64).ceil() as u64;
+    // Ordered by hand: `Ord::clamp` panics when the bounds are inverted, and a policy with
+    // retry_max below half of retry_min must produce a delay rather than take the process down.
+    let floor_ms = millis_bounded(policy.retry_min / 2).min(ceiling_ms);
+    Duration::from_millis(jittered_ms.max(floor_ms).min(ceiling_ms))
+}
+
+/// Milliseconds without ever truncating a duration that outlives `u64`.
+fn millis_bounded(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Delay before the first retry after a failure: bounded backoff plus a one-off spread so a
@@ -889,6 +906,63 @@ mod tests {
         assert_eq!(backoff_delay(&policy, 2, 0.5), Duration::from_secs(6));
         assert_eq!(backoff_delay(&policy, 3, 0.5), Duration::from_secs(12));
         assert_eq!(backoff_delay(&policy, 40, 0.5), Duration::from_secs(120));
+    }
+
+    /// Plan 50 F3: the attempt counter is a lifetime total and may reach any `u32`. Growing the
+    /// delay must saturate at the ceiling for every one of them - never panic, never exceed it -
+    /// whatever jitter draw accompanies it.
+    #[test]
+    fn backoff_saturates_for_every_attempt_without_panicking() {
+        let policy = LifecyclePolicy::default();
+        for attempt in [0, 1, 2, 31, 32, 62, 63, 64, 65, 100, 1_024, u32::MAX - 1, u32::MAX] {
+            for unit in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let delay = backoff_delay(&policy, attempt, unit);
+                assert!(
+                    delay >= policy.retry_min / 2 && delay <= policy.retry_max,
+                    "attempt {attempt} unit {unit}: {delay:?}"
+                );
+            }
+        }
+        // Once the exponent passes what the ceiling can absorb, the answer is the ceiling itself
+        // (modulo jitter), not a wrapped or negative value.
+        assert_eq!(backoff_delay(&policy, u32::MAX, 0.5), policy.retry_max);
+        assert_eq!(backoff_delay(&policy, 64, 0.5), policy.retry_max);
+    }
+
+    /// Degenerate policies must not be able to panic the arithmetic either.
+    #[test]
+    fn backoff_survives_degenerate_policies() {
+        let zero_floor = LifecyclePolicy {
+            retry_min: Duration::ZERO,
+            ..LifecyclePolicy::default()
+        };
+        assert_eq!(backoff_delay(&zero_floor, 7, 0.5), Duration::ZERO);
+
+        let huge_ceiling = LifecyclePolicy {
+            retry_max: Duration::from_secs(u64::MAX / 2),
+            ..LifecyclePolicy::default()
+        };
+        assert!(backoff_delay(&huge_ceiling, u32::MAX, 1.0) <= huge_ceiling.retry_max);
+
+        // An inverted policy (ceiling below the floor) still yields a bounded delay.
+        let inverted = LifecyclePolicy {
+            retry_min: Duration::from_secs(60),
+            retry_max: Duration::from_secs(5),
+            ..LifecyclePolicy::default()
+        };
+        assert!(backoff_delay(&inverted, 3, 0.5) <= Duration::from_secs(5));
+
+        // A jitter ratio outside [0, 1] is clamped rather than trusted.
+        let wild = LifecyclePolicy {
+            jitter_ratio: -1.0,
+            ..LifecyclePolicy::default()
+        };
+        assert!(backoff_delay(&wild, 3, 0.0) <= wild.retry_max);
+        let wild = LifecyclePolicy {
+            jitter_ratio: 9.0,
+            ..LifecyclePolicy::default()
+        };
+        assert!(backoff_delay(&wild, 3, 1.0) <= wild.retry_max);
     }
 
     #[test]

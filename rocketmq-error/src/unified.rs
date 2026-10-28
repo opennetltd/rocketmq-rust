@@ -354,6 +354,13 @@ pub enum RocketMQError {
     #[error("Illegal argument: {0}")]
     IllegalArgument(String),
 
+    /// Rejected configuration: the caller cannot fix it by retrying in this process, because the
+    /// problem is in what was asked for rather than in anything that happened while asking. Kept
+    /// distinct from `IllegalArgument`, which this codebase also raises for transient conditions,
+    /// so recovery logic can classify startup failures by type instead of message text.
+    #[error("Invalid configuration: {0}")]
+    Configuration(String),
+
     /// Operation timeout
     #[error("Operation '{operation}' timed out after {timeout_ms}ms")]
     Timeout { operation: &'static str, timeout_ms: u64 },
@@ -432,6 +439,12 @@ impl RocketMQError {
     #[inline]
     pub fn illegal_argument(message: impl Into<String>) -> Self {
         Self::IllegalArgument(message.into())
+    }
+
+    /// Reject a configuration that can never start in this process
+    #[inline]
+    pub fn configuration(message: impl Into<String>) -> Self {
+        Self::Configuration(message.into())
     }
 
     /// Create a route not found error

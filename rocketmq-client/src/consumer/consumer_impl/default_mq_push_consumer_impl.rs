@@ -221,7 +221,186 @@ pub struct DefaultMQPushConsumerImpl {
     cleanup_session: Arc<parking_lot::Mutex<Option<CleanupSession>>>,
 }
 
+/// Identity rules that hold before any resource exists, shared by legacy start and managed spec
+/// validation so an application cannot fail later than the SDK could have told it (plan 50 F3).
+pub(crate) fn check_consumer_identity(group: &str) -> rocketmq_error::RocketMQResult<()> {
+    Validators::check_group(group)?;
+    if group.is_empty() {
+        return Err(mq_client_err!(format!(
+            "consumer_group is empty, {}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
+    if group == DEFAULT_CONSUMER_GROUP {
+        return Err(mq_client_err!(format!(
+            "consumer_group can not equal {} please specify another one.{}",
+            DEFAULT_CONSUMER_GROUP,
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
+    Ok(())
+}
+
+/// One topic/expression pair, validated without a client instance or runtime: the same rules
+/// `subscribe` applies later, run early enough to reject a spec before anything is created.
+pub(crate) fn check_subscription(topic: &str, expression: &str) -> rocketmq_error::RocketMQResult<()> {
+    Validators::check_topic(topic)?;
+    let topic = CheetahString::from_slice(topic);
+    let expression = CheetahString::from_slice(expression);
+    FilterAPI::build_subscription_data(&topic, &expression)
+        .map_err(|err| mq_client_err!(format!("buildSubscriptionData exception, {err}")))?;
+    Ok(())
+}
+
 impl DefaultMQPushConsumerImpl {
+    fn check_config(&mut self) -> rocketmq_error::RocketMQResult<()> {
+        check_consumer_identity(self.consumer_config.consumer_group.as_str())?;
+
+        if self.consumer_config.allocate_message_queue_strategy.is_none() {
+            return Err(mq_client_err!(format!(
+                "allocate_message_queue_strategy is null{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.message_listener.is_none() {
+            return Err(mq_client_err!(format!(
+                "messageListener is null{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self
+            .consumer_config
+            .message_listener
+            .as_ref()
+            .unwrap()
+            .message_listener_orderly
+            .is_none()
+            && self
+                .consumer_config
+                .message_listener
+                .as_ref()
+                .unwrap()
+                .message_listener_concurrently
+                .is_none()
+        {
+            return Err(mq_client_err!(format!(
+                "messageListener must be instanceof MessageListenerOrderly or MessageListenerConcurrently{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        let consume_thread_min = self.consumer_config.consume_thread_min;
+        let consume_thread_max = self.consumer_config.consume_thread_max;
+        if !(1..=1000).contains(&consume_thread_min) {
+            return Err(mq_client_err!(format!(
+                "consumeThreadMin Out of range [1, 1000]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+        if !(1..=1000).contains(&consume_thread_max) {
+            return Err(mq_client_err!(format!(
+                "consumeThreadMax Out of range [1, 1000]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+        if consume_thread_min > consume_thread_max {
+            return Err(mq_client_err!(format!(
+                "consumeThreadMin ({}) is larger than consumeThreadMax ({})",
+                consume_thread_min, consume_thread_max
+            )));
+        }
+
+        if self.consumer_config.consume_concurrently_max_span < 1
+            || self.consumer_config.consume_concurrently_max_span > 65535
+        {
+            return Err(mq_client_err!(format!(
+                "consumeConcurrentlyMaxSpan Out of range [1, 65535]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_threshold_for_queue < 1 || self.consumer_config.pull_threshold_for_queue > 65535 {
+            return Err(mq_client_err!(format!(
+                "pullThresholdForQueue Out of range [1, 65535]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_threshold_for_topic != -1
+            && (self.consumer_config.pull_threshold_for_topic < 1
+                || self.consumer_config.pull_threshold_for_topic > 6553500)
+        {
+            return Err(mq_client_err!(format!(
+                "pullThresholdForTopic Out of range [1, 65535]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_threshold_size_for_queue < 1
+            || self.consumer_config.pull_threshold_size_for_queue > 1024
+        {
+            return Err(mq_client_err!(format!(
+                "pullThresholdSizeForQueue Out of range [1, 1024]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_threshold_size_for_topic != -1
+            && (self.consumer_config.pull_threshold_size_for_topic < 1
+                || self.consumer_config.pull_threshold_size_for_topic > 102400)
+        {
+            return Err(mq_client_err!(format!(
+                "pullThresholdSizeForTopic Out of range [1, 102400]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_interval > 65535 {
+            return Err(mq_client_err!(format!(
+                "pullInterval Out of range [0, 65535]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.consume_message_batch_max_size < 1
+            || self.consumer_config.consume_message_batch_max_size > 1024
+        {
+            return Err(mq_client_err!(format!(
+                "consumeMessageBatchMaxSize Out of range [1, 1024]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pull_batch_size < 1 || self.consumer_config.pull_batch_size > 1024 {
+            return Err(mq_client_err!(format!(
+                "pullBatchSize Out of range [1, 1024]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pop_invisible_time < MIN_POP_INVISIBLE_TIME
+            || self.consumer_config.pop_invisible_time > MAX_POP_INVISIBLE_TIME
+        {
+            return Err(mq_client_err!(format!(
+                "popInvisibleTime Out of range [{}, {}]{}",
+                MIN_POP_INVISIBLE_TIME,
+                MAX_POP_INVISIBLE_TIME,
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        if self.consumer_config.pop_batch_nums < 1 || self.consumer_config.pop_batch_nums > 32 {
+            return Err(mq_client_err!(format!(
+                "popBatchNums Out of range [1, 32]{}",
+                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+            )));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         *self.service_state == ServiceState::Running
     }
@@ -334,8 +513,14 @@ impl DefaultMQPushConsumerImpl {
                     self.consumer_config.unit_mode
                 );
                 *self.service_state = ServiceState::Starting;
-                // check all config
-                self.check_config()?;
+                // check all config. A configuration problem is tagged as such so the recovery
+                // controller can separate "never retry" from "not yet" by type instead of by
+                // message text (plan 50 F3).
+                if let Err(err) = self.check_config() {
+                    return Err(rocketmq_error::RocketMQError::configuration(format!(
+                        "consumer configuration is invalid: {err}"
+                    )));
+                }
                 //copy_subscription is can be removed
                 self.copy_subscription().await?;
                 if self.consumer_config.message_model() == MessageModel::Clustering {
@@ -702,168 +887,6 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
-    fn check_config(&mut self) -> rocketmq_error::RocketMQResult<()> {
-        Validators::check_group(self.consumer_config.consumer_group.as_str())?;
-        if self.consumer_config.consumer_group.is_empty() {
-            return Err(mq_client_err!(format!(
-                "consumer_group is empty, {}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.consumer_group == DEFAULT_CONSUMER_GROUP {
-            return Err(mq_client_err!(format!(
-                "consumer_group can not equal {} please specify another one.{}",
-                DEFAULT_CONSUMER_GROUP,
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.allocate_message_queue_strategy.is_none() {
-            return Err(mq_client_err!(format!(
-                "allocate_message_queue_strategy is null{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.message_listener.is_none() {
-            return Err(mq_client_err!(format!(
-                "messageListener is null{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self
-            .consumer_config
-            .message_listener
-            .as_ref()
-            .unwrap()
-            .message_listener_orderly
-            .is_none()
-            && self
-                .consumer_config
-                .message_listener
-                .as_ref()
-                .unwrap()
-                .message_listener_concurrently
-                .is_none()
-        {
-            return Err(mq_client_err!(format!(
-                "messageListener must be instanceof MessageListenerOrderly or MessageListenerConcurrently{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        let consume_thread_min = self.consumer_config.consume_thread_min;
-        let consume_thread_max = self.consumer_config.consume_thread_max;
-        if !(1..=1000).contains(&consume_thread_min) {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMin Out of range [1, 1000]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-        if !(1..=1000).contains(&consume_thread_max) {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMax Out of range [1, 1000]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-        if consume_thread_min > consume_thread_max {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMin ({}) is larger than consumeThreadMax ({})",
-                consume_thread_min, consume_thread_max
-            )));
-        }
-
-        if self.consumer_config.consume_concurrently_max_span < 1
-            || self.consumer_config.consume_concurrently_max_span > 65535
-        {
-            return Err(mq_client_err!(format!(
-                "consumeConcurrentlyMaxSpan Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_threshold_for_queue < 1 || self.consumer_config.pull_threshold_for_queue > 65535 {
-            return Err(mq_client_err!(format!(
-                "pullThresholdForQueue Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_threshold_for_topic != -1
-            && (self.consumer_config.pull_threshold_for_topic < 1
-                || self.consumer_config.pull_threshold_for_topic > 6553500)
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdForTopic Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_threshold_size_for_queue < 1
-            || self.consumer_config.pull_threshold_size_for_queue > 1024
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdSizeForQueue Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_threshold_size_for_topic != -1
-            && (self.consumer_config.pull_threshold_size_for_topic < 1
-                || self.consumer_config.pull_threshold_size_for_topic > 102400)
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdSizeForTopic Out of range [1, 102400]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_interval > 65535 {
-            return Err(mq_client_err!(format!(
-                "pullInterval Out of range [0, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.consume_message_batch_max_size < 1
-            || self.consumer_config.consume_message_batch_max_size > 1024
-        {
-            return Err(mq_client_err!(format!(
-                "consumeMessageBatchMaxSize Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pull_batch_size < 1 || self.consumer_config.pull_batch_size > 1024 {
-            return Err(mq_client_err!(format!(
-                "pullBatchSize Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pop_invisible_time < MIN_POP_INVISIBLE_TIME
-            || self.consumer_config.pop_invisible_time > MAX_POP_INVISIBLE_TIME
-        {
-            return Err(mq_client_err!(format!(
-                "popInvisibleTime Out of range [{}, {}]{}",
-                MIN_POP_INVISIBLE_TIME,
-                MAX_POP_INVISIBLE_TIME,
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        if self.consumer_config.pop_batch_nums < 1 || self.consumer_config.pop_batch_nums > 32 {
-            return Err(mq_client_err!(format!(
-                "popBatchNums Out of range [1, 32]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-
-        Ok(())
-    }
-
     async fn copy_subscription(&mut self) -> rocketmq_error::RocketMQResult<()> {
         let sub = self.consumer_config.subscription();
         if !sub.is_empty() {
@@ -947,8 +970,14 @@ impl DefaultMQPushConsumerImpl {
             return;
         }
         self.progress.note_retry_scheduled();
-        let service = self.client_instance.as_ref().unwrap().pull_message_service.clone();
-        self.work.spawn(&tokio::runtime::Handle::current(), async move {
+        // A delayed retry is dispatched by the shared pull service, so its timer belongs to the
+        // client instance's runtime rather than to whichever task happened to schedule it (F2).
+        let Some(client_instance) = self.client_instance.as_ref() else {
+            return;
+        };
+        let handle = client_instance.runtime_handle();
+        let service = client_instance.pull_message_service.clone();
+        self.work.spawn(&handle, async move {
             tokio::time::sleep(std::time::Duration::from_millis(time_delay)).await;
             service.execute_pull_request_immediately(pull_request).await;
         });

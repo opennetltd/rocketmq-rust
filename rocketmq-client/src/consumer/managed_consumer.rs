@@ -45,6 +45,8 @@ use crate::consumer::consumer_impl::consumer_lifecycle::ProgressSnapshot;
 use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
 use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
 use crate::consumer::consumer_impl::consumer_lifecycle::RepairKind;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consumer_identity;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
 use crate::consumer::default_mq_push_consumer::ConsumerCleanup;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
@@ -56,6 +58,7 @@ use crate::consumer::mq_push_consumer::MQPushConsumer;
 use rocketmq_common::common::consumer::consume_from_where::ConsumeFromWhere;
 use rocketmq_common::common::message::message_ext::MessageExt;
 use rocketmq_common::common::message::message_queue::MessageQueue;
+use rocketmq_error::RocketMQError;
 
 /// Listener invoked for a batch of messages on the SDK's consume runtime.
 pub type ManagedListener = Arc<
@@ -222,30 +225,39 @@ impl ManagedConsumerSpec {
         self
     }
 
-    /// Validation shared by `build()` and the managed entry point (plan 49 section 3.1): one
-    /// normalisation path so an application cannot fail later than the SDK could have told it.
+    /// Side-effect-free validation run before the controller, its runtime or any client instance
+    /// exists (plan 50 F3): identity and subscription rules are the ones `start` applies later, so
+    /// a managed consumer cannot fail later than the SDK could have told it. Every failure is
+    /// an `IllegalArgument`, which is how the controller recognises "never retry" by type.
     pub(crate) fn validate(&self) -> Result<(), rocketmq_error::RocketMQError> {
-        if self.builder.consumer_group_ref().trim().is_empty() {
-            return Err(rocketmq_error::RocketMQError::illegal_argument(
-                "consumer group must not be empty",
+        // Tagged as configuration so the controller can classify it by type (plan 50 F3).
+        let rejected =
+            |err: rocketmq_error::RocketMQError| rocketmq_error::RocketMQError::configuration(err.to_string());
+        if self.listener.is_none() {
+            return Err(rocketmq_error::RocketMQError::configuration(
+                "a managed consumer needs a message listener",
             ));
         }
-        if self.builder.subscriptions().is_empty() {
-            return Err(rocketmq_error::RocketMQError::illegal_argument(
+        let group = self.builder.effective_group();
+        check_consumer_identity(group.as_str()).map_err(rejected)?;
+        let subscriptions = self.builder.subscriptions();
+        if subscriptions.is_empty() {
+            return Err(rocketmq_error::RocketMQError::configuration(
                 "a managed consumer needs at least one subscription",
             ));
         }
-        if self.listener.is_none() {
-            return Err(rocketmq_error::RocketMQError::illegal_argument(
-                "a managed consumer needs a message listener",
-            ));
+        for (topic, expression) in &subscriptions {
+            check_subscription(topic.as_str(), expression.as_str()).map_err(rejected)?;
         }
         Ok(())
     }
 
     /// Build one incarnation from the spec. Must run on the controller runtime: subscribing
     /// resolves the client id and touches the runtime handle.
-    fn build_incarnation(&self, progress: Arc<ConsumerProgress>) -> DefaultMQPushConsumer {
+    fn build_incarnation(
+        &self,
+        progress: Arc<ConsumerProgress>,
+    ) -> Result<DefaultMQPushConsumer, rocketmq_error::RocketMQError> {
         let mut builder = self.builder.clone();
         if let Some(from) = self.consume_from_where {
             builder = builder.consume_from_where(from);
@@ -264,12 +276,23 @@ impl ManagedConsumerSpec {
             None => sdk_tracker,
         };
         builder = builder.message_queue_listener(Some(composed));
+        // Subscriptions are detached from the builder and applied here: `build()` would apply them
+        // through an `expect`, and a configuration problem on the managed path has to come back as
+        // a reportable startup failure instead of a panic (plan 50 F3).
+        let subscriptions = builder.take_subscriptions();
         let mut consumer = builder.build();
         consumer.set_progress(Arc::clone(&progress));
         if let Some(listener) = self.listener.clone() {
             consumer.register_message_listener_concurrently(SpecListener { listener });
         }
-        consumer
+        for (topic, expression) in &subscriptions {
+            consumer.subscribe(topic.as_str(), expression.as_str()).map_err(|err| {
+                rocketmq_error::RocketMQError::configuration(format!(
+                    "subscription {topic} ({expression}) is invalid: {err}"
+                ))
+            })?;
+        }
+        Ok(consumer)
     }
 }
 
@@ -626,7 +649,21 @@ async fn controller_body(
         }
 
         let progress = ConsumerProgress::new();
-        let mut consumer = spec.build_incarnation(Arc::clone(&progress));
+        let mut consumer = match spec.build_incarnation(Arc::clone(&progress)) {
+            Ok(consumer) => consumer,
+            // Building the incarnation failed on configuration grounds. Nothing was started, so
+            // there is nothing to clean up; report it as a permanent startup failure.
+            Err(err) => {
+                // Terminal report: the machine records a configuration rejection and schedules
+                // nothing, exactly as it does for a permanent startup failure.
+                let (state, effects) = machine.on_start_result(false, false, false, jitter_unit());
+                debug_assert!(effects.is_empty(), "a rejected build must not schedule a retry");
+                publisher.publish(state, machine.incarnation(), &empty);
+                tracing::error!(error = %err, "managed consumer: incarnation could not be built");
+                proof.settle();
+                return;
+            }
+        };
         let deadline = tokio::time::Instant::now() + machine.startup_budget();
         let start_result = {
             let start = consumer.start_until(deadline);
@@ -634,7 +671,7 @@ async fn controller_body(
             tokio::select! {
                 biased;
                 _ = stop_token.cancelled() => Err(StartFailure::Stopped),
-                result = &mut start => result.map_err(|err| StartFailure::Failed(err.to_string())),
+                result = &mut start => result.map_err(StartFailure::Failed),
             }
         };
 
@@ -695,7 +732,7 @@ async fn controller_body(
                 }
                 return;
             }
-            Err(StartFailure::Failed(message)) => {
+            Err(StartFailure::Failed(error)) => {
                 // Roll back partial resources before deciding anything else. An unproved rollback
                 // keeps its session owned and observable: no replacement, no second cleanup worker,
                 // and never an exit.
@@ -711,13 +748,14 @@ async fn controller_body(
                     proof.settle();
                     return;
                 }
-                let retryable = !is_permanent(&message);
+                let retryable = !is_permanent(&error);
                 // Only an attempt that ran to its own deadline is "exhausted"; an error that came
                 // back sooner is a retry in progress.
                 let timed_out = tokio::time::Instant::now() >= deadline;
                 tracing::warn!(
                     attempt = machine.incarnation(),
                     retryable,
+                    error = %error,
                     "managed consumer: startup attempt did not complete"
                 );
                 let (state, effects) = machine.on_start_result(false, retryable, timed_out, jitter_unit());
@@ -748,7 +786,9 @@ async fn controller_body(
 /// Why startup did not reach `Running`.
 enum StartFailure {
     Stopped,
-    Failed(String),
+    /// The typed failure, kept as raised by the SDK so permanence is decided by error type and not
+    /// by matching message text (plan 50 F3).
+    Failed(RocketMQError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -869,9 +909,20 @@ async fn run_incarnation(
 }
 
 /// Errors that retrying the same spec cannot fix.
-fn is_permanent(message: &str) -> bool {
-    let message = message.to_lowercase();
-    message.contains("invalid") || message.contains("not supported") || message.contains("must not be empty")
+/// Whether a startup failure could ever succeed if retried. Decided by the error's own type, never
+/// by its message text: configuration, credential and message-shape failures are permanent for this
+/// process, while anything a broker, network, route or clock could restore stays retryable. A wrong
+/// "permanent" verdict ends recovery forever, so anything uncertain - including a group
+/// registration still held by our own unproved previous incarnation - is retried (plan 50 F3).
+fn is_permanent(error: &RocketMQError) -> bool {
+    matches!(
+        error,
+        RocketMQError::Configuration(_)
+            | RocketMQError::Serialization(_)
+            | RocketMQError::Authentication(_)
+            | RocketMQError::MissingRequiredMessageProperty { .. }
+            | RocketMQError::InvalidVersionOrdinal(_)
+    )
 }
 
 fn wait_of(effects: &[Effect]) -> Duration {
@@ -947,9 +998,50 @@ mod tests {
         )
         .validate()
         .expect_err("missing listener must fail");
-        assert!(
-            matches!(err, rocketmq_error::RocketMQError::IllegalArgument(_)),
-            "{err:?}"
+        assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
+    }
+
+    /// Plan 50 F3: the rules legacy `start` applies are applied here too - before a controller,
+    /// runtime or client instance exists - and every rejection is typed so the controller can tell
+    /// "never retry" from "not yet" without reading message text.
+    #[test]
+    fn identity_and_subscription_rules_are_rejected_before_any_resource() {
+        fn listener() -> ManagedListener {
+            Arc::new(|_msgs, _ctx| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess))
+        }
+        let rejected = |builder: DefaultMQPushConsumerBuilder| {
+            let err = ManagedConsumerSpec::new(builder)
+                .with_listener(listener())
+                .validate()
+                .expect_err("invalid configuration must fail");
+            assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
+        };
+
+        rejected(DefaultMQPushConsumer::builder().subscribe("topic", "*"));
+        rejected(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("   ")
+                .subscribe("topic", "*"),
+        );
+        rejected(
+            DefaultMQPushConsumer::builder()
+                .consumer_group(rocketmq_common::common::mix_all::DEFAULT_CONSUMER_GROUP)
+                .subscribe("topic", "*"),
+        );
+        rejected(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("group with spaces")
+                .subscribe("topic", "*"),
+        );
+        rejected(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("group")
+                .subscribe("", "*"),
+        );
+        rejected(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("group")
+                .subscribe("bad topic!", "*"),
         );
     }
 
@@ -959,10 +1051,7 @@ mod tests {
             .with_listener(Arc::new(|_msgs, _ctx| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)))
             .validate()
             .expect_err("missing subscription must fail");
-        assert!(
-            matches!(err, rocketmq_error::RocketMQError::IllegalArgument(_)),
-            "{err:?}"
-        );
+        assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
     }
 
     #[test]
@@ -1100,10 +1189,25 @@ mod tests {
     }
 
     #[test]
-    fn permanent_startup_errors_are_classified_without_retry() {
-        assert!(is_permanent(
-            "Client exception occurred: CODE:20  DESC: the consumer group must not be empty"
+    fn permanent_startup_errors_are_classified_by_type() {
+        // A configuration problem is tagged by the SDK that found it, and never retried.
+        assert!(is_permanent(&RocketMQError::configuration(
+            "the consumer group must not be empty"
+        )));
+        // A rejected credential is permanent for this process: retrying cannot mint a secret.
+        assert!(is_permanent(&RocketMQError::authentication_failed("bad credentials")));
+        // A malformed message property is permanent too - the payload will not repair itself.
+        assert!(is_permanent(&RocketMQError::MissingRequiredMessageProperty {
+            property: "KEYS"
+        }));
+        // Everything a broker, network or clock could restore stays retryable, including a timeout
+        // raised by the startup budget and a group still registered to an unproved predecessor.
+        // `IllegalArgument` in particular cannot be trusted as permanent: this codebase raises it
+        // for transient conditions too, which is why rejections carry their own variant.
+        assert!(!is_permanent(&mq_client_err!("consumer startup deadline elapsed")));
+        assert!(!is_permanent(&mq_client_err!("the consumer group[g] exist already.")));
+        assert!(!is_permanent(
+            &rocketmq_error::RocketMQError::network_connection_failed("127.0.0.1:9876", "connection refused")
         ));
-        assert!(!is_permanent("consumer startup deadline elapsed"));
     }
 }

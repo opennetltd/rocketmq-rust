@@ -146,6 +146,16 @@ impl DefaultMQPushConsumerBuilder {
         pairs
     }
 
+    /// Detach every configured topic/expression pair, leaving the builder without subscriptions.
+    /// The managed path uses this to apply subscriptions itself where a failure is reportable,
+    /// instead of relying on `build()`'s unrecoverable `expect` (plan 50 F3).
+    pub(crate) fn take_subscriptions(&mut self) -> Vec<(CheetahString, CheetahString)> {
+        let pairs = self.subscriptions();
+        self.subscription = None;
+        self.topic_sub_expression = (None, None);
+        pairs
+    }
+
     /// Detach the application's queue-assignment listener so the managed path can compose it with
     /// the SDK's own assignment observation.
     pub(crate) fn take_message_queue_listener(&mut self) -> Option<Arc<Box<dyn MessageQueueListener>>> {
