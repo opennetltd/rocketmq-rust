@@ -193,6 +193,16 @@ impl RouteFetchOutcome {
     }
 }
 
+/// Whether a successfully decoded answer advertises at least one broker address. A route with no
+/// broker addresses anywhere is an authoritative empty snapshot rather than a partial answer (plan
+/// 49b R4).
+fn advertises_brokers(route: &TopicRouteData) -> bool {
+    route
+        .broker_datas
+        .iter()
+        .any(|broker_data| !broker_data.broker_addrs().is_empty())
+}
+
 impl MQClientInstance {
     pub fn new(
         client_config: ClientConfig,
@@ -771,6 +781,15 @@ impl MQClientInstance {
             FetchedRoute::Absent => return self.retire_topic_route(topic).await,
             FetchedRoute::Route(data) => data,
         };
+        // A successfully decoded answer that advertises no broker at all is itself the
+        // authoritative empty snapshot: it says where this topic is not. Retiring from it
+        // goes through the same path as an explicit empty answer so consumers, producers
+        // and derived addresses cannot disagree about which queues still exist (plan 49b
+        // R4). TopicNotExist, transport errors and bodyless answers stay non-authoritative
+        // under the agreed contract and never reach here.
+        if !advertises_brokers(&topic_route_data) {
+            return self.retire_topic_route(topic).await;
+        }
 
         let mut changed = {
             let topic_route_table = self.topic_route_table.read().await;
@@ -842,13 +861,19 @@ impl MQClientInstance {
             );
         }
 
-        // Update endpoint map
+        // Replace this topic's static endpoint projection on every applicable success. A route that
+        // advertises no endpoints must remove the map its predecessor left behind, or a
+        // static-to-ordinary change keeps resolving messages through broker names that no
+        // longer exist (plan 49b R4).
         {
             let mq_end_points = ClientMetadata::topic_route_data2endpoints_for_static_topic(topic, &topic_route_data);
-            if let Some(mq_end_points) = mq_end_points {
-                if !mq_end_points.is_empty() {
-                    let mut topic_end_points_table = self.topic_end_points_table.write().await;
+            let mut topic_end_points_table = self.topic_end_points_table.write().await;
+            match mq_end_points {
+                Some(mq_end_points) if !mq_end_points.is_empty() => {
                     topic_end_points_table.insert(topic.into(), mq_end_points);
+                }
+                _ => {
+                    topic_end_points_table.remove(topic);
                 }
             }
         }
@@ -900,6 +925,17 @@ impl MQClientInstance {
         let producers: Vec<_> = self.producer_table.read().await.values().cloned().collect();
         for mut producer in producers {
             producer.update_topic_publish_info(topic.to_string(), None);
+        }
+        let consumers: Vec<_> = self.consumer_table.read().await.values().cloned().collect();
+        if !consumers.is_empty() {
+            let empty_queues = HashSet::new();
+            for consumer in consumers {
+                // The consumer ignores a topic it does not subscribe to, so this is safe to
+                // broadcast.
+                consumer.update_topic_subscribe_info(topic.clone(), &empty_queues).await;
+            }
+            // Let the normal fenced rebalance retire the queues and tell listeners.
+            self.rebalance_service.wakeup();
         }
         if let Some(suppressed) = self.log_gate.try_acquire(&format!("route-absent:{topic}")) {
             info!(
@@ -967,7 +1003,7 @@ impl MQClientInstance {
     /// 4.1.1). Returns the retired `(broker_name, broker_id, address)` triples.
     async fn reconcile_broker_addr_table(&self) -> Vec<(CheetahString, u64, CheetahString)> {
         // Snapshot cached routes under one read lock; no callback and no I/O run here.
-        let desired: HashMap<(CheetahString, u64), (CheetahString, u64)> = {
+        let (desired, has_route_knowledge) = {
             let topic_route_table = self.topic_route_table.read().await;
             let sequences = self.topic_route_sequence.read().await;
             let mut desired: HashMap<(CheetahString, u64), (CheetahString, u64)> = HashMap::new();
@@ -986,11 +1022,18 @@ impl MQClientInstance {
                     }
                 }
             }
-            desired
+            // Answering at all is knowledge: a topic whose route was retired still leaves its
+            // sequence behind, which is what lets the last authoritative empty answer
+            // retire the final address instead of looking like a client that has never
+            // fetched.
+            (desired, !topic_route_table.is_empty() || !sequences.is_empty())
         };
-        if desired.is_empty() {
-            // No cached route knowledge: keep the last known addresses rather than wiping
-            // every broker because a fetch has not answered yet.
+        if !has_route_knowledge {
+            // No cached route knowledge at all: keep the last known addresses rather than wiping
+            // every broker because a fetch has not answered yet. This is deliberately
+            // about having *no* snapshot, not about a snapshot that advertises nothing
+            // - an authoritative empty answer must be able to retire the final obsolete
+            // broker, which is exactly when the derived set is empty (plan 49b R4).
             return Vec::new();
         }
         let mut broker_addr_table = self.broker_addr_table.write().await;
@@ -2260,6 +2303,201 @@ mod tests {
         assert_eq!(
             addresses(&instance).await,
             vec![("broker-a".to_string(), 0, "10.0.0.1:10911".to_string())]
+        );
+    }
+
+    /// Plan 49b R4: a successfully decoded answer that advertises no broker is authoritative
+    /// evidence, and it must be able to retire the *final* obsolete address. Preserving
+    /// "because the derived set came out empty" used to keep every broker alive exactly when
+    /// nothing was left to advertise them. The body goes through the same decode entry point
+    /// the nameserver response uses, so this is real wire evidence and not a helper-injected
+    /// outcome.
+    #[tokio::test]
+    async fn an_empty_decoded_route_retires_the_final_obsolete_broker() {
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-empty-last", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0u64, "10.0.0.1:10911".to_string())]
+        );
+
+        let body = br#"{"orderTopicConf":"","queueDatas":[],"brokerDatas":[],"filterServerTable":{}}"#;
+        let decoded = TopicRouteData::decode(body).expect("a nameserver route body decodes");
+        assert!(
+            !advertises_brokers(&decoded),
+            "the evidence really advertises no broker address"
+        );
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(decoded),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Absent);
+        assert!(outcome.succeeded(), "an authoritative empty answer earns the cooldown");
+        assert!(
+            !instance
+                .topic_route_table
+                .read()
+                .await
+                .contains_key(&CheetahString::from_static_str("TopicA")),
+            "the retired topic route is gone"
+        );
+        assert_eq!(
+            addresses(&instance).await,
+            Vec::<(String, u64, String)>::new(),
+            "an authoritative empty snapshot retires the final obsolete broker instead of preserving it"
+        );
+    }
+
+    /// Plan 49b R4: the same empty answer must not touch what another topic still advertises.
+    #[tokio::test]
+    async fn an_empty_decoded_route_leaves_a_sibling_topic_alone() {
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-empty-sibling", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        seed(
+            &instance,
+            "TopicB",
+            route("broker-b", &[(0, "10.0.0.2:10911"), (1, "10.0.0.3:10911")]),
+            2,
+        )
+        .await;
+        instance.reconcile_broker_addr_table().await;
+
+        let decoded = TopicRouteData::decode(br#"{"queueDatas":[],"brokerDatas":[]}"#).expect("decodes");
+        instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(decoded),
+                false,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            addresses(&instance).await,
+            vec![
+                ("broker-b".to_string(), 0u64, "10.0.0.2:10911".to_string()),
+                ("broker-b".to_string(), 1u64, "10.0.0.3:10911".to_string()),
+            ],
+            "only addresses no cached route advertises any more are retired"
+        );
+    }
+
+    /// Plan 49b R4: a successful answer that advertises no static endpoint must replace the
+    /// projection its predecessor left behind, or a static-to-ordinary topic change keeps
+    /// resolving dead broker names.
+    #[tokio::test]
+    async fn a_route_without_endpoints_clears_the_previous_endpoint_projection() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-endpoints", None);
+        let topic = CheetahString::from_static_str("TopicA");
+        instance.topic_end_points_table.write().await.insert(
+            topic.clone(),
+            HashMap::from([(MessageQueue::new(), CheetahString::from_static_str("broker-a"))]),
+        );
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &topic,
+                FetchedRoute::Route(route("broker-a", &[(0, "10.0.0.1:10911")])),
+                false,
+                None,
+            )
+            .await;
+        assert!(outcome.succeeded());
+        assert!(
+            !instance.topic_end_points_table.read().await.contains_key(&topic),
+            "a route advertising no endpoints removes the stale projection instead of keeping it"
+        );
+    }
+
+    /// Plan 49b R4: an authoritative empty answer has to reach consumers too - rebalance reads the
+    /// consumer's own subscribe-info table, so leaving the old queue set there keeps pulling
+    /// retired brokers.
+    #[tokio::test]
+    async fn an_empty_answer_publishes_an_empty_subscribe_set_to_consumers() {
+        use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        // Registration owns the shared instance, so it runs first and the assertions below read
+        // through the same Arc.
+        let mut instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-consumers", None);
+        let topic = CheetahString::from_static_str("TopicA");
+        let consumer = test_consumer("group-r4");
+        instance
+            .register_consumer(&CheetahString::from_static_str("group-r4"), consumer.clone())
+            .await;
+        // The consumer only accepts a projection for topics it actually subscribes to.
+        {
+            let subscription = SubscriptionData {
+                topic: topic.clone(),
+                sub_string: CheetahString::from_static_str(SubscriptionData::SUB_ALL),
+                ..Default::default()
+            };
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .get_subscription_inner()
+                .write()
+                .await
+                .insert(topic.clone(), subscription);
+        }
+        consumer
+            .default_mqpush_consumer_impl
+            .update_topic_subscribe_info(
+                topic.clone(),
+                &HashSet::from([MessageQueue::from_parts(topic.clone(), "broker-a", 0)]),
+            )
+            .await;
+        assert_eq!(
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .rebalance_impl_inner
+                .topic_subscribe_info_table
+                .read()
+                .await
+                .get(&topic)
+                .map(|set| set.len()),
+            Some(1)
+        );
+
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+
+        instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &topic,
+                FetchedRoute::Route(TopicRouteData::decode(br#"{"brokerDatas":[]}"#).expect("decodes")),
+                false,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .rebalance_impl_inner
+                .topic_subscribe_info_table
+                .read()
+                .await
+                .get(&topic)
+                .map(|set| set.len()),
+            Some(0),
+            "the consumer sees the same authoritative emptiness so rebalance can retire its queues"
         );
     }
 }
