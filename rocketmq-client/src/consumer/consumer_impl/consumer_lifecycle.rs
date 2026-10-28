@@ -57,6 +57,17 @@ pub(crate) struct LifecyclePolicy {
     pub max_repairs_before_replace: u32,
 }
 
+impl LifecyclePolicy {
+    /// How long the SDK allows one cleanup pass for its own finalization work - local quiescence,
+    /// offset persistence and unregistration. It is deliberately unrelated to how long the first
+    /// observer happens to wait: an observer that gives up early must not decide how much remote
+    /// opportunity a consumer gets (plan 49b R2). `cleanup_budget` targets local quiescence; the
+    /// remaining allowance is for the remote steps behind it.
+    pub(crate) fn cleanup_session_ceiling(&self) -> std::time::Duration {
+        self.cleanup_budget.saturating_mul(3)
+    }
+}
+
 impl Default for LifecyclePolicy {
     fn default() -> Self {
         Self {
@@ -1403,5 +1414,58 @@ mod tests {
         let all: Vec<MessageQueue> = (0..8).map(|id| queue("T", id)).collect();
         progress.note_revocation(&all);
         assert_eq!(0, progress.assigned_queues());
+    }
+
+    /// Plan 49b R2: a stop that arrives while cleanup is running has to be visible before the pass
+    /// completes, because completion is what settles a handle's proof. The controller therefore
+    /// reconciles the stop into the machine ahead of every cleanup-complete transition, and
+    /// completion can only end the machine - never resume recovery behind a requested stop.
+    #[test]
+    fn a_stop_reconciled_before_cleanup_completion_ends_the_machine() {
+        use crate::consumer::managed_consumer::ConsumerHealth;
+        use crate::consumer::managed_consumer::ConsumerPhase;
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        // While the pass runs the stop is already reported, and an unproved pass shows why nothing
+        // has been released.
+        let stopping = machine.request_stop();
+        assert_eq!(stopping.phase, ConsumerPhase::Stopping);
+        let blocked = machine.on_cleanup_unproved();
+        assert_eq!(blocked.phase, ConsumerPhase::Stopping);
+        assert_eq!(blocked.health, ConsumerHealth::Blocked);
+        // Completion after that can only be terminal.
+        let settled = machine.on_cleanup_complete();
+        assert_eq!(settled.phase, ConsumerPhase::Stopped);
+        assert_eq!(settled.reason, Reason::Stopped);
+    }
+
+    /// Without a requested stop the same completion leaves recovery available; reconciliation must
+    /// not turn an ordinary repair into a shutdown.
+    #[test]
+    fn cleanup_completion_without_a_stop_keeps_recovery_available() {
+        use crate::consumer::managed_consumer::ConsumerHealth;
+        use crate::consumer::managed_consumer::ConsumerPhase;
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_cleanup_unproved();
+        let settled = machine.on_cleanup_complete();
+        assert_eq!(settled.phase, ConsumerPhase::Recovering);
+        assert_eq!(settled.health, ConsumerHealth::Degraded);
+    }
+
+    /// Plan 49b R2: how much finalization a cleanup pass gets is a property of the lifecycle
+    /// policy. An observer's wait must not be able to size it, so nothing here reads a
+    /// deadline.
+    #[test]
+    fn the_finalization_ceiling_follows_the_cleanup_budget() {
+        let policy = LifecyclePolicy {
+            cleanup_budget: Duration::from_secs(7),
+            ..LifecyclePolicy::default()
+        };
+        assert_eq!(policy.cleanup_session_ceiling(), Duration::from_secs(21));
+        let default = LifecyclePolicy::default();
+        assert_eq!(
+            default.cleanup_session_ceiling(),
+            default.cleanup_budget * 3,
+            "the ceiling must exceed the local quiescence target so remote steps keep an opportunity"
+        );
     }
 }

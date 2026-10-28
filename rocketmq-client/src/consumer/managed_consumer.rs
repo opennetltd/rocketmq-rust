@@ -47,7 +47,6 @@ use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
 use crate::consumer::consumer_impl::consumer_lifecycle::RepairKind;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consumer_identity;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
-use crate::consumer::default_mq_push_consumer::ConsumerCleanup;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
 use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
@@ -257,6 +256,7 @@ impl ManagedConsumerSpec {
     fn build_incarnation(
         &self,
         progress: Arc<ConsumerProgress>,
+        policy: &LifecyclePolicy,
     ) -> Result<DefaultMQPushConsumer, rocketmq_error::RocketMQError> {
         let mut builder = self.builder.clone();
         if let Some(from) = self.consume_from_where {
@@ -281,6 +281,9 @@ impl ManagedConsumerSpec {
         // a reportable startup failure instead of a panic (plan 50 F3).
         let subscriptions = builder.take_subscriptions();
         let mut consumer = builder.build();
+        // Cleanup finalization is sized by the lifecycle policy this controller runs under, never
+        // by how long an observer happens to wait (plan 49b R2).
+        consumer.set_cleanup_session_ceiling(policy.cleanup_session_ceiling());
         consumer.set_progress(Arc::clone(&progress));
         if let Some(listener) = self.listener.clone() {
             consumer.register_message_listener_concurrently(SpecListener { listener });
@@ -649,7 +652,7 @@ async fn controller_body(
         }
 
         let progress = ConsumerProgress::new();
-        let mut consumer = match spec.build_incarnation(Arc::clone(&progress)) {
+        let mut consumer = match spec.build_incarnation(Arc::clone(&progress), &policy) {
             Ok(consumer) => consumer,
             // Building the incarnation failed on configuration grounds. Nothing was started, so
             // there is nothing to clean up; report it as a permanent startup failure.
@@ -684,67 +687,73 @@ async fn controller_body(
                         let state = machine.request_stop();
                         publisher.publish(state, machine.incarnation(), &progress.snapshot(stall_after()));
                         // The terminal `stopped` state and the handle's proof belong to the
-                        // requested stop; an unproved pass leaves both
-                        // pending.
-                        if matches!(
+                        // requested stop. An unproved pass keeps both
+                        // pending and stays owned: waiting for it is
+                        // never a reason to exit (plan 49b R2).
+                        if !matches!(
                             observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
                                 .await,
                             CleanupSettled::Proved
                         ) {
-                            proof.settle();
+                            await_cleanup_proof(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
+                                .await;
                         }
+                        proof.settle();
                         return;
                     }
                     IncarnationEnd::Replace => {
-                        match observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
-                            .await
-                        {
-                            // Cleanup could not be proved: at most one retiring incarnation is kept and no
-                            // replacement starts. This is never an exit request.
-                            CleanupSettled::Unproved(_) => return,
-                            CleanupSettled::Proved if stop_token.is_cancelled() => {
-                                // A stop raised while the old incarnation was being released wins
-                                // over a replacement;
-                                // observe_cleanup already published the terminal state.
-                                proof.settle();
-                                return;
-                            }
-                            CleanupSettled::Proved => {
-                                machine.advance_incarnation();
-                                publisher.publish(
-                                    machine.state(),
-                                    machine.incarnation(),
-                                    &progress.snapshot(stall_after()),
-                                );
-                            }
+                        // Cleanup could not be proved yet: at most one retiring incarnation is
+                        // kept, no replacement starts, and the controller
+                        // keeps observing instead of exiting.
+                        if !matches!(
+                            observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
+                                .await,
+                            CleanupSettled::Proved
+                        ) {
+                            await_cleanup_proof(&mut consumer, &mut machine, &publisher, &stop_token, Some(&progress))
+                                .await;
                         }
+                        if stop_token.is_cancelled() {
+                            // A stop raised while the old incarnation was being released wins over
+                            // a replacement, and observe_cleanup
+                            // already published the terminal state.
+                            proof.settle();
+                            return;
+                        }
+                        machine.advance_incarnation();
+                        publisher.publish(
+                            machine.state(),
+                            machine.incarnation(),
+                            &progress.snapshot(stall_after()),
+                        );
                     }
                 }
             }
             Err(StartFailure::Stopped) => {
                 let state = machine.request_stop();
                 publisher.publish(state, machine.incarnation(), &empty);
-                if matches!(
+                if !matches!(
                     observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
                     CleanupSettled::Proved
                 ) {
-                    proof.settle();
+                    await_cleanup_proof(&mut consumer, &mut machine, &publisher, &stop_token, None).await;
                 }
+                proof.settle();
                 return;
             }
             Err(StartFailure::Failed(error)) => {
                 // Roll back partial resources before deciding anything else. An unproved rollback
                 // keeps its session owned and observable: no replacement, no second cleanup worker,
                 // and never an exit.
-                if matches!(
+                if !matches!(
                     observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
-                    CleanupSettled::Unproved(_)
+                    CleanupSettled::Proved
                 ) {
-                    return;
+                    await_cleanup_proof(&mut consumer, &mut machine, &publisher, &stop_token, None).await;
                 }
                 if stop_token.is_cancelled() {
-                    let state = machine.request_stop();
-                    publisher.publish(state, machine.incarnation(), &empty);
+                    // The requested stop already won: observe_cleanup published `stopped`, so this
+                    // settles the handle without turning a completed stop back into `stopping`.
                     proof.settle();
                     return;
                 }
@@ -770,12 +779,13 @@ async fn controller_body(
                 if wait_or_stop(wait_of(&effects), &stop_token).await {
                     let state = machine.request_stop();
                     publisher.publish(state, machine.incarnation(), &empty);
-                    if matches!(
+                    if !matches!(
                         observe_cleanup(&mut consumer, &mut machine, &publisher, &stop_token, None).await,
                         CleanupSettled::Proved
                     ) {
-                        proof.settle();
+                        await_cleanup_proof(&mut consumer, &mut machine, &publisher, &stop_token, None).await;
                     }
+                    proof.settle();
                     return;
                 }
             }
@@ -806,12 +816,14 @@ enum CleanupSettled {
     Unproved(&'static str),
 }
 
-/// Wait for the consumer's one cleanup session to settle, publishing status while it runs.
+/// Observe the consumer's one cleanup session until it settles, publishing status as it goes.
 ///
-/// The SDK owns the pass; this only observes it (plan 50 section 4.1). A slice elapsing is not a
-/// give-up and never cancels anything: while ownership remains unproved the controller keeps
-/// selecting between the cleanup session, a sticky stop request and its own status ticks, so no
-/// caller deadline can strand leases, offset writes or unregistration halfway through.
+/// The SDK owns the pass; this only watches it. Admission and the pass itself are established
+/// before anything is awaited, so no caller wait decides how much finalization the pass gets (plan
+/// 49b R2). A stop request is reconciled into every transition - a pass that proves itself after a
+/// stop can only publish `Stopped` - and status stays fresh at the policy cadence while the pass
+/// runs. Nothing here cancels, restarts or duplicates a pass: an unproved result keeps its owner
+/// and stays observable.
 async fn observe_cleanup(
     consumer: &mut DefaultMQPushConsumer,
     machine: &mut RecoveryMachine,
@@ -819,44 +831,91 @@ async fn observe_cleanup(
     stop_token: &CancellationToken,
     progress: Option<&Arc<ConsumerProgress>>,
 ) -> CleanupSettled {
-    let budget = machine.policy().cleanup_budget;
+    // Idempotent for an existing session: this closes admission and returns without waiting.
+    consumer.begin_cleanup();
+    let policy = machine.policy();
+    let Some(mut changes) = consumer.cleanup_progress_changes() else {
+        // No session means the pass could never be detached from a caller that has already gone.
+        // Report it as unproved rather than inventing success.
+        let state = if stop_token.is_cancelled() {
+            machine.request_stop()
+        } else {
+            machine.on_cleanup_unproved()
+        };
+        publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+        return CleanupSettled::Unproved("no_cleanup_session");
+    };
+    let mut ticker = tokio::time::interval(policy.progress_check);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        // One visibility slice of the caller's own budget; joining again later is free.
-        let slice = tokio::time::Instant::now() + budget;
-        if matches!(consumer.shutdown_until(slice).await, ConsumerCleanup::Complete) {
+        let stopping = stop_token.is_cancelled();
+        let session = changes.borrow_and_update().clone();
+        if session.proved {
+            // Reconcile the stop first so completion cannot publish a nonterminal state.
+            if stopping {
+                machine.request_stop();
+            }
             let state = machine.on_cleanup_complete();
             publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
             return CleanupSettled::Proved;
         }
-        match consumer.cleanup_progress() {
-            // Still running: report the wait and keep observing. A stop request only changes which
-            // phase is published; it cannot cancel the pass.
-            Some(session) if session.running => {
-                let state = if stop_token.is_cancelled() {
-                    machine.request_stop()
-                } else {
-                    machine.on_cleanup_unproved()
-                };
-                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
-                continue;
+        if !session.running {
+            // The pass ended without proving cleanup. Publish the blocker and keep ownership: this
+            // is never an exit request and never a second pass.
+            let state = if stopping {
+                machine.request_stop()
+            } else {
+                machine.on_cleanup_unproved()
+            };
+            publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+            tracing::warn!(
+                phase = session.phase,
+                "managed consumer: cleanup session ended unproved"
+            );
+            return CleanupSettled::Unproved(session.phase);
+        }
+        // Still running: report where it is. A stop changes only what is published.
+        let state = if stopping {
+            machine.request_stop()
+        } else {
+            machine.on_cleanup_unproved()
+        };
+        publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+        tokio::select! {
+            biased;
+            // Guarded so an already-cancelled stop cannot spin this loop.
+            _ = stop_token.cancelled(), if !stopping => {}
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    // The pass stopped reporting; settle from the last known state next round.
+                    tokio::time::sleep(policy.progress_check).await;
+                }
             }
-            // The pass ended without a proof. Report the phase it stopped in and retain ownership.
-            Some(session) => {
-                let state = machine.on_cleanup_unproved();
-                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
-                tracing::warn!(
-                    phase = session.phase,
-                    "managed consumer: cleanup session ended unproved"
-                );
-                return CleanupSettled::Unproved(session.phase);
-            }
-            // No session at all means shutdown_until never created one, which cannot happen because
-            // the call above starts it. Treat it as unproved rather than inventing success.
-            None => {
-                let state = machine.on_cleanup_unproved();
-                publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
-                return CleanupSettled::Unproved("no_cleanup_session");
-            }
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
+/// Hold an unproved cleanup until it proves itself, publishing its blocker at the policy cadence.
+/// Returning means local ownership is quiescent; a stop observed meanwhile stays visible in status
+/// and leaves the handle's proof pending (plan 49b R2). The controller never exits because cleanup
+/// is slow, and it never starts another pass or an overlapping incarnation.
+async fn await_cleanup_proof(
+    consumer: &mut DefaultMQPushConsumer,
+    machine: &mut RecoveryMachine,
+    publisher: &StatusPublisher,
+    stop_token: &CancellationToken,
+    progress: Option<&Arc<ConsumerProgress>>,
+) {
+    let cadence = machine.policy().progress_check;
+    while !matches!(
+        observe_cleanup(consumer, machine, publisher, stop_token, progress).await,
+        CleanupSettled::Proved
+    ) {
+        if wait_or_stop(cadence, stop_token).await {
+            // Keep the blocker published and truthful for a waiting handle; still no exit.
+            let state = machine.request_stop();
+            publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
         }
     }
 }
@@ -1209,5 +1268,65 @@ mod tests {
         assert!(!is_permanent(
             &rocketmq_error::RocketMQError::network_connection_failed("127.0.0.1:9876", "connection refused")
         ));
+    }
+
+    /// Plan 49b R2: every incarnation is built under the controller's policy, and that policy - not
+    /// any observer's patience - decides how long its cleanup pass may finalize.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incarnation_carries_the_policy_finalization_ceiling() {
+        let policy = LifecyclePolicy {
+            cleanup_budget: Duration::from_secs(4),
+            ..LifecyclePolicy::default()
+        };
+        let consumer = spec()
+            .build_incarnation(Arc::new(ConsumerProgress::default()), &policy)
+            .expect("a valid spec builds an incarnation");
+        assert_eq!(consumer.cleanup_session_ceiling(), Duration::from_secs(12));
+    }
+
+    /// An observer whose wait has already elapsed must not shrink the pass it just joined: giving
+    /// up on watching cannot take away the consumer's chance to persist offsets and unregister.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_elapsed_observer_does_not_resize_the_finalization_ceiling() {
+        let policy = LifecyclePolicy {
+            cleanup_budget: Duration::from_secs(4),
+            ..LifecyclePolicy::default()
+        };
+        let mut consumer = spec()
+            .build_incarnation(Arc::new(ConsumerProgress::default()), &policy)
+            .expect("a valid spec builds an incarnation");
+        let settled = consumer.shutdown_until(tokio::time::Instant::now()).await;
+        assert!(
+            matches!(
+                settled,
+                crate::consumer::default_mq_push_consumer::ConsumerCleanup::Incomplete
+            ),
+            "an elapsed wait cannot prove cleanup"
+        );
+        assert_eq!(consumer.cleanup_session_ceiling(), Duration::from_secs(12));
+    }
+
+    /// Admission closes at once and the pass is detached from the caller that asked for it, so
+    /// status can follow its phases without anybody waiting on it or starting a second pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observers_follow_the_one_pass_without_starting_another() {
+        let mut consumer = spec()
+            .build_incarnation(Arc::new(ConsumerProgress::default()), &LifecyclePolicy::default())
+            .expect("a valid spec builds an incarnation");
+        assert!(consumer.cleanup_progress_changes().is_none(), "no stop requested yet");
+        assert!(consumer.begin_cleanup(), "the pass is owned by the SDK");
+        let mut first = consumer
+            .cleanup_progress_changes()
+            .expect("admission created a session");
+        let second = consumer
+            .cleanup_progress_changes()
+            .expect("the same session, not a new one");
+        let progress = first.borrow_and_update().clone();
+        assert!(progress.running && !progress.proved, "{progress:?}");
+        assert_eq!(*second.borrow(), *first.borrow());
+        // Asking again joins what exists; it never spawns a second pass or writer.
+        assert!(consumer.begin_cleanup());
+        let progress = consumer.cleanup_progress().expect("still the same session");
+        assert!(progress.running, "{progress:?}");
     }
 }

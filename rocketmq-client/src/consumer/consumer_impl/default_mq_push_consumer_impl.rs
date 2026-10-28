@@ -173,6 +173,10 @@ impl Drop for CleanupReport {
     }
 }
 
+/// Finalization ceiling for a consumer that was never given a lifecycle policy: the same local
+/// budget a managed stop targets, times the remote allowance beside it.
+const DEFAULT_CLEANUP_CEILING: std::time::Duration = std::time::Duration::from_secs(90);
+
 fn remaining_millis(deadline: TokioInstant) -> u64 {
     deadline
         .saturating_duration_since(TokioInstant::now())
@@ -219,6 +223,9 @@ pub struct DefaultMQPushConsumerImpl {
     /// The one cleanup session of this consumer, created by the first stop request. Observers join
     /// it; nobody may cancel it (plan 50 section 4.1).
     cleanup_session: Arc<parking_lot::Mutex<Option<CleanupSession>>>,
+    /// Millis of finalization ceiling the SDK gives its own cleanup pass; `0` means unset so the
+    /// default applies. Never derived from an observer's wait (plan 49b R2).
+    cleanup_ceiling_millis: std::sync::atomic::AtomicU64,
 }
 
 /// Identity rules that hold before any resource exists, shared by legacy start and managed spec
@@ -474,6 +481,7 @@ impl DefaultMQPushConsumerImpl {
             ]),
             default_mqpush_consumer_impl: None,
             cleanup_session: Arc::new(parking_lot::Mutex::new(None)),
+            cleanup_ceiling_millis: std::sync::atomic::AtomicU64::new(0),
         };
         let wrapper = ArcMut::downgrade(&this.rebalance_impl);
         this.rebalance_impl.set_rebalance_impl(wrapper);
@@ -712,28 +720,58 @@ impl DefaultMQPushConsumerImpl {
     /// False means local cleanup is unproved; callers must not start a replacement. The caller's
     /// deadline bounds only this wait - the session it joins keeps running afterwards.
     pub(crate) async fn shutdown_until(&mut self, deadline: TokioInstant) -> bool {
-        // Admission closes immediately and unconditionally: no new pull and no new listener batch.
-        // The cleanup session itself is not cancellable; a caller deadline only bounds the wait.
+        let started = self.begin_cleanup();
+        if started {
+            let session = self.cleanup_session.lock().clone();
+            return match session {
+                Some(session) => session.join(deadline).await,
+                // Lost the slot to a concurrent caller that has already dropped it; nothing left to
+                // join, and inventing success would be worse than reporting the missing proof.
+                None => false,
+            };
+        }
+        // Degenerate case: this consumer was built without an owned handle, so the pass cannot be
+        // detached from the caller. It stays bounded as it always was.
+        tokio::time::timeout_at(deadline, self.cleanup_pass(deadline, CleanupDriver::detached()))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Close admission and make sure one cleanup pass exists, without waiting for it. Admission is
+    /// immediate and unconditional: no new pull and no new listener batch. The pass itself is not
+    /// cancellable, so a caller that stops watching leaves it running rather than stranded.
+    /// Returns whether an owned session backs the pass (`false` only for the degenerate handle-less
+    /// consumer, which can only run the pass inline).
+    pub(crate) fn begin_cleanup(&mut self) -> bool {
         self.pause.store(true, Ordering::Release);
         self.work.close();
         self.delivery.close();
         self.rebalance_impl.invalidate_rebalance_generation();
+        if self.cleanup_session.lock().is_some() {
+            return true;
+        }
+        self.begin_cleanup_session()
+    }
 
-        let existing_session = self.cleanup_session.lock().clone();
-        if let Some(session) = existing_session {
-            // A session already exists: join it rather than starting a second pass or writer.
-            return session.join(deadline).await;
+    /// The phase stream of the one cleanup pass, or `None` while no stop was requested.
+    pub(crate) fn cleanup_progress_changes(&self) -> Option<tokio::sync::watch::Receiver<CleanupSessionProgress>> {
+        self.cleanup_session.lock().as_ref().map(|session| session.subscribe())
+    }
+
+    /// The ceiling this SDK gives its own cleanup pass. Set from the lifecycle policy by a managed
+    /// consumer; otherwise the default budget applies. It never depends on an observer's wait.
+    pub(crate) fn cleanup_session_ceiling(&self) -> std::time::Duration {
+        let millis = self.cleanup_ceiling_millis.load(Ordering::Acquire);
+        if millis == 0 {
+            DEFAULT_CLEANUP_CEILING
+        } else {
+            std::time::Duration::from_millis(millis)
         }
-        match self.begin_cleanup_session(deadline) {
-            Some(session) => session.join(deadline).await,
-            None => {
-                // Degenerate case: this consumer was built without an owned handle, so the pass
-                // cannot be detached from the caller. It stays bounded as it always was.
-                tokio::time::timeout_at(deadline, self.cleanup_pass(deadline, CleanupDriver::detached()))
-                    .await
-                    .unwrap_or(false)
-            }
-        }
+    }
+
+    pub(crate) fn set_cleanup_session_ceiling(&self, ceiling: std::time::Duration) {
+        self.cleanup_ceiling_millis
+            .store(ceiling.as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Release);
     }
 
     /// Where the cleanup session stands, or `None` while no stop has been requested. Observation
@@ -742,21 +780,19 @@ impl DefaultMQPushConsumerImpl {
         self.cleanup_session.lock().as_ref().map(|session| session.progress())
     }
 
-    /// Start the one cleanup pass on a thread this SDK owns. The first caller's remaining budget
-    /// sizes the session's own ceiling - eight times what a managed stop used to wait for in two
-    /// fixed steps - but never bounds the pass itself.
-    fn begin_cleanup_session(&mut self, deadline: TokioInstant) -> Option<CleanupSession> {
-        let mut handle = self.default_mqpush_consumer_impl.clone()?;
-        let caller_budget = deadline
-            .saturating_duration_since(TokioInstant::now())
-            .max(std::time::Duration::from_millis(1));
-        let session_deadline = TokioInstant::now() + caller_budget.saturating_mul(8);
+    /// Start the one cleanup pass on a thread this SDK owns. Its ceiling comes from the lifecycle
+    /// policy, never from how long the first observer waits (plan 49b R2).
+    fn begin_cleanup_session(&mut self) -> bool {
+        let Some(mut handle) = self.default_mqpush_consumer_impl.clone() else {
+            return false;
+        };
+        let session_deadline = TokioInstant::now() + self.cleanup_session_ceiling();
         let group = self.consumer_config.consumer_group.to_string();
         let session = spawn_cleanup_session(&group, move |driver| async move {
             handle.cleanup_pass(session_deadline, driver).await
         });
-        *self.cleanup_session.lock() = Some(session.clone());
-        Some(session)
+        *self.cleanup_session.lock() = Some(session);
+        true
     }
 
     async fn cleanup_pass(&mut self, deadline: TokioInstant, driver: CleanupDriver) -> bool {

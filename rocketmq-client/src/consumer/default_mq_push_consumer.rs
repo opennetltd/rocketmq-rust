@@ -700,6 +700,40 @@ impl DefaultMQPushConsumer {
             .and_then(|impl_| impl_.cleanup_progress())
     }
 
+    /// Close admission and make sure this consumer's single cleanup pass exists, without waiting
+    /// for it. The pass belongs to the SDK: an observer that stops watching leaves it running,
+    /// and its finalization ceiling comes from the lifecycle policy rather than from any
+    /// caller's wait.
+    pub(crate) fn begin_cleanup(&mut self) -> bool {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .map(|impl_| impl_.begin_cleanup())
+            .unwrap_or(false)
+    }
+
+    /// The phase stream of the one cleanup pass, or `None` while no stop was requested.
+    pub(crate) fn cleanup_progress_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::consumer::cleanup_session::CleanupProgress>> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .and_then(|impl_| impl_.cleanup_progress_changes())
+    }
+
+    /// How long the SDK lets this consumer's cleanup pass finalize.
+    pub(crate) fn cleanup_session_ceiling(&self) -> std::time::Duration {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .map(|impl_| impl_.cleanup_session_ceiling())
+            .unwrap_or(std::time::Duration::from_secs(90))
+    }
+
+    pub(crate) fn set_cleanup_session_ceiling(&mut self, ceiling: std::time::Duration) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.set_cleanup_session_ceiling(ceiling);
+        }
+    }
+
     /// Join the consumer's one cleanup session until `deadline`. The deadline bounds only this
     /// wait: an elapsed answer means "not proved yet", and the pass keeps running to release what
     /// it holds. Use [`Self::cleanup_progress`] to tell a still-running pass from a settled one.

@@ -60,6 +60,12 @@ pub(crate) struct CleanupSession {
 
 impl CleanupSession {
     /// Observe the session without waiting.
+    /// A stream of this pass's phase changes. Subscribing cannot start, restart or cancel anything;
+    /// it is how a controller stays responsive without polling (plan 49b R2).
+    pub(crate) fn subscribe(&self) -> watch::Receiver<CleanupProgress> {
+        self.progress.subscribe()
+    }
+
     pub(crate) fn progress(&self) -> CleanupProgress {
         self.progress.subscribe().borrow().clone()
     }
