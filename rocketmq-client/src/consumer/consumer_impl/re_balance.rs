@@ -42,6 +42,13 @@ pub trait RebalanceLocal {
         mq_divided: &HashSet<MessageQueue>,
     );
 
+    /// What one completed allocation pass concluded (plan 49a F4 section 4.3 item 1). Consumers
+    /// that do not observe their own assignment record nothing.
+    async fn note_allocation_pass(
+        &mut self,
+        outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
+    );
+
     /// Removes an unnecessary message queue.
     ///
     /// # Arguments

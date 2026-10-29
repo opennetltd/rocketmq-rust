@@ -148,6 +148,19 @@ impl RebalancePushImpl {
 const UNLOCK_BATCH_MQ_TIMEOUT_MS: u64 = 1_000;
 
 impl Rebalance for RebalancePushImpl {
+    async fn note_allocation_pass(
+        &mut self,
+        outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
+    ) {
+        // Only consumers whose assignment is tracked by the SDK keep a progress record; for others
+        // it would describe a table that is never populated.
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            if impl_.tracks_assignment() {
+                impl_.progress.note_allocation_pass(outcome);
+            }
+        }
+    }
+
     async fn message_queue_changed(
         &mut self,
         topic: &str,

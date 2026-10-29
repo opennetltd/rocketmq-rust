@@ -215,6 +215,12 @@ pub(crate) struct ProgressSnapshot {
     /// latest one that could not. Which is newer decides whether a zero assignment is explicit.
     pub last_route_ok_ms: u64,
     pub last_route_miss_ms: u64,
+    /// What the newest completed allocation pass concluded. A zero assignment is only "explicitly
+    /// idle" when a pass actually answered; which answer it was decides whether health repairs in
+    /// place or reports a failed refresh (plan 49a F4 section 4.3 item 1). `None` means no pass has
+    /// reported one, so health falls back to route observations alone.
+    pub alloc_outcome: Option<AllocationOutcome>,
+    pub alloc_outcome_ms: u64,
 }
 
 impl ProgressSnapshot {
@@ -275,6 +281,37 @@ impl Drop for PullLease {
     }
 }
 
+/// What one completed allocation pass concluded (plan 49a F4 section 4.3 item 1). Only consumers
+/// that track assignment through the SDK record these; other consumers keep inferring from route
+/// observations alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub(crate) enum AllocationOutcome {
+    /// The pass read the control plane and this consumer was explicitly assigned no queues.
+    ExplicitZero,
+    /// The pass read the control plane and this consumer was assigned at least one queue.
+    QueuesOwned,
+    /// The pass could not read what it needed - typically the consumer list of the topic.
+    LookupFailed,
+    /// Queues were allocated but a newly acquired queue's starting offset could not be prepared, so
+    /// no pull loop was started for it.
+    OffsetPreparationFailed,
+}
+
+impl AllocationOutcome {
+    /// A packed record keeps its kind in the high byte and its timestamp in the low 56 bits; a zero
+    /// record means "no pass has reported yet" and must not be read as an answer.
+    fn from_packed(record: u64) -> Option<Self> {
+        match record >> 56 {
+            1 => Some(Self::ExplicitZero),
+            2 => Some(Self::QueuesOwned),
+            3 => Some(Self::LookupFailed),
+            4 => Some(Self::OffsetPreparationFailed),
+            _ => None,
+        }
+    }
+}
+
 /// Why a pull failed, used only to choose the repair action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PullFailureKind {
@@ -310,6 +347,9 @@ pub(crate) struct ConsumerProgress {
     last_callback_progress_ms: AtomicU64,
     last_assignment_ms: AtomicU64,
     last_offset_ms: AtomicU64,
+    /// Newest allocation outcome, packed as kind in the high byte and its timestamp in the low 56
+    /// bits, so reading the answer and when it was given cannot observe two different passes.
+    alloc_outcome: AtomicU64,
     last_route_ok_ms: AtomicU64,
     last_route_miss_ms: AtomicU64,
     /// Source of queue epochs for this incarnation. Epochs are never reused: a revoked queue and
@@ -321,6 +361,9 @@ pub(crate) struct ConsumerProgress {
 }
 
 impl ConsumerProgress {
+    /// Timestamps packed with an allocation outcome keep 56 bits of milliseconds.
+    const ALLOC_MS_MASK: u64 = (1 << 56) - 1;
+
     pub(crate) fn new() -> Arc<Self> {
         let now = get_current_millis();
         Arc::new(Self {
@@ -434,6 +477,21 @@ impl ConsumerProgress {
     /// Records what the latest rebalance pass could actually see. A pass with no route for this
     /// consumer's own subscriptions is a failed assignment refresh, which section 3.2 treats as a
     /// fault to repair; only a pass that saw routes can prove that a zero assignment was explicit.
+    /// What one completed allocation pass concluded. Recorded per pass so a zero assignment can be
+    /// read as "the broker answered and gave us nothing" instead of being guessed from route
+    /// timestamps - and so the two ways an allocation can fail stay distinguishable from that
+    /// answer.
+    pub(crate) fn note_allocation_pass(&self, outcome: AllocationOutcome) {
+        let kind: u64 = match outcome {
+            AllocationOutcome::ExplicitZero => 1,
+            AllocationOutcome::QueuesOwned => 2,
+            AllocationOutcome::LookupFailed => 3,
+            AllocationOutcome::OffsetPreparationFailed => 4,
+        };
+        let now = get_current_millis() & Self::ALLOC_MS_MASK;
+        self.alloc_outcome.store(kind << 56 | now, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_route_observation(&self, routed: bool) {
         if routed {
             self.stamp(&self.last_route_ok_ms);
@@ -595,6 +653,8 @@ impl ConsumerProgress {
             last_callback_progress_ms: self.last_callback_progress_ms.load(Ordering::Relaxed),
             last_assignment_ms: self.last_assignment_ms.load(Ordering::Relaxed),
             last_offset_ms: self.last_offset_ms.load(Ordering::Relaxed),
+            alloc_outcome: AllocationOutcome::from_packed(self.alloc_outcome.load(Ordering::Relaxed)),
+            alloc_outcome_ms: self.alloc_outcome.load(Ordering::Relaxed) & Self::ALLOC_MS_MASK,
             last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
             last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
         }
@@ -895,7 +955,17 @@ impl RecoveryMachine {
             // is reported as such. It repairs in place and deliberately does not spend
             // the replacement budget - replacing an incarnation cannot fix a
             // control-plane outage.
-            if snapshot.last_route_miss_ms > snapshot.last_route_ok_ms {
+            // The newest completed pass answers this directly when one has been recorded: only "you
+            // get nothing" makes idleness explicit, and every other conclusion -
+            // including queues allocated that this incarnation does not actually own -
+            // is a refresh that did not finish. Without such a record there is nothing
+            // better than the route observation itself.
+            let refresh_failed = match snapshot.alloc_outcome {
+                Some(AllocationOutcome::ExplicitZero) => false,
+                Some(_) => true,
+                None => snapshot.last_route_miss_ms > snapshot.last_route_ok_ms,
+            };
+            if refresh_failed {
                 self.state = MachineState {
                     phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
                     health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
@@ -1507,6 +1577,37 @@ mod tests {
     /// Plan 49a F4 section 4.3 item 4: a live long poll on one queue must not aggregate away a
     /// neighbour whose pull loop is gone, and the fault has to name the missing pull instead of
     /// reporting health.
+    /// Plan 49a F4 section 4.3 item 1: an explicit zero assignment is idleness, not a failed
+    /// refresh, even though the newest route observation was a miss.
+    #[test]
+    fn an_explicit_zero_assignment_is_idle_rather_than_a_failed_refresh() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 0);
+        progress.note_route_observation(false);
+        progress.note_allocation_pass(AllocationOutcome::ExplicitZero);
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::WaitingForAssignment);
+        assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
+        assert!(matches!(effects.first(), Some(Effect::Idle(_))));
+    }
+
+    /// A pass that could not read the consumer list is a failed assignment refresh even when routes
+    /// were readable - the route timestamp alone cannot tell the two apart.
+    #[test]
+    fn a_consumer_id_lookup_failure_is_a_failed_assignment_refresh() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 0);
+        progress.note_route_observation(true);
+        progress.note_allocation_pass(AllocationOutcome::LookupFailed);
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
+        assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
+    }
+
     #[test]
     fn a_live_long_poll_does_not_hide_a_lost_pull_on_another_queue() {
         let progress = ConsumerProgress::new();

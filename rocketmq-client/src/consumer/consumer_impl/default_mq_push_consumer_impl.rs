@@ -800,6 +800,12 @@ impl DefaultMQPushConsumerImpl {
     /// Record that the SDK lifecycle controller owns this incarnation. Only then does a
     /// configuration failure become a typed permanent rejection; a legacy consumer keeps its
     /// historical error variants.
+    /// Whether this consumer's assignment and progress are tracked by the SDK rather than left to
+    /// whatever the application wired up.
+    pub(crate) fn tracks_assignment(&self) -> bool {
+        self.managed_lifecycle.load(Ordering::Acquire)
+    }
+
     pub(crate) fn mark_managed_lifecycle(&self) {
         self.managed_lifecycle.store(true, Ordering::Release);
     }

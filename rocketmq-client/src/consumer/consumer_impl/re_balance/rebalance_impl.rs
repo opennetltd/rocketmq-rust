@@ -39,6 +39,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::consumer::allocate_message_queue_strategy::AllocateMessageQueueStrategy;
+use crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -102,6 +103,17 @@ where
     #[inline]
     fn is_rebalance_generation_current(&self, generation: u64) -> bool {
         self.rebalance_generation() == generation
+    }
+
+    /// Forward one completed allocation pass to the consumer that owns this rebalance, if any.
+    #[inline]
+    async fn note_allocation_pass(&mut self, outcome: AllocationOutcome) {
+        let Some(inner) = self.sub_rebalance_impl.as_mut() else {
+            return;
+        };
+        if let Some(mut sub_rebalance) = inner.upgrade() {
+            sub_rebalance.note_allocation_pass(outcome).await;
+        }
     }
 
     #[inline]
@@ -737,6 +749,15 @@ where
                         self.consumer_group,
                         mq.get_topic()
                     );
+                    // Queues were allocated but this one could not be placed: no pull loop was
+                    // started for it, which is a preparation failure rather
+                    // than an idle assignment. A pass that ended because the
+                    // rebalance generation moved on is not that.
+                    if next_offset < 0 {
+                        sub_rebalance_impl
+                            .note_allocation_pass(AllocationOutcome::OffsetPreparationFailed)
+                            .await;
+                    }
                 }
             }
         }
@@ -813,6 +834,10 @@ where
                         self.consumer_group.as_ref().unwrap(),
                         topic
                     );
+                    // The pass ended without an answer: health must not read the resulting zero
+                    // assignment as an explicit idle assignment (plan 49a F4
+                    // section 4.3 item 1).
+                    self.note_allocation_pass(AllocationOutcome::LookupFailed).await;
                     return true;
                 }
                 if let (Some(mq_set), Some(mut ci_all)) = (mq_set, cid_all) {
@@ -835,10 +860,19 @@ where
                                 self.allocate_message_queue_strategy.as_ref().unwrap().get_name(),
                                 e.to_string()
                             );
+                            self.note_allocation_pass(AllocationOutcome::LookupFailed).await;
                             return false;
                         }
                     };
                     let allocate_result_set = allocate_result.into_iter().collect::<HashSet<MessageQueue>>();
+                    // The pass has an answer, and its kind is what tells a later zero assignment
+                    // apart from a refresh that never finished.
+                    self.note_allocation_pass(if allocate_result_set.is_empty() {
+                        AllocationOutcome::ExplicitZero
+                    } else {
+                        AllocationOutcome::QueuesOwned
+                    })
+                    .await;
                     let changed = self
                         .update_process_queue_table_in_rebalance(topic, &allocate_result_set, is_order)
                         .await;
