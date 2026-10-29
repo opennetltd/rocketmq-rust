@@ -20,6 +20,7 @@ use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_enum::MessageRequestMode;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 
+use crate::consumer::consumer_impl::consumer_lifecycle::PullLease;
 use crate::consumer::consumer_impl::message_request::MessageRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 
@@ -30,6 +31,10 @@ pub(crate) struct PullRequest {
     pub(crate) process_queue: Arc<ProcessQueue>,
     pub(crate) next_offset: i64,
     pub(crate) previously_locked: bool,
+    /// The in-flight pull lease this request's loop holds (plan 49a F4 section 4.3 item 3). Shared
+    /// so that a clone handed to the callback cannot release the lease before the loop itself
+    /// ends.
+    pub(crate) lease: Option<Arc<PullLease>>,
 }
 
 impl PullRequest {
@@ -45,7 +50,17 @@ impl PullRequest {
             process_queue,
             next_offset,
             previously_locked: false,
+            lease: None,
         }
+    }
+
+    /// The acquisition this request was issued under, if it holds a lease.
+    pub(crate) fn lease_epoch(&self) -> Option<u64> {
+        self.lease.as_ref().map(|lease| lease.epoch())
+    }
+
+    pub(crate) fn hold_lease(&mut self, lease: Arc<PullLease>) {
+        self.lease = Some(lease);
     }
 
     pub fn is_previously_locked(&self) -> bool {

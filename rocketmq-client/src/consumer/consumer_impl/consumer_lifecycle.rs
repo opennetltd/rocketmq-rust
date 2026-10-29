@@ -243,6 +243,31 @@ struct QueueProgress {
     pull_leased: bool,
 }
 
+/// One in-flight pull of one queue acquisition (plan 49a F4 section 4.3 item 3).
+///
+/// The token *is* the lease: it releases when the last reference to the pull loop goes away, so a
+/// request that ends for any reason - answer arrived and was not re-dispatched, queue revoked,
+/// consumer stopped, request dropped while still queued - cannot leave its queue permanently
+/// leased. A retry of the same loop carries the same token and therefore keeps holding it, which is
+/// what makes "one pull per queue" hold across delayed retries instead of only within a single RPC.
+pub(crate) struct PullLease {
+    progress: Arc<ConsumerProgress>,
+    queue: MessageQueue,
+    epoch: u64,
+}
+
+impl PullLease {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for PullLease {
+    fn drop(&mut self) {
+        self.progress.release_pull(&self.queue, self.epoch);
+    }
+}
+
 /// Why a pull failed, used only to choose the repair action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PullFailureKind {
@@ -320,6 +345,29 @@ impl ConsumerProgress {
         }
         entry.pull_leased = true;
         Some(entry.epoch)
+    }
+
+    /// The epoch this incarnation's current acquisition of `queue` carries, if it owns the queue at
+    /// all.
+    pub(crate) fn current_epoch(&self, queue: &MessageQueue) -> Option<u64> {
+        self.queues.read().get(queue).map(|entry| entry.epoch)
+    }
+
+    /// Whether `epoch` still names the acquisition this token was taken under (plan 49a F4 section
+    /// 4.3 item 2: an answer or retry must publish only into the acquisition that issued it).
+    pub(crate) fn is_current(&self, queue: &MessageQueue, epoch: u64) -> bool {
+        self.current_epoch(queue) == Some(epoch)
+    }
+
+    /// Takes the single in-flight lease for `queue` under its current epoch. Returns `None` when
+    /// another pull loop already holds it or the queue is not assigned to this incarnation.
+    pub(crate) fn acquire_pull_lease(self: &Arc<Self>, queue: &MessageQueue) -> Option<Arc<PullLease>> {
+        let epoch = self.claim_pull(queue)?;
+        Some(Arc::new(PullLease {
+            progress: Arc::clone(self),
+            queue: queue.clone(),
+            epoch,
+        }))
     }
 
     /// Releases the lease after a pull completes, fails or is cancelled. `epoch` rejects a
@@ -1340,6 +1388,52 @@ mod tests {
     /// newer than the last.
     /// Plan 49a F5 section 4.4 item 2: a listener that unwinds must be data, not a dead task, and
     /// the batch accounting must still unwind with it.
+    /// Plan 49a F4 section 4.3 items 2 and 3: one in-flight pull per queue, held for the whole loop
+    /// rather than one RPC, released by the last reference, and unable to publish once its
+    /// acquisition is gone.
+    #[test]
+    fn a_pull_lease_covers_the_loop_and_dies_with_it() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 1);
+        let q = queue("T", 0);
+
+        let lease = progress.acquire_pull_lease(&q).expect("an assigned queue may pull");
+        let epoch = lease.epoch();
+        assert!(
+            progress.acquire_pull_lease(&q).is_none(),
+            "a second request must not stack behind a live pull"
+        );
+
+        // A delayed retry is the same loop: it keeps holding the token it already has, and dropping
+        // one reference to that token must not open the queue to a duplicate.
+        let retry = Arc::clone(&lease);
+        drop(lease);
+        assert!(
+            progress.acquire_pull_lease(&q).is_none(),
+            "the loop still owns its lease"
+        );
+
+        // Only the end of the loop releases it, and releasing does not change the acquisition's
+        // identity.
+        drop(retry);
+        let again = progress
+            .acquire_pull_lease(&q)
+            .expect("a released queue may be pulled again");
+        assert_eq!(epoch, again.epoch(), "release must not renumber the acquisition");
+
+        // Once revoked, nothing that was issued under the old epoch may publish into it.
+        progress.note_revocation(std::slice::from_ref(&q));
+        assert!(!progress.is_current(&q, epoch), "a revoked queue is not current");
+        drop(again); // releasing a lease whose queue is gone must be harmless
+
+        assigned(&progress, 1);
+        let fresh = progress
+            .acquire_pull_lease(&q)
+            .expect("a reassigned queue may pull again");
+        assert!(fresh.epoch() > epoch, "the new acquisition has its own identity");
+        assert!(!progress.is_current(&q, epoch), "an expired lease cannot publish");
+    }
+
     #[test]
     fn a_panicking_listener_is_returned_as_a_failed_call() {
         let quiet = std::panic::take_hook();

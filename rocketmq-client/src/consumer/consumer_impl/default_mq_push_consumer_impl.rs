@@ -51,6 +51,7 @@ use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -1175,6 +1176,47 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
+    /// Takes (or keeps) the single in-flight pull lease for this request's queue.
+    ///
+    /// A request that already carries the current acquisition's lease continues - a delayed retry
+    /// is the same loop, not new work. Any other request for that queue is refused while the
+    /// loop runs, which is what stops initial dispatch, retries and repair from stacking
+    /// duplicate pulls behind one live long poll. Refusal simply drops the request; consumers
+    /// that do not use SDK-owned assignment tracking keep their existing behaviour unchanged
+    /// (plan 49a F4 section 4.3 item 3).
+    fn admit_pull_request(&self, pull_request: &mut PullRequest) -> bool {
+        if !self.managed_lifecycle.load(Ordering::Acquire) {
+            return true;
+        }
+        let queue = pull_request.get_message_queue();
+        match (pull_request.lease_epoch(), self.progress.current_epoch(queue)) {
+            (Some(leased), Some(current)) => leased == current,
+            (None, Some(_)) => match self.progress.acquire_pull_lease(queue) {
+                Some(lease) => {
+                    pull_request.hold_lease(lease);
+                    true
+                }
+                None => false,
+            },
+            // Not assigned to this incarnation any more: end the loop instead of pulling a stranger's queue.
+            _ => false,
+        }
+    }
+
+    /// Whether work issued under `epoch` may still touch `queue` (plan 49a F4 section 4.3 item 2).
+    /// An answer or retry that outlived its acquisition must not publish into the queue a later
+    /// owner holds.
+    pub(crate) fn holds_acquisition(&self, queue: &MessageQueue, epoch: Option<u64>) -> bool {
+        if !self.managed_lifecycle.load(Ordering::Acquire) {
+            return true;
+        }
+        match epoch {
+            Some(epoch) => self.progress.is_current(queue, epoch),
+            // Nothing tracked this request's acquisition (legacy path): leave it alone.
+            None => true,
+        }
+    }
+
     pub(crate) async fn pull_message(&mut self, mut pull_request: PullRequest) {
         let Some(_work) = self.work.enter() else { return };
         //let process_queue = pull_request.get_process_queue_mut();
@@ -1182,8 +1224,16 @@ impl DefaultMQPushConsumerImpl {
             info!("the pull request[{}] is dropped.", pull_request);
             return;
         }
-        // Observation only: the SDK counts real work transitions so recovery never has to trust an
-        // application observer. Leases stay with the pull loop itself.
+        // One in-flight pull per queue (plan 49a F4 section 4.3 item 3). Checked before any
+        // observation is recorded, so a refused duplicate never looks like pull progress on
+        // its own.
+        if !self.admit_pull_request(&mut pull_request) {
+            debug!(
+                "another pull loop owns {} or the queue is no longer assigned, dropping this request",
+                pull_request.get_message_queue()
+            );
+            return;
+        }
         self.progress.note_pull_started(pull_request.get_message_queue());
         if let Err(e) = self.make_sure_state_ok() {
             if !self.is_terminal_state() {

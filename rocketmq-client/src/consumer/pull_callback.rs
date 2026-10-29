@@ -20,6 +20,7 @@ use rocketmq_error::RocketmqError;
 use rocketmq_remoting::code::response_code::ResponseCode;
 use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_rust::ArcMut;
+use tracing::debug;
 use tracing::warn;
 
 use crate::consumer::consumer_impl::consumer_lifecycle::PullFailureKind;
@@ -126,6 +127,20 @@ impl PullCallback for DefaultPullCallback {
         let message_queue_inner = self.message_queue_inner.take().unwrap();
         let subscription_data = self.subscription_data.take().unwrap();
         let mut pull_request = self.pull_request.take().unwrap();
+
+        // Plan 49a F4 section 4.3 item 2: an answer can arrive after its acquisition moved on - the
+        // queue was revoked, or revoked and assigned again. The lease epoch names the
+        // acquisition that issued the request, so publishing now would put messages under a
+        // process queue this consumer no longer owns and advance offsets nobody read. Drop
+        // the answer only; bookkeeping owned elsewhere is untouched and the current owner
+        // pulls for itself.
+        if !push_consumer_impl.holds_acquisition(&message_queue_inner, pull_request.lease_epoch()) {
+            debug!(
+                "pull answer belongs to an expired acquisition, dropping it without publishing, mq={}",
+                message_queue_inner
+            );
+            return;
+        }
 
         push_consumer_impl
             .pull_api_wrapper
@@ -259,6 +274,18 @@ impl PullCallback for DefaultPullCallback {
         self.push_consumer_impl
             .progress
             .note_pull_failed(&message_queue_inner, classify_pull_failure(err.as_ref()));
+        if !self
+            .push_consumer_impl
+            .holds_acquisition(&message_queue_inner, pull_request.lease_epoch())
+        {
+            // A failure of an expired acquisition must not schedule a retry against it; dropping
+            // the request here releases its lease (plan 49a F4 section 4.3 item 2).
+            debug!(
+                "pull failure belongs to an expired acquisition, not scheduling a retry, mq={}",
+                message_queue_inner
+            );
+            return;
+        }
         let topic = message_queue_inner.get_topic();
         if !topic.starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
             if let Some(er) = err.downcast_ref::<RocketmqError>() {
