@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::task::Context;
 use std::task::Poll;
 use std::thread;
@@ -36,6 +37,7 @@ use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tokio_util::sync::ReusableBoxFuture;
 
 use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
 use crate::consumer::consumer_impl::consumer_lifecycle::Effect;
@@ -381,7 +383,10 @@ pub struct ManagedConsumerHandle {
 
 struct HandleInner {
     status: watch::Receiver<ConsumerStatus>,
-    events: broadcast::Sender<ConsumerStatus>,
+    /// Weak on purpose: the controller alone owns a strong sender, so neither a remaining handle
+    /// nor an observer can keep the event channel open and prevent terminal closure (plan 49a
+    /// F9).
+    events: Weak<broadcast::Sender<ConsumerStatus>>,
     stop_token: CancellationToken,
     stop_requested: AtomicBool,
     /// Resolved once cleanup is proved complete; `None` after the outcome was consumed.
@@ -402,16 +407,28 @@ impl ManagedConsumerHandle {
         self.inner.current()
     }
 
-    /// Status of the current incarnation including queues it owns and delivery still pending.
-    pub fn subscribe_status(&self) -> ConsumerStatus {
-        self.inner.current()
+    /// Live status subscription. The receiver starts at the current value and `changed()` resolves
+    /// on every later transition, so an observer never has to poll for a state it could have
+    /// been told about (plan 49a F9). Reading the latest value stays available through
+    /// [`Self::status`].
+    pub fn subscribe_status(&self) -> watch::Receiver<ConsumerStatus> {
+        self.inner.status.clone()
     }
 
     /// Stream of status transitions. A lagging observer skips stale values rather than delaying
-    /// recovery: recovery never waits on an observer.
+    /// recovery: recovery never waits on an observer. Creating one borrows nothing that extends the
+    /// consumer's life, and it closes once the controller has exited.
     pub fn subscribe_events(&self) -> ConsumerStatusEvents {
-        ConsumerStatusEvents {
-            receiver: self.inner.events.subscribe(),
+        match self.inner.events.upgrade() {
+            Some(sender) => ConsumerStatusEvents::new(sender.subscribe()),
+            None => {
+                // The controller already finished: hand back a receiver whose sender is dropped, so
+                // the stream reports terminal closure instead of waiting for a
+                // publisher that is gone.
+                let (gone, receiver) = broadcast::channel::<ConsumerStatus>(1);
+                drop(gone);
+                ConsumerStatusEvents::new(receiver)
+            }
         }
     }
 
@@ -481,22 +498,52 @@ impl ManagedConsumerHandle {
 
 /// Borrowed view of the status stream. Dropping it unsubscribes; recovery is unaffected.
 pub struct ConsumerStatusEvents {
-    receiver: broadcast::Receiver<ConsumerStatus>,
+    /// One retained receive step, reused after each item: `Pending` registers the caller's waker
+    /// with the broadcast channel instead of returning Pending without one and never waking
+    /// again (plan 49a F9). Reusing a boxed future keeps this allocation-free after
+    /// construction.
+    next: ReusableBoxFuture<
+        'static,
+        (
+            Result<ConsumerStatus, broadcast::error::RecvError>,
+            broadcast::Receiver<ConsumerStatus>,
+        ),
+    >,
+}
+
+async fn receive_status(
+    mut receiver: broadcast::Receiver<ConsumerStatus>,
+) -> (
+    Result<ConsumerStatus, broadcast::error::RecvError>,
+    broadcast::Receiver<ConsumerStatus>,
+) {
+    let result = receiver.recv().await;
+    (result, receiver)
+}
+
+impl ConsumerStatusEvents {
+    fn new(receiver: broadcast::Receiver<ConsumerStatus>) -> Self {
+        Self {
+            next: ReusableBoxFuture::new(receive_status(receiver)),
+        }
+    }
 }
 
 impl futures::Stream for ConsumerStatusEvents {
     type Item = ConsumerStatus;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            match this.receiver.try_recv() {
+            let (result, receiver) = std::task::ready!(futures::future::FutureExt::poll_unpin(&mut this.next, cx));
+            // Put the receiver back before deciding: a lagged answer still has to be polled again.
+            this.next.set(receive_status(receiver));
+            match result {
                 Ok(status) => return Poll::Ready(Some(status)),
-                Err(broadcast::error::TryRecvError::Empty) => return Poll::Pending,
                 // A lagging observer skips stale values rather than delaying recovery, so one
                 // slow consumer of status events can never hold the lifecycle back.
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(broadcast::error::TryRecvError::Closed) => return Poll::Ready(None),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return Poll::Ready(None),
             }
         }
     }
@@ -532,12 +579,13 @@ pub(crate) fn start_managed(
         progress: ProgressCounts::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial);
-    let (events_tx, _) = broadcast::channel(64);
+    // The publisher below holds the only strong sender; handles see it weakly.
+    let events_tx = Arc::new(broadcast::channel::<ConsumerStatus>(64).0);
     let stop_token = CancellationToken::new();
 
     let inner = Arc::new(HandleInner {
         status: status_rx,
-        events: events_tx,
+        events: Arc::downgrade(&events_tx),
         stop_token: stop_token.clone(),
         stop_requested: AtomicBool::new(false),
         cleanup_complete: parking_lot::Mutex::new(None),
@@ -552,7 +600,7 @@ pub(crate) fn start_managed(
     let id = CONTROLLER_SEQ.fetch_add(1, Ordering::Relaxed);
     let publisher = StatusPublisher {
         status: status_tx,
-        events: inner.events.clone(),
+        events: events_tx,
     };
     // A detached controller thread with its own current-thread runtime: the recursive consumer
     // graph is not `Send`, and an application must never move it across schedulers.
@@ -594,7 +642,9 @@ impl Drop for CleanupProof {
 
 struct StatusPublisher {
     status: watch::Sender<ConsumerStatus>,
-    events: broadcast::Sender<ConsumerStatus>,
+    /// Strong owner of the event channel. When the controller returns, receivers observe closure; a
+    /// handle or observer cannot manufacture that publisher's lifetime (plan 49a F9).
+    events: Arc<broadcast::Sender<ConsumerStatus>>,
 }
 
 impl StatusPublisher {
@@ -1304,6 +1354,112 @@ mod tests {
         // The only assertion that matters is that this test process is still alive and waiting
         // for nothing.
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    fn sample_status(incarnation: u64) -> ConsumerStatus {
+        ConsumerStatus {
+            phase: ConsumerPhase::Running,
+            health: ConsumerHealth::Healthy,
+            reason: "assigned",
+            incarnation,
+            progress: ProgressCounts::default(),
+        }
+    }
+
+    /// Plan 49a F9: an idle observer must be woken by a published status. Returning `Pending`
+    /// without registering a wakeup leaves a quiet consumer's observer asleep forever, which no
+    /// amount of later publishing can undo.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_event_observer_is_woken_by_a_published_status() {
+        let (sender, receiver) = broadcast::channel::<ConsumerStatus>(8);
+        let mut events = ConsumerStatusEvents::new(receiver);
+        let waiter = tokio::spawn(async move { futures::StreamExt::next(&mut events).await });
+        // Park the reader on an empty buffer. Nothing else runs on this runtime until the awaited
+        // item arrives, so a missing wakeup can only show up as the timeout below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sender
+            .send(sample_status(3))
+            .expect("a live receiver keeps the channel open");
+        let observed = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("publishing a status must wake the idle observer")
+            .expect("observer task")
+            .expect("the stream stays open while a sender lives");
+        assert_eq!(observed.incarnation, 3);
+        assert_eq!(observed.phase, ConsumerPhase::Running);
+        assert_eq!(observed.reason, "assigned");
+    }
+
+    /// Plan 49a F9: only the publisher owns the event channel. A remaining handle must neither keep
+    /// a stream open nor be able to manufacture a publisher, and creating a receiver borrows no
+    /// control ownership of the consumer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handle_cannot_keep_the_event_channel_open_without_a_publisher() {
+        let (status_tx, status_rx) = watch::channel(sample_status(1));
+        let publisher = Arc::new(broadcast::channel::<ConsumerStatus>(8).0);
+        let handle = ManagedConsumerHandle {
+            inner: Arc::new(HandleInner {
+                status: status_rx,
+                events: Arc::downgrade(&publisher),
+                stop_token: CancellationToken::new(),
+                stop_requested: AtomicBool::new(false),
+                cleanup_complete: parking_lot::Mutex::new(None),
+                proved: AtomicBool::new(false),
+            }),
+        };
+        // While the publisher lives, a receiver created from the handle sees its values.
+        let mut events = handle.subscribe_events();
+        publisher
+            .send(sample_status(7))
+            .expect("a subscribed receiver keeps the channel open");
+        assert_eq!(
+            futures::StreamExt::next(&mut events)
+                .await
+                .expect("open stream")
+                .incarnation,
+            7
+        );
+        drop(events);
+        // The controller is gone: a fresh receiver reports terminal closure at once instead of
+        // waiting for values that can never arrive, even though this handle is still alive.
+        drop(publisher);
+        let mut after = handle.subscribe_events();
+        let closed = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut after)).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "a stream must close once its only publisher is gone, observed: {closed:?}"
+        );
+        // Latest-state access stays available and costs no ownership.
+        assert_eq!(handle.status().incarnation, 1);
+        drop(status_tx);
+    }
+
+    /// Plan 49a F9: `subscribe_status` hands out a live subscription, so an observer learns the
+    /// next state by being told instead of by sampling on a timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_subscription_delivers_the_next_transition_unprompted() {
+        let handle = start_managed(spec(), LifecyclePolicy::default()).expect("managed consumer starts");
+        let mut statuses = handle.subscribe_status();
+        let initial = *statuses.borrow_and_update();
+        handle.request_stop();
+        let observed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if statuses.changed().await.is_err() {
+                    // The publisher finished: the subscription ended on its own, which is also a
+                    // delivery rather than a wait.
+                    return None;
+                }
+                let next = *statuses.borrow_and_update();
+                if next.phase != initial.phase || next.reason != initial.reason {
+                    return Some(next);
+                }
+            }
+        })
+        .await
+        .expect("a stop must reach a subscriber through the subscription, not by polling");
+        if let Some(status) = observed {
+            assert_ne!(status.reason, "");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
