@@ -1134,8 +1134,10 @@ impl MQClientAPIImpl {
         ))
     }
 
+    /// Takes `&self` so several offset writes can share one client handle concurrently (plan 49a
+    /// F10).
     pub async fn update_consumer_offset_oneway(
-        &mut self,
+        &self,
         addr: &str,
         request_header: UpdateConsumerOffsetRequestHeader,
         timeout_millis: u64,
@@ -1151,8 +1153,10 @@ impl MQClientAPIImpl {
         Ok(())
     }
 
+    /// Takes `&self` so several offset writes can share one client handle concurrently (plan 49a
+    /// F10).
     pub async fn update_consumer_offset(
-        &mut self,
+        &self,
         addr: &CheetahString,
         request_header: UpdateConsumerOffsetRequestHeader,
         timeout_millis: u64,

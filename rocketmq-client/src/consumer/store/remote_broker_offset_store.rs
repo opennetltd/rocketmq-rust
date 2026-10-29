@@ -14,7 +14,12 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
+
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 
 use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
@@ -47,15 +52,95 @@ pub struct RemoteBrokerOffsetStore {
     offset_table: Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>>,
 }
 
+/// How many offset writes one pass may have in flight at once (plan 49a F10 section 4.6 item 2).
+/// Enough that a pass over hundreds of queues is not dominated by sequential connection setup, few
+/// enough that one consumer's offset persistence cannot become a burst against the brokers.
+pub(crate) const MAX_INFLIGHT_OFFSET_WRITES: usize = 8;
+
+/// What one offset write produced, before it is folded into a [`PersistSummary`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// Issues items of work with at most `max` of them in flight, and never abandons one that started.
+///
+/// The caller keeps whatever needs the client's mutable handle - broker resolution, the
+/// cancellation probe, the deadline - while an item of work only borrows what it needs, which is
+/// what lets several of them overlap without creating a second mutable alias of the same client.
+/// [`Self::finish`] waits for everything already admitted: stopping means stopping new work, not
+/// interrupting an offset write that is on its way.
+struct BoundedInFlight<'a, R> {
+    in_flight: FuturesUnordered<BoxFuture<'a, R>>,
+    max: usize,
+}
+
+impl<'a, R> BoundedInFlight<'a, R> {
+    fn new(max: usize) -> Self {
+        Self {
+            in_flight: FuturesUnordered::new(),
+            max,
+        }
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Admit one item of work, first waiting for a slot when the window is full. Whatever landed
+    /// while waiting is handed back so the caller accounts for it.
+    async fn admit<F>(&mut self, task: F) -> Vec<R>
+    where
+        F: Future<Output = R> + Send + 'a,
+    {
+        let mut landed = Vec::new();
+        while self.in_flight.len() >= self.max {
+            match self.next_result().await {
+                Some(outcome) => landed.push(outcome),
+                None => break,
+            }
+        }
+        self.in_flight.push(Box::pin(task));
+        landed
+    }
+
+    /// The next completed result, waiting for one. Draining with this until it returns `None` is
+    /// how everything already admitted gets finished and reported; nothing started here is left
+    /// undone.
+    async fn next_result(&mut self) -> Option<R> {
+        self.in_flight.next().await
+    }
+}
+
+/// One write's outcome folded into the pass summary, counted exactly once.
+fn count(summary: &mut PersistSummary, outcome: WriteOutcome) {
+    match outcome {
+        WriteOutcome::Succeeded => {
+            summary.attempted += 1;
+            summary.succeeded += 1;
+        }
+        WriteOutcome::Failed => {
+            summary.attempted += 1;
+            summary.failed += 1;
+        }
+    }
+}
+
 impl RemoteBrokerOffsetStore {
     /// One pass over the assigned offsets, shared by the periodic task and cleanup so their
     /// snapshot and write primitive cannot drift apart (plan 49a F10). `deadline` bounds each
-    /// individual write; `cancelled` is consulted between queues - never during a write - so a
-    /// consumer that is stopping stops issuing new writes without waiting for its siblings or
-    /// the client's scheduled task.
+    /// individual write; `cancelled` is consulted before a queue is offered - never during a
+    /// write - so a consumer that is stopping stops issuing new writes without waiting for its
+    /// siblings or the client's scheduled task, and without abandoning a write already on the
+    /// wire.
     ///
-    /// Writes stay one at a time on purpose: the client handle is borrowed mutably per write, so
-    /// there is never more than one in-flight write nor two mutable aliases of the same client.
+    /// Broker resolution stays sequential because the client hands out its route tables through a
+    /// mutable handle; the writes themselves only need a shared one, so up to
+    /// [`MAX_INFLIGHT_OFFSET_WRITES`] of them overlap (plan 49a F10 section 4.6 item 2). A pass
+    /// over two hundred and fifty-six queues used to spend that many sequential round trips on
+    /// connection setup alone.
     async fn run_pass(
         &mut self,
         mqs: &HashSet<MessageQueue>,
@@ -69,6 +154,11 @@ impl RemoteBrokerOffsetStore {
         // Snapshot only the assigned offsets once; the table lock is never held across I/O.
         let pending = self.snapshot_assigned(mqs).await;
         let total = pending.len() as u64;
+        // A second shared handle to the same API object: writes borrow it, they never take it
+        // mutably, so overlapping them cannot produce two mutable aliases of the client.
+        let api = self.client_instance.mq_client_api_impl.as_ref().unwrap().clone();
+        let group_name = self.group_name.clone();
+        let mut in_flight = BoundedInFlight::<WriteOutcome>::new(MAX_INFLIGHT_OFFSET_WRITES);
         for (index, (mq, offset)) in pending.into_iter().enumerate() {
             let remaining_here = total - index as u64;
             if cancelled() {
@@ -76,44 +166,98 @@ impl RemoteBrokerOffsetStore {
                 summary.skipped += remaining_here;
                 break;
             }
-            let (timeout, budget) = match deadline {
+            let (timeout_millis, budget) = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(TokioInstant::now());
-                    let timeout = offset_rpc_timeout(remaining);
-                    if timeout == 0 {
+                    let timeout_millis = offset_rpc_timeout(remaining);
+                    if timeout_millis == 0 {
                         // No budget: report it instead of starting a write that would be cut off.
                         summary.skipped += remaining_here;
                         break;
                     }
-                    (timeout, remaining)
+                    (timeout_millis, remaining)
                 }
                 None => (
                     OFFSET_WRITE_TIMEOUT_MILLIS,
                     std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS),
                 ),
             };
-            summary.attempted += 1;
+            // Resolution needs the mutable client handle and stays where the per-queue budget is
+            // spent.
+            let addr = match self.resolve_write_addr(&mq).await {
+                Some(addr) => addr,
+                None => {
+                    summary.attempted += 1;
+                    summary.failed += 1;
+                    debug!("[persistAll] broker not found for offset write, {}", mq);
+                    continue;
+                }
+            };
+            let request_header = UpdateConsumerOffsetRequestHeader {
+                consumer_group: group_name.clone(),
+                topic: mq.get_topic_cs().clone(),
+                queue_id: mq.get_queue_id(),
+                commit_offset: offset,
+                topic_request_header: Some(TopicRequestHeader {
+                    lo: None,
+                    rpc: Some(RpcRequestHeader {
+                        namespace: None,
+                        namespaced: None,
+                        broker_name: Some(CheetahString::from_string(mq.get_broker_name().to_string())),
+                        oneway: None,
+                    }),
+                }),
+            };
             // A one-way write is best effort and cannot be confirmed, so finishing its dispatch is
             // the most this pass can claim.
-            let step = self.write_offset(&mq, offset, true, timeout);
-            match tokio::time::timeout(budget, step).await {
-                Ok(Ok(())) => summary.succeeded += 1,
-                Ok(Err(e)) => {
-                    debug!("[persistAll] updateConsumeOffsetToBroker failed, {},{}", mq, e);
-                    summary.failed += 1;
+            let api = &api;
+            let write = async move {
+                let step = api.update_consumer_offset_oneway(addr.as_str(), request_header, timeout_millis);
+                match tokio::time::timeout(budget, step).await {
+                    Ok(Ok(())) => WriteOutcome::Succeeded,
+                    Ok(Err(e)) => {
+                        debug!("[persistAll] updateConsumeOffsetToBroker failed, {}", e);
+                        WriteOutcome::Failed
+                    }
+                    Err(_) => {
+                        debug!("[persistAll] offset write cut off by its budget, {}", addr);
+                        WriteOutcome::Failed
+                    }
                 }
-                Err(_) => {
-                    debug!("[persistAll] offset write cut off by its budget, {}", mq);
-                    summary.failed += 1;
-                }
+            };
+            for outcome in in_flight.admit(write).await {
+                count(&mut summary, outcome);
             }
+        }
+        // Everything already admitted is finished and accounted for, however the loop ended.
+        while let Some(outcome) = in_flight.next_result().await {
+            count(&mut summary, outcome);
         }
         self.report_pass(&summary);
         summary
     }
 
-    /// One bounded line per pass rather than one per queue: two hundred fifty-six assigned queues
-    /// must not produce two hundred fifty-six log lines every five seconds (plan 49a F10).
+    /// Where a queue's offset goes: the master broker from the shared route tables, refreshed once
+    /// on a miss exactly as before. `None` means this pass cannot address the write.
+    async fn resolve_write_addr(&mut self, mq: &MessageQueue) -> Option<CheetahString> {
+        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+        let mut found = self
+            .client_instance
+            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+            .await;
+        if found.is_none() {
+            self.client_instance
+                .update_topic_route_info_from_name_server_topic(mq.get_topic_cs())
+                .await;
+            let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+            found = self
+                .client_instance
+                .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+                .await;
+        }
+        found.map(|found| CheetahString::from_string(found.broker_addr.to_string()))
+    }
+
     fn report_pass(&self, summary: &PersistSummary) {
         if summary.attempted == 0 && summary.skipped == 0 {
             return;
@@ -463,6 +607,81 @@ mod tests {
             summary.attempted > 0,
             "a budget should reach the first queue: {summary}"
         );
+    }
+
+    /// Plan 49a F10 section 4.6 item 2: a pass may overlap its writes, but only up to the window.
+    /// Sequential dispatch made a pass over hundreds of queues pay one round trip of connection
+    /// setup per queue; an unbounded fan-out would turn one consumer's persistence into a
+    /// burst.
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_most_eight_offset_writes_are_issued_at_once() {
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut in_flight = BoundedInFlight::<WriteOutcome>::new(MAX_INFLIGHT_OFFSET_WRITES);
+        let mut summary = PersistSummary::default();
+        for _ in 0..40 {
+            let (current, peak) = (current.clone(), peak.clone());
+            for outcome in in_flight
+                .admit(async move {
+                    let now = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    WriteOutcome::Succeeded
+                })
+                .await
+            {
+                count(&mut summary, outcome);
+            }
+        }
+        while let Some(outcome) = in_flight.next_result().await {
+            count(&mut summary, outcome);
+        }
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak <= MAX_INFLIGHT_OFFSET_WRITES, "window exceeded: {peak}");
+        assert!(peak > 1, "writes never overlapped at all: {peak}");
+        assert_eq!(40, summary.attempted, "{summary}");
+        assert_eq!(40, summary.succeeded, "{summary}");
+    }
+
+    /// Stopping is a decision about work not yet started. Everything already admitted has to finish
+    /// and be accounted for, or an offset write disappears between the consumer stopping and
+    /// the pass ending.
+    #[tokio::test(flavor = "current_thread")]
+    async fn everything_admitted_is_finished_after_the_caller_stops_early() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut in_flight = BoundedInFlight::<WriteOutcome>::new(MAX_INFLIGHT_OFFSET_WRITES);
+        let mut summary = PersistSummary::default();
+        // The caller stops offering queues part-way, exactly as a stopping consumer does.
+        for index in 0..24 {
+            if index >= 10 {
+                break;
+            }
+            let (started, finished) = (started.clone(), finished.clone());
+            for outcome in in_flight
+                .admit(async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    WriteOutcome::Succeeded
+                })
+                .await
+            {
+                count(&mut summary, outcome);
+            }
+        }
+        while let Some(outcome) = in_flight.next_result().await {
+            count(&mut summary, outcome);
+        }
+        assert_eq!(10, started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "an admitted write was left unfinished"
+        );
+        assert_eq!(10, summary.attempted, "{summary}");
+        assert_eq!(10, summary.succeeded, "{summary}");
     }
 
     /// Plan 49a F10: periodic persistence belongs to its own consumer. Once that consumer is

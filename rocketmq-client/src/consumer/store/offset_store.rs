@@ -44,6 +44,17 @@ impl std::fmt::Display for PersistSummary {
     }
 }
 
+impl PersistSummary {
+    /// Fold another partial result into this one. A pass is reported as a whole even though its
+    /// resolution phase and its concurrent write phase are counted separately.
+    pub fn merge(&mut self, other: &PersistSummary) {
+        self.attempted += other.attempted;
+        self.succeeded += other.succeeded;
+        self.failed += other.failed;
+        self.skipped += other.skipped;
+    }
+}
+
 /// Per-write RPC timeout inside a bounded pass: never more than five seconds and never more than
 /// what the caller's deadline still allows. Zero means there is no budget left to spend.
 pub(crate) fn offset_rpc_timeout(remaining: std::time::Duration) -> u64 {
