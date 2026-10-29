@@ -46,6 +46,8 @@ use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
 use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consumer_identity;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::validate_consumer_config;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::ListenerPresence;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
 use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
@@ -247,6 +249,14 @@ impl ManagedConsumerSpec {
         for (topic, expression) in &subscriptions {
             check_subscription(topic.as_str(), expression.as_str()).map_err(rejected)?;
         }
+        // Thread bounds, batch sizes, flow-control thresholds and POP limits belong to the same
+        // promise. They used to be decided only inside `check_config`, so a spec with
+        // consume_thread_min = 0 passed here, built a controller plus incarnation graph,
+        // and failed afterwards: reported as permanent, but never rejected synchronously as
+        // Plan 49a requires (plan 49b R5). The managed listener is attached to the object
+        // after construction, so presence is asserted above rather than read from config.
+        let config = self.builder.clone().normalized_consumer_config();
+        validate_consumer_config(&config, ListenerPresence::Provided).map_err(rejected)?;
         Ok(())
     }
 
@@ -282,6 +292,7 @@ impl ManagedConsumerSpec {
         let mut consumer = builder.build();
         // Cleanup finalization is sized by the lifecycle policy this controller runs under, never
         // by how long an observer happens to wait (plan 49b R2).
+        consumer.mark_managed_lifecycle();
         consumer.set_cleanup_session_ceiling(policy.cleanup_session_ceiling());
         consumer.set_progress(Arc::clone(&progress));
         if let Some(listener) = self.listener.clone() {
@@ -1063,6 +1074,77 @@ mod tests {
         fn assert_<T: Send + Sync>() {}
         assert_::<ManagedConsumerSpec>();
         assert_::<ManagedConsumerHandle>();
+    }
+
+    /// Plan 49b R5: numeric limits belong to the same synchronous promise as identity and
+    /// subscriptions. Each setting below used to pass spec validation, build a controller plus
+    /// incarnation graph, and only then fail `check_config` - permanent, but never reported
+    /// before resources existed.
+    #[test]
+    fn numeric_settings_are_rejected_before_any_resource_exists() {
+        fn rejected(mutate: impl Fn(DefaultMQPushConsumerBuilder) -> DefaultMQPushConsumerBuilder) -> RocketMQError {
+            let builder = DefaultMQPushConsumer::builder()
+                .consumer_group("group")
+                .subscribe("topic", "*");
+            let err = ManagedConsumerSpec::new(mutate(builder))
+                .with_listener(Arc::new(|_msgs, _ctx| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)))
+                .validate()
+                .expect_err("an invalid numeric setting must be rejected synchronously");
+            assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
+            err
+        }
+
+        for (describe, err) in [
+            ("consume_thread_min = 0", rejected(|b| b.consume_thread_min(0))),
+            (
+                "consume_thread_max above range",
+                rejected(|b| b.consume_thread_max(1001)),
+            ),
+            (
+                "consume_thread_min above consume_thread_max",
+                rejected(|b| b.consume_thread_min(20).consume_thread_max(10)),
+            ),
+            ("pull_batch_size = 0", rejected(|b| b.pull_batch_size(0))),
+            (
+                "consume_message_batch_max_size above range",
+                rejected(|b| b.consume_message_batch_max_size(1025)),
+            ),
+            (
+                "pull_threshold_for_queue = 0",
+                rejected(|b| b.pull_threshold_for_queue(0)),
+            ),
+            (
+                "pull_threshold_size_for_queue above range",
+                rejected(|b| b.pull_threshold_size_for_queue(1025)),
+            ),
+            (
+                "consume_concurrently_max_span = 0",
+                rejected(|b| b.consume_concurrently_max_span(0)),
+            ),
+            ("pop_batch_nums above range", rejected(|b| b.pop_batch_nums(33))),
+        ] {
+            let message = err.to_string();
+            assert!(
+                message.contains("Out of range") || message.contains("larger than"),
+                "{describe} must be reported as a range violation, got {message}"
+            );
+        }
+    }
+
+    /// The shared validator must still accept what the SDK configures by default; bounds tightened
+    /// past the documented defaults would turn every ordinary managed consumer into a permanent
+    /// rejection.
+    #[test]
+    fn documented_numeric_defaults_pass_preflight() {
+        spec()
+            .validate()
+            .expect("the documented defaults are valid configuration");
+        let config = DefaultMQPushConsumer::builder()
+            .consumer_group("group")
+            .subscribe("topic", "*")
+            .normalized_consumer_config();
+        validate_consumer_config(&config, ListenerPresence::Provided)
+            .expect("the same projection build() uses must pass validation");
     }
 
     #[test]

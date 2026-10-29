@@ -226,6 +226,11 @@ pub struct DefaultMQPushConsumerImpl {
     /// Millis of finalization ceiling the SDK gives its own cleanup pass; `0` means unset so the
     /// default applies. Never derived from an observer's wait (plan 49b R2).
     cleanup_ceiling_millis: std::sync::atomic::AtomicU64,
+    /// Set when the SDK-owned controller built this incarnation. Startup classification differs
+    /// between the two owners on purpose: legacy callers keep the error variants they already
+    /// match on, while a managed incarnation reports configuration failures as a typed
+    /// permanent rejection (plan 49b R5).
+    managed_lifecycle: std::sync::atomic::AtomicBool,
 }
 
 /// Identity rules that hold before any resource exists, shared by legacy start and managed spec
@@ -259,152 +264,166 @@ pub(crate) fn check_subscription(topic: &str, expression: &str) -> rocketmq_erro
     Ok(())
 }
 
-impl DefaultMQPushConsumerImpl {
-    fn check_config(&mut self) -> rocketmq_error::RocketMQResult<()> {
-        check_consumer_identity(self.consumer_config.consumer_group.as_str())?;
+/// Whether a listener will be attached to the consumer being validated. Legacy start reads this
+/// from its own configuration; a managed spec knows it independently, because its listener is
+/// attached to the object after construction rather than stored in `ConsumerConfig` (plan 49b R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListenerPresence {
+    Provided,
+    Missing,
+    Malformed,
+}
 
-        if self.consumer_config.allocate_message_queue_strategy.is_none() {
-            return Err(mq_client_err!(format!(
-                "allocate_message_queue_strategy is null{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+/// One normalized, side-effect-free configuration check shared by legacy start and managed
+/// preflight (plan 49b R5). Identity, allocation strategy, listener presence and every numeric
+/// limit are decided from the configuration alone: no I/O, no runtime handle, no client instance,
+/// nothing mutated. Errors keep their historical variant here - translating them into a typed
+/// permanent rejection is the managed boundary's job, so legacy callers that match on the old
+/// variants keep working unchanged.
+pub(crate) fn validate_consumer_config(
+    config: &ConsumerConfig,
+    listener: ListenerPresence,
+) -> rocketmq_error::RocketMQResult<()> {
+    check_consumer_identity(config.consumer_group.as_str())?;
 
-        if self.consumer_config.message_listener.is_none() {
+    if config.allocate_message_queue_strategy.is_none() {
+        return Err(mq_client_err!(format!(
+            "allocate_message_queue_strategy is null{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
+
+    match listener {
+        ListenerPresence::Missing => {
             return Err(mq_client_err!(format!(
                 "messageListener is null{}",
                 FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
             )));
         }
-
-        if self
-            .consumer_config
-            .message_listener
-            .as_ref()
-            .unwrap()
-            .message_listener_orderly
-            .is_none()
-            && self
-                .consumer_config
-                .message_listener
-                .as_ref()
-                .unwrap()
-                .message_listener_concurrently
-                .is_none()
-        {
+        ListenerPresence::Malformed => {
             return Err(mq_client_err!(format!(
                 "messageListener must be instanceof MessageListenerOrderly or MessageListenerConcurrently{}",
                 FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
             )));
         }
+        ListenerPresence::Provided => {}
+    }
 
-        let consume_thread_min = self.consumer_config.consume_thread_min;
-        let consume_thread_max = self.consumer_config.consume_thread_max;
-        if !(1..=1000).contains(&consume_thread_min) {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMin Out of range [1, 1000]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-        if !(1..=1000).contains(&consume_thread_max) {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMax Out of range [1, 1000]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
-        if consume_thread_min > consume_thread_max {
-            return Err(mq_client_err!(format!(
-                "consumeThreadMin ({}) is larger than consumeThreadMax ({})",
-                consume_thread_min, consume_thread_max
-            )));
-        }
+    let consume_thread_min = config.consume_thread_min;
+    let consume_thread_max = config.consume_thread_max;
+    if !(1..=1000).contains(&consume_thread_min) {
+        return Err(mq_client_err!(format!(
+            "consumeThreadMin Out of range [1, 1000]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
+    if !(1..=1000).contains(&consume_thread_max) {
+        return Err(mq_client_err!(format!(
+            "consumeThreadMax Out of range [1, 1000]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
+    if consume_thread_min > consume_thread_max {
+        return Err(mq_client_err!(format!(
+            "consumeThreadMin ({}) is larger than consumeThreadMax ({})",
+            consume_thread_min, consume_thread_max
+        )));
+    }
 
-        if self.consumer_config.consume_concurrently_max_span < 1
-            || self.consumer_config.consume_concurrently_max_span > 65535
-        {
-            return Err(mq_client_err!(format!(
-                "consumeConcurrentlyMaxSpan Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.consume_concurrently_max_span < 1 || config.consume_concurrently_max_span > 65535 {
+        return Err(mq_client_err!(format!(
+            "consumeConcurrentlyMaxSpan Out of range [1, 65535]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_threshold_for_queue < 1 || self.consumer_config.pull_threshold_for_queue > 65535 {
-            return Err(mq_client_err!(format!(
-                "pullThresholdForQueue Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_threshold_for_queue < 1 || config.pull_threshold_for_queue > 65535 {
+        return Err(mq_client_err!(format!(
+            "pullThresholdForQueue Out of range [1, 65535]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_threshold_for_topic != -1
-            && (self.consumer_config.pull_threshold_for_topic < 1
-                || self.consumer_config.pull_threshold_for_topic > 6553500)
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdForTopic Out of range [1, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_threshold_for_topic != -1
+        && (config.pull_threshold_for_topic < 1 || config.pull_threshold_for_topic > 6553500)
+    {
+        return Err(mq_client_err!(format!(
+            "pullThresholdForTopic Out of range [1, 65535]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_threshold_size_for_queue < 1
-            || self.consumer_config.pull_threshold_size_for_queue > 1024
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdSizeForQueue Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_threshold_size_for_queue < 1 || config.pull_threshold_size_for_queue > 1024 {
+        return Err(mq_client_err!(format!(
+            "pullThresholdSizeForQueue Out of range [1, 1024]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_threshold_size_for_topic != -1
-            && (self.consumer_config.pull_threshold_size_for_topic < 1
-                || self.consumer_config.pull_threshold_size_for_topic > 102400)
-        {
-            return Err(mq_client_err!(format!(
-                "pullThresholdSizeForTopic Out of range [1, 102400]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_threshold_size_for_topic != -1
+        && (config.pull_threshold_size_for_topic < 1 || config.pull_threshold_size_for_topic > 102400)
+    {
+        return Err(mq_client_err!(format!(
+            "pullThresholdSizeForTopic Out of range [1, 102400]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_interval > 65535 {
-            return Err(mq_client_err!(format!(
-                "pullInterval Out of range [0, 65535]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_interval > 65535 {
+        return Err(mq_client_err!(format!(
+            "pullInterval Out of range [0, 65535]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.consume_message_batch_max_size < 1
-            || self.consumer_config.consume_message_batch_max_size > 1024
-        {
-            return Err(mq_client_err!(format!(
-                "consumeMessageBatchMaxSize Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.consume_message_batch_max_size < 1 || config.consume_message_batch_max_size > 1024 {
+        return Err(mq_client_err!(format!(
+            "consumeMessageBatchMaxSize Out of range [1, 1024]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pull_batch_size < 1 || self.consumer_config.pull_batch_size > 1024 {
-            return Err(mq_client_err!(format!(
-                "pullBatchSize Out of range [1, 1024]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pull_batch_size < 1 || config.pull_batch_size > 1024 {
+        return Err(mq_client_err!(format!(
+            "pullBatchSize Out of range [1, 1024]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pop_invisible_time < MIN_POP_INVISIBLE_TIME
-            || self.consumer_config.pop_invisible_time > MAX_POP_INVISIBLE_TIME
-        {
-            return Err(mq_client_err!(format!(
-                "popInvisibleTime Out of range [{}, {}]{}",
-                MIN_POP_INVISIBLE_TIME,
-                MAX_POP_INVISIBLE_TIME,
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pop_invisible_time < MIN_POP_INVISIBLE_TIME || config.pop_invisible_time > MAX_POP_INVISIBLE_TIME {
+        return Err(mq_client_err!(format!(
+            "popInvisibleTime Out of range [{}, {}]{}",
+            MIN_POP_INVISIBLE_TIME,
+            MAX_POP_INVISIBLE_TIME,
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
-        if self.consumer_config.pop_batch_nums < 1 || self.consumer_config.pop_batch_nums > 32 {
-            return Err(mq_client_err!(format!(
-                "popBatchNums Out of range [1, 32]{}",
-                FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
-            )));
-        }
+    if config.pop_batch_nums < 1 || config.pop_batch_nums > 32 {
+        return Err(mq_client_err!(format!(
+            "popBatchNums Out of range [1, 32]{}",
+            FAQUrl::suggest_todo(FAQUrl::CLIENT_PARAMETER_CHECK_URL)
+        )));
+    }
 
+    Ok(())
+}
+
+impl DefaultMQPushConsumerImpl {
+    /// Legacy start's own check: the same normalized rules, with listener presence read from this
+    /// consumer's configuration so its historical first-error behaviour is unchanged (plan 49b R5).
+    fn check_config(&mut self) -> rocketmq_error::RocketMQResult<()> {
+        let listener = match self.consumer_config.message_listener.as_ref() {
+            None => ListenerPresence::Missing,
+            Some(listener) => {
+                if listener.message_listener_orderly.is_none() && listener.message_listener_concurrently.is_none() {
+                    ListenerPresence::Malformed
+                } else {
+                    ListenerPresence::Provided
+                }
+            }
+        };
+        validate_consumer_config(&self.consumer_config, listener)?;
         Ok(())
     }
 
@@ -482,6 +501,7 @@ impl DefaultMQPushConsumerImpl {
             default_mqpush_consumer_impl: None,
             cleanup_session: Arc::new(parking_lot::Mutex::new(None)),
             cleanup_ceiling_millis: std::sync::atomic::AtomicU64::new(0),
+            managed_lifecycle: std::sync::atomic::AtomicBool::new(false),
         };
         let wrapper = ArcMut::downgrade(&this.rebalance_impl);
         this.rebalance_impl.set_rebalance_impl(wrapper);
@@ -523,11 +543,18 @@ impl DefaultMQPushConsumerImpl {
                 *self.service_state = ServiceState::Starting;
                 // check all config. A configuration problem is tagged as such so the recovery
                 // controller can separate "never retry" from "not yet" by type instead of by
-                // message text (plan 50 F3).
+                // message text (plan 50 F3) - but only for a consumer the
+                // controller owns. Tagging every start changed the variant legacy
+                // callers had always matched on, so that translation belongs to the
+                // managed boundary alone (plan 49b R5).
                 if let Err(err) = self.check_config() {
-                    return Err(rocketmq_error::RocketMQError::configuration(format!(
-                        "consumer configuration is invalid: {err}"
-                    )));
+                    return Err(if self.managed_lifecycle.load(Ordering::Acquire) {
+                        rocketmq_error::RocketMQError::configuration(format!(
+                            "consumer configuration is invalid: {err}"
+                        ))
+                    } else {
+                        err
+                    });
                 }
                 //copy_subscription is can be removed
                 self.copy_subscription().await?;
@@ -767,6 +794,13 @@ impl DefaultMQPushConsumerImpl {
         } else {
             std::time::Duration::from_millis(millis)
         }
+    }
+
+    /// Record that the SDK lifecycle controller owns this incarnation. Only then does a
+    /// configuration failure become a typed permanent rejection; a legacy consumer keeps its
+    /// historical error variants.
+    pub(crate) fn mark_managed_lifecycle(&self) {
+        self.managed_lifecycle.store(true, Ordering::Release);
     }
 
     pub(crate) fn set_cleanup_session_ceiling(&self, ceiling: std::time::Duration) {
@@ -1984,6 +2018,10 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
 
 #[cfg(test)]
 mod tests {
+    use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
+    use crate::consumer::mq_push_consumer::MQPushConsumer;
+    use rocketmq_error::RocketMQError;
+
     use std::io::Write;
     use std::process::Command;
     use std::time::Duration;
@@ -2159,5 +2197,36 @@ mod tests {
         let again = consumer.cleanup_progress().expect("session still there");
         assert_eq!(again.phase, progress.phase, "no second pass rewrote the outcome");
         assert!(!again.running && again.proved);
+    }
+    /// Plan 49b R5: translating a configuration failure into the typed variant belongs to the
+    /// managed boundary alone. A legacy consumer has always returned `IllegalArgument` here,
+    /// and callers match on that variant; wrapping it unconditionally was a silent
+    /// public-contract change.
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_start_keeps_its_historical_configuration_error() {
+        let mut legacy = DefaultMQPushConsumer::builder()
+            .consumer_group("group-legacy-config")
+            .subscribe("topic", "*")
+            .consume_thread_min(0)
+            .build();
+        let err = legacy
+            .start()
+            .await
+            .expect_err("an invalid thread bound must be rejected");
+        assert!(matches!(err, RocketMQError::IllegalArgument(_)), "{err:?}");
+
+        // The identical failure under SDK ownership is the typed permanent rejection the controller
+        // needs in order to stop retrying without reading message text.
+        let mut managed = DefaultMQPushConsumer::builder()
+            .consumer_group("group-managed-config")
+            .subscribe("topic", "*")
+            .consume_thread_min(0)
+            .build();
+        managed.mark_managed_lifecycle();
+        let err = managed
+            .start()
+            .await
+            .expect_err("an invalid thread bound must be rejected");
+        assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
     }
 }

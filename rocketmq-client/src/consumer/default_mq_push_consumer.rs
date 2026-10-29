@@ -728,6 +728,15 @@ impl DefaultMQPushConsumer {
             .unwrap_or(std::time::Duration::from_secs(90))
     }
 
+    /// Record that the SDK lifecycle controller owns this consumer, so startup classifies
+    /// configuration failures as permanent typed rejections. Legacy consumers never call this
+    /// and keep their historical error variants (plan 49b R5).
+    pub(crate) fn mark_managed_lifecycle(&mut self) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.mark_managed_lifecycle();
+        }
+    }
+
     pub(crate) fn set_cleanup_session_ceiling(&mut self, ceiling: std::time::Duration) {
         if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
             impl_.set_cleanup_session_ceiling(ceiling);

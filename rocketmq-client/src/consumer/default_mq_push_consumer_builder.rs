@@ -381,7 +381,10 @@ impl DefaultMQPushConsumerBuilder {
     }
 
     // Build method to create a ConsumerConfig instance
-    pub fn build(mut self) -> DefaultMQPushConsumer {
+    /// Project the builder onto the configuration a consumer would run with, creating no consumer,
+    /// no runtime and no client instance. Construction and validation read this one projection
+    /// so they cannot disagree about what "configured" means (plan 49b R5).
+    pub(crate) fn normalized_consumer_config(mut self) -> ConsumerConfig {
         let mut consumer_config = ConsumerConfig::default();
         if let Some(consumer_group) = self.consumer_group {
             consumer_config.consumer_group = consumer_group;
@@ -475,10 +478,15 @@ impl DefaultMQPushConsumerBuilder {
         }
         consumer_config.rpc_hook = self.rpc_hook.clone();
 
-        let mut consumer = DefaultMQPushConsumer::new(self.client_config.take().unwrap_or_default(), consumer_config);
-        if self.topic_sub_expression.0.is_some() && self.topic_sub_expression.1.is_some() {
-            let topic = self.topic_sub_expression.0.take().unwrap();
-            let sub_expression = self.topic_sub_expression.1.take().unwrap();
+        consumer_config
+    }
+
+    pub fn build(mut self) -> DefaultMQPushConsumer {
+        let client_config = self.client_config.take().unwrap_or_default();
+        let topic_sub_expression = (self.topic_sub_expression.0.take(), self.topic_sub_expression.1.take());
+        let consumer_config = self.normalized_consumer_config();
+        let mut consumer = DefaultMQPushConsumer::new(client_config, consumer_config);
+        if let (Some(topic), Some(sub_expression)) = topic_sub_expression {
             consumer.subscribe(&topic, &sub_expression).expect("subscribe failed");
         }
         consumer
