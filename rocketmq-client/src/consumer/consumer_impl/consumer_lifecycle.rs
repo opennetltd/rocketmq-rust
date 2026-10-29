@@ -280,6 +280,11 @@ pub(crate) struct ConsumerProgress {
     last_offset_ms: AtomicU64,
     last_route_ok_ms: AtomicU64,
     last_route_miss_ms: AtomicU64,
+    /// Source of queue epochs for this incarnation. Epochs are never reused: a revoked queue and
+    /// the same queue assigned again must carry different numbers, or a lease claim, retry or
+    /// completion captured under the old assignment would be accepted by the new one (plan 49a
+    /// F4).
+    next_epoch: AtomicU64,
     queues: parking_lot::RwLock<HashMap<MessageQueue, QueueProgress>>,
 }
 
@@ -382,8 +387,11 @@ impl ConsumerProgress {
         }
     }
 
-    /// Publishes a new assignment. Queues seen for the first time, or again after revocation,
-    /// start a fresh epoch; retained queues keep theirs.
+    /// Publishes a new assignment. Queues seen for the first time, or again after revocation, start
+    /// a fresh (strictly newer) epoch. A retained queue is left exactly as it was - same epoch,
+    /// same in-flight lease: publishing an unchanged answer is not evidence that the pull
+    /// already running on that queue finished, and clearing its lease would let a second pull
+    /// stack onto it (plan 49a F4).
     pub(crate) fn note_assignment(&self, assigned: &HashSet<MessageQueue>) {
         let now = get_current_millis();
         self.bump(&self.assignments);
@@ -391,12 +399,17 @@ impl ConsumerProgress {
         let mut queues = self.queues.write();
         for queue in assigned {
             match queues.get_mut(queue) {
-                Some(entry) => entry.pull_leased = false,
+                // Retained: identity and lease are the running work's, not this pass's to reset.
+                Some(_) => {}
                 None => {
+                    // A fresh acquisition always receives a strictly larger epoch than any this
+                    // incarnation handed out before, including the one this queue held when it was
+                    // revoked. Retained queues keep theirs (plan 49a F4 section 4.3 item 2).
+                    let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                     queues.insert(
                         queue.clone(),
                         QueueProgress {
-                            epoch: 1,
+                            epoch,
                             last_progress_ms: now,
                             pull_leased: false,
                         },
@@ -1273,11 +1286,74 @@ mod tests {
         assigned(&progress, 1);
         let q = queue("T", 0);
         assert!(progress.owns(&q));
+        let first_epoch = progress.claim_pull(&q).expect("an assigned queue may pull");
         progress.note_revocation(std::slice::from_ref(&q));
         assert!(!progress.owns(&q));
         assert_eq!(progress.claim_pull(&q), None, "a revoked queue may not pull");
         assigned(&progress, 1);
-        assert_eq!(progress.claim_pull(&q), Some(1), "reassignment starts a fresh epoch");
+
+        // Re-acquisition must be distinguishable from the assignment it replaced: an epoch is the
+        // only identity a queued retry or an in-flight completion carries back.
+        let current_epoch = progress.claim_pull(&q).expect("a reassigned queue may pull again");
+        assert!(
+            current_epoch > first_epoch,
+            "an epoch must never be reused within an incarnation, saw {current_epoch} after {first_epoch}"
+        );
+
+        // A release arriving with the revoked epoch cannot unlock the new lease.
+        progress.release_pull(&q, first_epoch);
+        assert_eq!(
+            progress.claim_pull(&q),
+            None,
+            "a stale release must not free a live lease"
+        );
+        progress.release_pull(&q, current_epoch);
+        assert_eq!(progress.claim_pull(&q), Some(current_epoch));
+    }
+
+    /// Plan 49a F4 section 4.3 item 2: an unchanged rebalance pass must not disturb what a queue
+    /// already owns - its epoch and its in-flight lease - while every later acquisition is
+    /// newer than the last.
+    #[test]
+    fn retained_queues_keep_their_epoch_and_lease_across_unchanged_passes() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 2);
+        let q0 = queue("T", 0);
+        let q1 = queue("T", 1);
+        let epoch = progress.claim_pull(&q0).expect("assigned queue may pull");
+
+        // The same assignment published again: the lease is still held by its owner.
+        assigned(&progress, 2);
+        assert_eq!(
+            progress.claim_pull(&q0),
+            None,
+            "an unchanged pass must not steal a lease"
+        );
+        progress.release_pull(&q0, epoch);
+        assert_eq!(
+            progress.claim_pull(&q0),
+            Some(epoch),
+            "an unchanged pass must keep the queue's epoch"
+        );
+
+        // Revoking one neighbour cannot change the other queue's identity.
+        progress.note_revocation(std::slice::from_ref(&q1));
+        assert_eq!(
+            progress.claim_pull(&q0),
+            None,
+            "unrelated revocation must not free a lease"
+        );
+        let mut previous = epoch;
+        for _ in 0..4 {
+            progress.note_revocation(std::slice::from_ref(&q0));
+            assigned(&progress, 2);
+            let next = progress.claim_pull(&q0).expect("re-acquired queue may pull");
+            assert!(
+                next > previous,
+                "epochs must increase monotonically: {next} <= {previous}"
+            );
+            previous = next;
+        }
     }
 
     #[test]
