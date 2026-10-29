@@ -1217,6 +1217,61 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
+    /// Re-dispatch one pull per queue whose loop was lost (plan 49a F4 section 4.3 item 5), through
+    /// the same pull service as any other request and therefore under that acquisition's lease,
+    /// resuming at the offset this consumer has actually reached rather than at a guessed
+    /// position. Queues no longer owned here are skipped: assignment belongs to rebalance,
+    /// which will place them again.
+    pub(crate) async fn repair_lost_pulls(&mut self, stall_after: std::time::Duration) {
+        let lost = self.progress.lost_pulls(stall_after);
+        if lost.is_empty() {
+            return;
+        }
+        // Snapshot the owned queues first and release the table before any I/O: holding that read
+        // guard across a broker round trip would block rebalance from updating the same table.
+        let owned: Vec<_> = {
+            let table = self
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .read()
+                .await;
+            lost.into_iter()
+                .filter_map(|mq| {
+                    let pq = table.get(&mq)?.clone();
+                    (!pq.is_dropped()).then_some((mq, pq))
+                })
+                .collect()
+        };
+        let mut requests = Vec::new();
+        for (mq, pq) in owned {
+            let commit_offset = match &mut self.offset_store {
+                Some(store) => store.read_offset(&mq, ReadOffsetType::MemoryFirstThenStore).await,
+                None => -1,
+            };
+            // Nothing committed and nothing consumed yet: start where this consumer would have
+            // started on first assignment rather than from an offset nobody has agreed on.
+            let next_offset = if commit_offset >= 0 {
+                commit_offset
+            } else {
+                Rebalance::compute_pull_from_where(self.rebalance_impl.as_mut(), &mq).await
+            };
+            requests.push(PullRequest::new(
+                self.consumer_config.consumer_group.clone(),
+                mq,
+                pq,
+                next_offset,
+            ));
+        }
+        if requests.is_empty() || self.client_instance.is_none() {
+            return;
+        }
+        debug!("re-dispatching {} queue(s) whose pull loop was lost", requests.len());
+        for request in requests {
+            self.execute_pull_request_immediately(request).await;
+        }
+    }
+
     pub(crate) async fn pull_message(&mut self, mut pull_request: PullRequest) {
         let Some(_work) = self.work.enter() else { return };
         //let process_queue = pull_request.get_process_queue_mut();

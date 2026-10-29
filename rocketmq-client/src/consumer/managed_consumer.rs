@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -49,6 +50,7 @@ use crate::consumer::consumer_impl::consumer_lifecycle::MachineState;
 use crate::consumer::consumer_impl::consumer_lifecycle::ProgressSnapshot;
 use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
 use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
+use crate::consumer::consumer_impl::consumer_lifecycle::RepairKind;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consumer_identity;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::validate_consumer_config;
@@ -1023,11 +1025,20 @@ async fn run_incarnation(
                         return IncarnationEnd::StopRequested;
                     }
                 }
-                Effect::Repair(_kind) => {
+                Effect::Repair(kind) => {
+                    // The kind decides what is repaired: a lost pull goes straight back through the
+                    // pull service, while route and assignment faults take the
+                    // coalesced refresh path.
+                    let repair: Pin<Box<dyn Future<Output = ()> + Send>> = match kind {
+                        RepairKind::LostPull => Box::pin(consumer.repair_lost_pulls(stall_after())),
+                        RepairKind::RouteAndPull | RepairKind::Assignment => {
+                            Box::pin(consumer.repair_routes_and_rebalance())
+                        }
+                    };
                     tokio::select! {
                         biased;
                         _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
-                        _ = consumer.repair_routes_and_rebalance() => {}
+                        _ = repair => {}
                         _ = ticker.tick(), if !cadence_consumed => {
                             cadence_consumed = true;
                             effects.push_front(effect);

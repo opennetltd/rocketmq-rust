@@ -692,6 +692,16 @@ impl DefaultMQPushConsumer {
         instance.re_balance_immediately();
     }
 
+    /// Re-dispatch the pulls that were lost, if any (plan 49a F4 section 4.3 item 5). Used by the
+    /// recovery controller when a queue this consumer owns stopped having a pull request in
+    /// flight.
+    pub(crate) async fn repair_lost_pulls(&mut self, stall_after: std::time::Duration) {
+        let Some(impl_) = self.default_mqpush_consumer_impl.as_mut() else {
+            return;
+        };
+        impl_.repair_lost_pulls(stall_after).await;
+    }
+
     /// Where this consumer's single cleanup session stands, or `None` while no stop has been
     /// requested. Reading it cannot start, restart, or cancel the pass.
     pub(crate) fn cleanup_progress(&self) -> Option<crate::consumer::cleanup_session::CleanupProgress> {

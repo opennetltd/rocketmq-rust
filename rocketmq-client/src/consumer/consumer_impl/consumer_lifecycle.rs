@@ -187,6 +187,11 @@ pub(crate) struct ProgressSnapshot {
     pub started_at_ms: u64,
     pub assigned_queues: u64,
     pub stalled_queues: u64,
+    /// Queues this incarnation owns whose pull loop is not running and is not advancing.
+    pub lost_pull_queues: u64,
+    /// Queues with a pull request in flight right now; the only honest evidence of an outstanding
+    /// long poll.
+    pub leased_queues: u64,
     pub pulls_started: u64,
     pub pulls_completed: u64,
     pub pulls_empty: u64,
@@ -222,9 +227,11 @@ impl ProgressSnapshot {
         self.pending_delivery_msgs > 0 || self.active_callbacks > 0
     }
 
-    /// A long poll that is still inside its own deadline is an expected wait, not silence.
+    /// A long poll that is still inside its own deadline is an expected wait, not silence. Judged
+    /// by a queue actually holding its pull lease now, not by lifetime counters that stay
+    /// unequal forever (plan 49a F4 section 4.3 item 4).
     pub(crate) fn pull_within_deadline(&self, deadline: Duration) -> bool {
-        self.pulls_started > self.pulls_completed && self.age_ms(self.last_pull_ms) < deadline
+        self.leased_queues > 0 && self.age_ms(self.last_pull_ms) < deadline
     }
 
     /// Counters that moved since `previous`; used to prove progress rather than trust a timer.
@@ -521,6 +528,25 @@ impl ConsumerProgress {
         self.queues.read().contains_key(queue)
     }
 
+    /// How long a queue may stay silent before its pull loop counts as lost or as stalled. Derived
+    /// from the consumer's own long-poll reserve so it adapts when an application tunes that
+    /// timeout.
+    /// Queues this incarnation owns whose pull loop is neither running nor advancing: the request
+    /// was dropped, its delayed retry never arrived, or a callback finished without
+    /// re-dispatching (plan 49a F4 section 4.3 item 5). A queue holding its lease is an
+    /// outstanding pull and not a lost one, however old its last answer looks: the RPC timeout
+    /// bounds it.
+    pub(crate) fn lost_pulls(&self, stall_after: Duration) -> Vec<MessageQueue> {
+        let now_ms = get_current_millis();
+        let window = u64::try_from(stall_after.as_millis()).unwrap_or(u64::MAX);
+        self.queues
+            .read()
+            .iter()
+            .filter(|(_, entry)| !entry.pull_leased && now_ms.saturating_sub(entry.last_progress_ms) >= window)
+            .map(|(queue, _)| queue.clone())
+            .collect()
+    }
+
     pub(crate) fn assigned_queues(&self) -> u64 {
         self.queues.read().len() as u64
     }
@@ -529,15 +555,27 @@ impl ConsumerProgress {
         let now_ms = get_current_millis();
         let queues = self.queues.read();
         let stall = u64::try_from(stall_after.as_millis()).unwrap_or(u64::MAX);
-        let stalled_queues = queues
-            .values()
-            .filter(|entry| now_ms.saturating_sub(entry.last_progress_ms) >= stall)
-            .count() as u64;
+        let mut stalled_queues = 0u64;
+        let mut lost_pull_queues = 0u64;
+        let mut leased_queues = 0u64;
+        for entry in queues.values() {
+            let silent = now_ms.saturating_sub(entry.last_progress_ms) >= stall;
+            if entry.pull_leased {
+                leased_queues += 1;
+            } else if silent {
+                lost_pull_queues += 1;
+            }
+            if silent {
+                stalled_queues += 1;
+            }
+        }
         ProgressSnapshot {
             now_ms,
             started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
             assigned_queues: queues.len() as u64,
             stalled_queues,
+            lost_pull_queues,
+            leased_queues,
             pulls_started: self.pulls_started.load(Ordering::Relaxed),
             pulls_completed: self.pulls_completed.load(Ordering::Relaxed),
             pulls_empty: self.pulls_empty.load(Ordering::Relaxed),
@@ -605,6 +643,9 @@ pub(crate) enum RepairKind {
     RouteAndPull,
     /// Refresh assignment through the existing rebalance path.
     Assignment,
+    /// Re-dispatch the pull of a queue whose loop was lost, at this consumer's committed offset,
+    /// under that acquisition's lease (plan 49a F4 section 4.3 item 5).
+    LostPull,
 }
 
 /// Phase/health pair derived by the machine; `managed_consumer` projects it into the public
@@ -875,24 +916,9 @@ impl RecoveryMachine {
             };
             return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
-        if snapshot.pulls_empty > 0 && !snapshot.has_pending_work() && snapshot.stalled_queues == 0 {
-            self.state = MachineState {
-                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
-                reason: Reason::IdleNoMessages,
-            };
-            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-        }
-
-        // Expected waits: an outstanding long poll inside its deadline, or deliberate flow control.
-        if snapshot.pull_within_deadline(pull_deadline) {
-            self.state = MachineState {
-                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
-                reason: Reason::LongPollPending,
-            };
-            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-        }
+        // Per-queue faults are evaluated before any aggregate "everything is fine" answer, so that
+        // a live long poll on one queue cannot hide a stalled callback or a lost pull loop
+        // on another (plan 49a F4 section 4.3 item 4).
 
         // Pending messages whose callbacks do not advance.
         if snapshot.has_pending_work() {
@@ -915,6 +941,52 @@ impl RecoveryMachine {
                 };
                 return (self.state, vec![Effect::Repair(RepairKind::RouteAndPull)]);
             }
+        }
+
+        // A queue this incarnation owns whose pull loop is neither running nor advancing. Judged
+        // per queue and by current state rather than by lifetime counters, so one busy
+        // queue cannot excuse an idle neighbour and a healthy past cannot excuse a stopped
+        // present (plan 49a F4 section 4.3 item 5).
+        if snapshot.lost_pull_queues > 0 && !progressed {
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
+                reason: Reason::ExpectedPullMissing,
+            };
+            self.stalled_repairs = self.stalled_repairs.saturating_add(1);
+            if self.stalled_repairs > self.policy.max_repairs_before_replace {
+                self.stalled_repairs = 0;
+                return (self.state, vec![Effect::Stop { grace: Duration::ZERO }]);
+            }
+            return (
+                self.state,
+                vec![
+                    Effect::Repair(RepairKind::LostPull),
+                    Effect::Idle(self.policy.progress_check),
+                ],
+            );
+        }
+
+        // Expected waits: successful empty pulls, or an outstanding long poll inside its deadline.
+        if snapshot.pulls_empty > 0 && !snapshot.has_pending_work() && snapshot.stalled_queues == 0 {
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
+                reason: Reason::IdleNoMessages,
+            };
+            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
+        }
+        if snapshot.pull_within_deadline(pull_deadline) {
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
+                reason: Reason::LongPollPending,
+            };
+            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
+        }
+
+        // Pending work that is advancing: busy rather than blocked.
+        if snapshot.has_pending_work() {
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -930,8 +1002,6 @@ impl RecoveryMachine {
             Some(Reason::RpcTimeout)
         } else if snapshot.revocations > 0 && snapshot.assigned_queues == 0 && !progressed {
             Some(Reason::AssignmentRefreshFailed)
-        } else if snapshot.pulls_started > snapshot.pulls_completed && !progressed {
-            Some(Reason::ExpectedPullMissing)
         } else {
             None
         };
@@ -1432,6 +1502,65 @@ mod tests {
             .expect("a reassigned queue may pull again");
         assert!(fresh.epoch() > epoch, "the new acquisition has its own identity");
         assert!(!progress.is_current(&q, epoch), "an expired lease cannot publish");
+    }
+
+    /// Plan 49a F4 section 4.3 item 4: a live long poll on one queue must not aggregate away a
+    /// neighbour whose pull loop is gone, and the fault has to name the missing pull instead of
+    /// reporting health.
+    #[test]
+    fn a_live_long_poll_does_not_hide_a_lost_pull_on_another_queue() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 2);
+        // Queue 0 holds an outstanding long poll; queue 1 has no request in flight and is not
+        // advancing.
+        let live = queue("T", 0);
+        assert!(progress.claim_pull(&live).is_some());
+        progress.note_pull_started(&live);
+
+        // Let a one-millisecond silence window pass: both queues are now silent, and what tells
+        // them apart is that one still has its request in flight. Ageing only moves one
+        // way, so the expectation cannot depend on how long the scheduler takes.
+        std::thread::sleep(Duration::from_millis(5));
+        let before = progress.snapshot(Duration::from_millis(1));
+        let snap = progress.snapshot(Duration::from_millis(1));
+        assert_eq!(snap.leased_queues, 1, "one queue is actively pulling");
+        assert_eq!(snap.lost_pull_queues, 1, "the other queue lost its pull loop");
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        // Two passes with identical counters: nothing moved between them, so silence here is
+        // evidence rather than the absence of an observation.
+        assert!(!snap.progressed_since(&before));
+        let (state, effects) = machine.on_tick(&snap, Some(&before), Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::ExpectedPullMissing);
+        assert_eq!(
+            state.health,
+            crate::consumer::managed_consumer::ConsumerHealth::Degraded
+        );
+        assert!(
+            matches!(effects.first(), Some(Effect::Repair(RepairKind::LostPull))),
+            "the repair must re-dispatch the lost pull rather than refresh routes: {effects:?}"
+        );
+    }
+
+    /// A queue holding its lease is an outstanding pull, not a lost one, however old its last
+    /// answer looks; otherwise every slow long poll would look like a dead loop.
+    #[test]
+    fn an_outstanding_pull_is_never_counted_as_lost() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 1);
+        let q = queue("T", 0);
+        assert!(progress.claim_pull(&q).is_some());
+        progress.note_pull_started(&q);
+        // Let the silence window pass while the request stays in flight: what keeps this queue from
+        // being called lost is the held lease and nothing else.
+        std::thread::sleep(Duration::from_millis(5));
+        let snap = progress.snapshot(Duration::from_millis(1));
+        assert_eq!(snap.stalled_queues, 1, "it has been silent for a while");
+        assert_eq!(snap.lost_pull_queues, 0, "but the request is still in flight");
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, _) = machine.on_tick(&snap, None, Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::LongPollPending);
     }
 
     #[test]
