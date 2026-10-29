@@ -20,6 +20,7 @@
 //! consumer never requests a host restart and never exits the process: the controller reports
 //! `ConfigurationError`/`Blocked` and stops creating work instead.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::pin::Pin;
@@ -27,6 +28,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+use cheetah_string::CheetahString;
 use std::sync::Weak;
 use std::task::Context;
 use std::task::Poll;
@@ -277,7 +280,7 @@ impl ManagedConsumerSpec {
         // supplied through the builder keeps running behind it.
         let sdk_tracker: Arc<Box<dyn MessageQueueListener>> = Arc::new(Box::new(AssignmentTracker {
             progress: Arc::clone(&progress),
-            known: parking_lot::Mutex::new(HashSet::new()),
+            topics: parking_lot::Mutex::new(HashMap::new()),
         }));
         let composed: Arc<Box<dyn MessageQueueListener>> = match builder.take_message_queue_listener() {
             Some(app) => Arc::new(Box::new(CompositeQueueListener {
@@ -341,22 +344,26 @@ impl MessageQueueListener for CompositeQueueListener {
 
 /// Feeds assignment and revocation transitions into the SDK progress bus. This is how the SDK
 /// itself observes "assignment observed" instead of relying on an application observer.
+///
+/// The callback arrives once per topic carrying only that topic's queues, so each topic's previous
+/// answer is kept under its own key (plan 49a F4 section 4.3 item 1). One accumulated set for the
+/// whole consumer cannot express that: publishing topic B's allocation would report every queue of
+/// topic A as revoked, dropping live queues - and their epochs and stall evidence - out of progress
+/// on each unrelated rebalance pass. Entries are bounded by the consumer's subscription set.
 struct AssignmentTracker {
     progress: Arc<ConsumerProgress>,
-    known: parking_lot::Mutex<HashSet<MessageQueue>>,
+    topics: parking_lot::Mutex<HashMap<CheetahString, HashSet<MessageQueue>>>,
 }
 
 impl MessageQueueListener for AssignmentTracker {
-    fn message_queue_changed(
-        &self,
-        _topic: &str,
-        _mq_all: &HashSet<MessageQueue>,
-        mq_assigned: &HashSet<MessageQueue>,
-    ) {
+    fn message_queue_changed(&self, topic: &str, _mq_all: &HashSet<MessageQueue>, mq_assigned: &HashSet<MessageQueue>) {
         let (revoked, assigned) = {
-            let mut known = self.known.lock();
-            let revoked: Vec<MessageQueue> = known.difference(mq_assigned).cloned().collect();
-            known.extend(mq_assigned.iter().cloned());
+            let mut topics = self.topics.lock();
+            let previous = topics.insert(CheetahString::from_slice(topic), mq_assigned.clone());
+            // Only this topic's earlier answer may be revoked by this topic's new answer.
+            let revoked: Vec<MessageQueue> = previous
+                .map(|previous| previous.difference(mq_assigned).cloned().collect())
+                .unwrap_or_default();
             (revoked, mq_assigned.clone())
         };
         self.progress.note_revocation(&revoked);
@@ -1117,6 +1124,54 @@ mod tests {
                 .subscribe("topic", "*"),
         )
         .with_listener(Arc::new(|_msgs, _ctx| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)))
+    }
+
+    /// Plan 49a F4 section 4.3 item 1: `message_queue_changed` is invoked per topic with only that
+    /// topic's queues, so an allocation for one topic must never revoke another topic's queues.
+    #[test]
+    fn assignment_tracking_is_scoped_to_the_topic_that_changed() {
+        let progress = ConsumerProgress::new();
+        let tracker = AssignmentTracker {
+            progress: Arc::clone(&progress),
+            topics: parking_lot::Mutex::new(HashMap::new()),
+        };
+        let a0 = MessageQueue::from_parts("TopicA", "broker-a", 0);
+        let a1 = MessageQueue::from_parts("TopicA", "broker-a", 1);
+        let b0 = MessageQueue::from_parts("TopicB", "broker-b", 0);
+
+        tracker.message_queue_changed("TopicA", &HashSet::new(), &HashSet::from([a0.clone(), a1.clone()]));
+        tracker.message_queue_changed("TopicB", &HashSet::new(), &HashSet::from([b0.clone()]));
+
+        assert!(progress.owns(&a0) && progress.owns(&a1), "topic B displaced topic A");
+        assert!(progress.owns(&b0));
+        assert_eq!(3, progress.assigned_queues());
+    }
+
+    /// A shrinking allocation revokes exactly the queues this topic no longer owns.
+    #[test]
+    fn a_shrinking_allocation_revokes_only_that_topics_queues() {
+        let progress = ConsumerProgress::new();
+        let tracker = AssignmentTracker {
+            progress: Arc::clone(&progress),
+            topics: parking_lot::Mutex::new(HashMap::new()),
+        };
+        let a0 = MessageQueue::from_parts("TopicA", "broker-a", 0);
+        let a1 = MessageQueue::from_parts("TopicA", "broker-a", 1);
+        let b0 = MessageQueue::from_parts("TopicB", "broker-b", 0);
+
+        tracker.message_queue_changed("TopicA", &HashSet::new(), &HashSet::from([a0.clone(), a1.clone()]));
+        tracker.message_queue_changed("TopicB", &HashSet::new(), &HashSet::from([b0.clone()]));
+        tracker.message_queue_changed("TopicA", &HashSet::new(), &HashSet::from([a0.clone()]));
+
+        assert!(!progress.owns(&a1), "the dropped queue must be gone");
+        assert!(progress.owns(&a0), "the retained queue must survive");
+        assert!(progress.owns(&b0), "an unrelated topic must be untouched");
+        assert_eq!(2, progress.assigned_queues());
+
+        // An unchanged pass changes nothing at all.
+        tracker.message_queue_changed("TopicA", &HashSet::new(), &HashSet::from([a0.clone()]));
+        assert!(progress.owns(&a0) && progress.owns(&b0));
+        assert_eq!(2, progress.assigned_queues());
     }
 
     #[test]
