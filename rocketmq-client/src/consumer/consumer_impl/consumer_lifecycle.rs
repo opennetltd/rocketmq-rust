@@ -515,6 +515,30 @@ impl ConsumerProgress {
     }
 }
 
+/// Outcome of one synchronous user-code invocation.
+#[derive(Debug)]
+pub(crate) enum ListenerCall<T> {
+    Returned(T),
+    /// The listener unwound instead of returning. Nothing downstream may assume the messages or the
+    /// consume context were left untouched, so callers treat it as failed consumption.
+    ThrewPanic,
+}
+
+/// Run a synchronous listener call with an unwinding panic converted into a value instead of
+/// letting it reach the task root (plan 49a F5 section 4.4 item 2). User code may abort through a
+/// foreign frame or simply panic; either way the batch must still be recorded as failed consumption
+/// and released, which is what the caller's existing retry/send-back path and delivery guard do
+/// once the call returns normally.
+pub(crate) fn call_listener_catching<T, F>(call: F) -> ListenerCall<T>
+where
+    F: FnOnce() -> T,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(value) => ListenerCall::Returned(value),
+        Err(_) => ListenerCall::ThrewPanic,
+    }
+}
+
 /// What the controller should do next. Effects are executed by the async shell; the machine
 /// itself never performs I/O and never holds a resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1314,6 +1338,37 @@ mod tests {
     /// Plan 49a F4 section 4.3 item 2: an unchanged rebalance pass must not disturb what a queue
     /// already owns - its epoch and its in-flight lease - while every later acquisition is
     /// newer than the last.
+    /// Plan 49a F5 section 4.4 item 2: a listener that unwinds must be data, not a dead task, and
+    /// the batch accounting must still unwind with it.
+    #[test]
+    fn a_panicking_listener_is_returned_as_a_failed_call() {
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = call_listener_catching(|| -> u32 { panic!("listener exploded") });
+        std::panic::set_hook(quiet);
+        assert!(matches!(outcome, ListenerCall::ThrewPanic));
+
+        // Accounting attached to the frame is released by the same unwind.
+        struct Released(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        call_listener_catching(|| {
+            let _guard = Released(released.clone());
+            panic!("listener exploded");
+        });
+        std::panic::set_hook(quiet);
+        assert!(released.load(Ordering::SeqCst), "the batch guard must unwind too");
+
+        // A listener that returns normally is untouched by the wrapper.
+        assert!(matches!(call_listener_catching(|| 7u32), ListenerCall::Returned(7)));
+    }
+
     #[test]
     fn retained_queues_keep_their_epoch_and_lease_across_unchanged_passes() {
         let progress = ConsumerProgress::new();

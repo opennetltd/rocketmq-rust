@@ -37,6 +37,8 @@ use crate::base::client_config::ClientConfig;
 use crate::consumer::ack_callback::AckCallback;
 use crate::consumer::ack_result::AckResult;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
+use crate::consumer::consumer_impl::consumer_lifecycle::call_listener_catching;
+use crate::consumer::consumer_impl::consumer_lifecycle::ListenerCall;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -111,15 +113,23 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopConcurrentlyService {
 
         let begin_timestamp = Instant::now();
 
-        let status = self.message_listener.consume_message(
-            &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>(),
-            &mut context,
-        );
+        // A panicking listener must still return a result to its caller (plan 49a F5).
+        let status = call_listener_catching(|| {
+            self.message_listener.consume_message(
+                &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>(),
+                &mut context,
+            )
+        });
         let mut result = ConsumeMessageDirectlyResult::default();
         result.set_order(false);
         result.set_auto_commit(true);
         match status {
-            Ok(status) => match status {
+            ListenerCall::ThrewPanic => {
+                error!("message listener panicked while consuming directly, reporting a thrown exception");
+                result.set_consume_result(CMResult::CRThrowException);
+                result.set_remark(CheetahString::from_static_str("listener panicked"));
+            }
+            ListenerCall::Returned(Ok(status)) => match status {
                 ConsumeConcurrentlyStatus::ConsumeSuccess => {
                     result.set_consume_result(CMResult::CRSuccess);
                 }
@@ -127,7 +137,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopConcurrentlyService {
                     result.set_consume_result(CMResult::CRLater);
                 }
             },
-            Err(e) => {
+            ListenerCall::Returned(Err(e)) => {
                 result.set_consume_result(CMResult::CRThrowException);
                 result.set_remark(CheetahString::from_string(e.to_string()))
             }
@@ -416,11 +426,21 @@ impl ConsumeRequest {
             default_mqpush_consumer_impl.execute_hook_before(&mut consume_message_context);
         }
         let vec = self.msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>();
-        match self.message_listener.consume_message(&vec, &mut context) {
-            Ok(value) => {
+        match call_listener_catching(|| self.message_listener.consume_message(&vec, &mut context)) {
+            ListenerCall::Returned(Ok(value)) => {
                 status = Some(value);
             }
-            Err(_) => {
+            ListenerCall::Returned(Err(_)) => {
+                has_exception = true;
+            }
+            // Plan 49a F5: an unwinding listener is failed consumption, not a dead task. Leaving `status`
+            // unset routes the batch through the same retry/send-back path an exception uses.
+            ListenerCall::ThrewPanic => {
+                error!(
+                    "message listener panicked, treating {} message(s) as failed consumption, mq={}",
+                    self.msgs.len(),
+                    self.message_queue
+                );
                 has_exception = true;
             }
         }

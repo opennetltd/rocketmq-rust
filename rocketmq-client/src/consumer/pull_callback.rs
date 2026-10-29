@@ -127,10 +127,18 @@ impl PullCallback for DefaultPullCallback {
         let subscription_data = self.subscription_data.take().unwrap();
         let mut pull_request = self.pull_request.take().unwrap();
 
-        // SDK-owned progress observation (plan 49 section 4.2): a response for an owned queue is
-        // progress whether or not it carried messages, and anything handed to the delivery layer
-        // stays counted until its listener returns, so a stalled callback cannot look like
-        // idleness.
+        push_consumer_impl
+            .pull_api_wrapper
+            .as_mut()
+            .unwrap()
+            .process_pull_result(&message_queue_inner, &mut pull_result_ext, &subscription_data);
+
+        // SDK-owned progress observation (plan 49 section 4.2, plan 49a F5 section 4.4 item 1): a
+        // response for an owned queue is progress whether or not it carried messages.
+        // Whether the pull "found" anything is read from the decoded result, because
+        // process_pull_result is what decodes the wire bytes and drops messages this
+        // subscription does not match; before that call the list does not exist yet, so a
+        // delivered batch used to be recorded as an empty pull.
         {
             let found = matches!(pull_result_ext.pull_result.pull_status, PullStatus::Found)
                 && pull_result_ext
@@ -138,23 +146,10 @@ impl PullCallback for DefaultPullCallback {
                     .msg_found_list
                     .as_ref()
                     .is_some_and(|list| !list.is_empty());
-            let pending = pull_result_ext
-                .pull_result
-                .msg_found_list
-                .as_ref()
-                .map_or(0, |list| list.len());
-            let progress = &push_consumer_impl.progress;
-            progress.note_pull_completed(&message_queue_inner, found);
-            if pending > 0 {
-                progress.note_delivery_pending(pending as u64);
-            }
+            push_consumer_impl
+                .progress
+                .note_pull_completed(&message_queue_inner, found);
         }
-
-        push_consumer_impl
-            .pull_api_wrapper
-            .as_mut()
-            .unwrap()
-            .process_pull_result(&message_queue_inner, &mut pull_result_ext, &subscription_data);
         match pull_result_ext.pull_result.pull_status {
             PullStatus::Found => {
                 let prev_request_offset = pull_request.next_offset;
@@ -179,6 +174,17 @@ impl PullCallback for DefaultPullCallback {
                         .unwrap()
                         .queue_offset;
                     let vec = pull_result_ext.pull_result.msg_found_list.clone();
+                    // Pending work is counted here, from the very list handed to put_message and
+                    // submit_consume_request below, because that batch's delivery guard releases
+                    // exactly this many messages. Counting the
+                    // undecoded/filtered list instead either missed every delivered
+                    // batch - hiding a stalled listener as idleness - or kept filtered-out messages
+                    // pending forever (plan 49a F5 section 4.4 item 1).
+                    if let Some(list) = vec.as_ref() {
+                        if !list.is_empty() {
+                            push_consumer_impl.progress.note_delivery_pending(list.len() as u64);
+                        }
+                    }
                     let dispatch_to_consume = pull_request.process_queue.put_message(vec.unwrap_or_default()).await;
                     push_consumer_impl
                         .consume_message_service

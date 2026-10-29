@@ -25,11 +25,14 @@ use rocketmq_remoting::protocol::body::cm_result::CMResult;
 use rocketmq_remoting::protocol::body::consume_message_directly_result::ConsumeMessageDirectlyResult;
 use rocketmq_runtime::RocketMQRuntime;
 use rocketmq_rust::ArcMut;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
+use crate::consumer::consumer_impl::consumer_lifecycle::call_listener_catching;
+use crate::consumer::consumer_impl::consumer_lifecycle::ListenerCall;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -120,15 +123,23 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopOrderlyService {
 
         let begin_timestamp = Instant::now();
 
-        let status = self.message_listener.consume_message(
-            &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..],
-            &mut context,
-        );
+        // A panicking listener must still return a result to its caller (plan 49a F5).
+        let status = call_listener_catching(|| {
+            self.message_listener.consume_message(
+                &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..],
+                &mut context,
+            )
+        });
         let mut result = ConsumeMessageDirectlyResult::default();
         result.set_order(true);
         result.set_auto_commit(context.is_auto_commit());
         match status {
-            Ok(status) => match status {
+            ListenerCall::ThrewPanic => {
+                error!("message listener panicked while consuming directly, reporting a thrown exception");
+                result.set_consume_result(CMResult::CRThrowException);
+                result.set_remark(CheetahString::from_static_str("listener panicked"));
+            }
+            ListenerCall::Returned(Ok(status)) => match status {
                 ConsumeOrderlyStatus::Success => {
                     result.set_consume_result(CMResult::CRSuccess);
                 }
@@ -142,7 +153,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessagePopOrderlyService {
                     result.set_consume_result(CMResult::CRLater);
                 }
             },
-            Err(e) => {
+            ListenerCall::Returned(Err(e)) => {
                 result.set_consume_result(CMResult::CRThrowException);
                 result.set_remark(CheetahString::from_string(e.to_string()))
             }

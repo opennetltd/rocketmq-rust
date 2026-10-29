@@ -32,11 +32,14 @@ use rocketmq_remoting::protocol::heartbeat::message_model::MessageModel;
 use rocketmq_runtime::RocketMQRuntime;
 use rocketmq_rust::ArcMut;
 use rocketmq_rust::RocketMQTokioMutex;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
+use crate::consumer::consumer_impl::consumer_lifecycle::call_listener_catching;
+use crate::consumer::consumer_impl::consumer_lifecycle::ListenerCall;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -381,15 +384,23 @@ impl ConsumeMessageServiceTrait for ConsumeMessageOrderlyService {
 
         let begin_timestamp = Instant::now();
 
-        let status = self.message_listener.consume_message(
-            &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..],
-            &mut context,
-        );
+        // A panicking listener must still return a result to its caller (plan 49a F5).
+        let status = call_listener_catching(|| {
+            self.message_listener.consume_message(
+                &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..],
+                &mut context,
+            )
+        });
         let mut result = ConsumeMessageDirectlyResult::default();
         result.set_order(true);
         result.set_auto_commit(context.is_auto_commit());
         match status {
-            Ok(status) => match status {
+            ListenerCall::ThrewPanic => {
+                error!("message listener panicked while consuming directly, reporting a thrown exception");
+                result.set_consume_result(CMResult::CRThrowException);
+                result.set_remark(CheetahString::from_static_str("listener panicked"));
+            }
+            ListenerCall::Returned(Ok(status)) => match status {
                 ConsumeOrderlyStatus::Success => {
                     result.set_consume_result(CMResult::CRSuccess);
                 }
@@ -403,7 +414,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessageOrderlyService {
                     result.set_consume_result(CMResult::CRLater);
                 }
             },
-            Err(e) => {
+            ListenerCall::Returned(Err(e)) => {
                 result.set_consume_result(CMResult::CRThrowException);
                 result.set_remark(CheetahString::from_string(e.to_string()))
             }
@@ -574,14 +585,26 @@ impl ConsumeRequest {
                 }
                 let vec = &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..];
 
-                match consume_message_orderly_service_inner
-                    .message_listener
-                    .consume_message(vec, &mut context)
-                {
-                    Ok(value) => {
+                match call_listener_catching(|| {
+                    consume_message_orderly_service_inner
+                        .message_listener
+                        .consume_message(vec, &mut context)
+                }) {
+                    ListenerCall::Returned(Ok(value)) => {
                         status = Some(value);
                     }
-                    Err(_) => {
+                    ListenerCall::Returned(Err(_)) => {
+                        has_exception = true;
+                    }
+                    // Plan 49a F5: unwinding here would skip the `drop(consume_lock)` below and leave the
+                    // queue locked until its lock lease expires. Record it as an exception instead and let
+                    // the orderly retry path run.
+                    ListenerCall::ThrewPanic => {
+                        error!(
+                            "orderly message listener panicked, treating {} message(s) as failed consumption, mq={}",
+                            msgs.len(),
+                            self.message_queue
+                        );
                         has_exception = true;
                     }
                 }
