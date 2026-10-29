@@ -48,6 +48,93 @@ pub struct RemoteBrokerOffsetStore {
 }
 
 impl RemoteBrokerOffsetStore {
+    /// One pass over the assigned offsets, shared by the periodic task and cleanup so their
+    /// snapshot and write primitive cannot drift apart (plan 49a F10). `deadline` bounds each
+    /// individual write; `cancelled` is consulted between queues - never during a write - so a
+    /// consumer that is stopping stops issuing new writes without waiting for its siblings or
+    /// the client's scheduled task.
+    ///
+    /// Writes stay one at a time on purpose: the client handle is borrowed mutably per write, so
+    /// there is never more than one in-flight write nor two mutable aliases of the same client.
+    async fn run_pass(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        deadline: Option<TokioInstant>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> PersistSummary {
+        let mut summary = PersistSummary::default();
+        if mqs.is_empty() {
+            return summary;
+        }
+        // Snapshot only the assigned offsets once; the table lock is never held across I/O.
+        let pending = self.snapshot_assigned(mqs).await;
+        let total = pending.len() as u64;
+        for (index, (mq, offset)) in pending.into_iter().enumerate() {
+            let remaining_here = total - index as u64;
+            if cancelled() {
+                // The consumer is stopping: report the rest instead of writing on its behalf.
+                summary.skipped += remaining_here;
+                break;
+            }
+            let (timeout, budget) = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+                    let timeout = offset_rpc_timeout(remaining);
+                    if timeout == 0 {
+                        // No budget: report it instead of starting a write that would be cut off.
+                        summary.skipped += remaining_here;
+                        break;
+                    }
+                    (timeout, remaining)
+                }
+                None => (
+                    OFFSET_WRITE_TIMEOUT_MILLIS,
+                    std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS),
+                ),
+            };
+            summary.attempted += 1;
+            // A one-way write is best effort and cannot be confirmed, so finishing its dispatch is
+            // the most this pass can claim.
+            let step = self.write_offset(&mq, offset, true, timeout);
+            match tokio::time::timeout(budget, step).await {
+                Ok(Ok(())) => summary.succeeded += 1,
+                Ok(Err(e)) => {
+                    debug!("[persistAll] updateConsumeOffsetToBroker failed, {},{}", mq, e);
+                    summary.failed += 1;
+                }
+                Err(_) => {
+                    debug!("[persistAll] offset write cut off by its budget, {}", mq);
+                    summary.failed += 1;
+                }
+            }
+        }
+        self.report_pass(&summary);
+        summary
+    }
+
+    /// One bounded line per pass rather than one per queue: two hundred fifty-six assigned queues
+    /// must not produce two hundred fifty-six log lines every five seconds (plan 49a F10).
+    fn report_pass(&self, summary: &PersistSummary) {
+        if summary.attempted == 0 && summary.skipped == 0 {
+            return;
+        }
+        debug!(
+            "[persistAll] Group: {} ClientId: {} offset pass {}",
+            self.group_name, self.client_instance.client_id, summary
+        );
+        if let Some(suppressed) = self
+            .client_instance
+            .log_gate()
+            .try_acquire(&format!("offset-persist:{}", self.group_name))
+        {
+            info!(
+                "[persistAll] Group: {} ClientId: {} persisted assigned offsets ({}), suppressed {} identical \
+                 summaries",
+                self.group_name, self.client_instance.client_id, summary, suppressed
+            );
+        }
+    }
+
     pub fn new(client_instance: ArcMut<MQClientInstance>, group_name: CheetahString) -> Self {
         Self {
             client_instance,
@@ -255,58 +342,16 @@ impl OffsetStoreTrait for RemoteBrokerOffsetStore {
         -3
     }
 
-    /// Writes assigned offsets one at a time. Sequential on purpose: the client handle is borrowed
-    /// mutably per write, so there is never more than one in-flight write (and therefore never more
-    /// than the eight the cleanup budget allows) nor two mutable aliases of the same client.
     async fn persist_all_until(&mut self, mqs: &HashSet<MessageQueue>, deadline: TokioInstant) -> PersistSummary {
-        let mut summary = PersistSummary::default();
-        // Snapshot only the assigned offsets once; the table lock is never held across I/O.
-        let pending = self.snapshot_assigned(mqs).await;
-        for (mq, offset) in pending {
-            let remaining = deadline.saturating_duration_since(TokioInstant::now());
-            let timeout = offset_rpc_timeout(remaining);
-            if timeout == 0 {
-                // No budget: report it instead of starting a write that would be cut off.
-                summary.skipped += 1;
-                continue;
-            }
-            summary.attempted += 1;
-            // A one-way write is best effort and cannot be confirmed, so finishing its dispatch is
-            // the most this pass can claim.
-            let step = self.write_offset(&mq, offset, true, timeout);
-            match tokio::time::timeout(remaining, step).await {
-                Ok(Ok(())) => summary.succeeded += 1,
-                Ok(Err(e)) => {
-                    debug!("[persistAll] updateConsumeOffsetToBroker failed, {},{}", mq, e);
-                    summary.failed += 1;
-                }
-                Err(_) => {
-                    debug!("[persistAll] offset write cut off by the cleanup deadline, {}", mq);
-                    summary.failed += 1;
-                }
-            }
-        }
-        summary
+        self.run_pass(mqs, Some(deadline), &|| false).await
     }
 
-    async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>) {
-        if mqs.is_empty() {
-            return;
-        }
-        let used_mq = self.snapshot_assigned(mqs).await;
-        for (mq, offset) in used_mq {
-            match self.update_consume_offset_to_broker(&mq, offset, true).await {
-                Ok(_) => {
-                    info!(
-                        "[persistAll] Group: {} ClientId: {} updateConsumeOffsetToBroker {} {}",
-                        self.group_name, self.client_instance.client_id, mq, offset
-                    );
-                }
-                Err(e) => {
-                    error!("updateConsumeOffsetToBroker exception, {},{}", mq, e);
-                }
-            }
-        }
+    async fn persist_all(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> PersistSummary {
+        self.run_pass(mqs, None, cancelled).await
     }
 
     async fn persist(&mut self, mq: &MessageQueue) {
@@ -333,7 +378,7 @@ impl OffsetStoreTrait for RemoteBrokerOffsetStore {
     async fn remove_offset(&self, mq: &MessageQueue) {
         let mut offset_table = self.offset_table.lock().await;
         offset_table.remove(mq);
-        info!(
+        debug!(
             "remove unnecessary messageQueue offset. group={}, mq={}, offsetTableSize={}",
             mq,
             self.group_name,
@@ -418,5 +463,59 @@ mod tests {
             summary.attempted > 0,
             "a budget should reach the first queue: {summary}"
         );
+    }
+
+    /// Plan 49a F10: periodic persistence belongs to its own consumer. Once that consumer is
+    /// stopping, no further remote opportunity is taken on its behalf - the pass may not wait
+    /// for a sibling or for the client's scheduled task to stop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopping_consumer_takes_no_further_offset_writes() {
+        let mut store =
+            RemoteBrokerOffsetStore::new(dead_instance("cancel-offset-test"), CheetahString::from("cancel-group"));
+        let assigned = queues("CancelTopic", 8);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+
+        let started = TokioInstant::now();
+        let summary = store.persist_all(&assigned, &|| true).await;
+        assert_eq!(0, summary.attempted, "a stopping consumer may not start a write");
+        assert_eq!(8, summary.skipped, "{summary}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the pass must stop at once, not after its queues: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Cancellation is observed per queue rather than once per pass, so the offsets already written
+    /// stay accounted for and the remainder is reported instead of silently dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_stops_the_periodic_pass_between_queues() {
+        let mut store = RemoteBrokerOffsetStore::new(
+            dead_instance("cancel-between-test"),
+            CheetahString::from("between-group"),
+        );
+        let assigned = queues("BetweenTopic", 6);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+
+        // Stop after the first queue has been offered: exactly one write is taken.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let summary = store
+            .persist_all(&assigned, &|| {
+                checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+            })
+            .await;
+        assert_eq!(1, summary.attempted, "{summary}");
+        assert_eq!(5, summary.skipped, "{summary}");
+        assert_eq!(summary.attempted, summary.succeeded + summary.failed, "{summary}");
+        assert_eq!(6, summary.attempted + summary.skipped, "{summary}");
+
+        // Without cancellation the same store walks every assigned queue.
+        let full = store.persist_all(&assigned, &|| false).await;
+        assert_eq!(6, full.attempted, "{full}");
+        assert_eq!(0, full.skipped, "{full}");
     }
 }

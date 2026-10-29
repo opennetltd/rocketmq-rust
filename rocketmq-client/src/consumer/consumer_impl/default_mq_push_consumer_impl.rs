@@ -1907,13 +1907,18 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
                     .await;
                 guard.keys().cloned().collect::<HashSet<_>>()
             };
-            self.offset_store
+            // The pass is cancellable by this consumer alone: stopping must not depend on stopping
+            // its siblings or the client's scheduled task, and a write already in
+            // flight is never cut off (plan 49a F10).
+            let work = self.work.clone();
+            let summary = self
+                .offset_store
                 .as_ref()
                 .unwrap()
                 .mut_from_ref()
-                .persist_all(&allocate_mq)
+                .persist_all(&allocate_mq, &|| work.is_closed())
                 .await;
-            if !allocate_mq.is_empty() {
+            if summary.succeeded > 0 {
                 self.progress.note_offset_persisted();
             }
         }

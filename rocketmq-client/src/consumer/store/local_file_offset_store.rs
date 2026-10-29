@@ -27,6 +27,7 @@ use rocketmq_remoting::protocol::RemotingDeserializable;
 use rocketmq_remoting::protocol::RemotingSerializable;
 use rocketmq_rust::ArcMut;
 use tokio::sync::Mutex;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 
@@ -34,6 +35,7 @@ use crate::consumer::store::controllable_offset::ControllableOffset;
 use crate::consumer::store::offset_serialize::OffsetSerialize;
 use crate::consumer::store::offset_serialize_wrapper::OffsetSerializeWrapper;
 use crate::consumer::store::offset_store::OffsetStoreTrait;
+use crate::consumer::store::offset_store::PersistSummary;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::factory::mq_client_instance::MQClientInstance;
 
@@ -187,10 +189,23 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         }
     }
 
-    async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>) {
+    async fn persist_all(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> PersistSummary {
+        let mut summary = PersistSummary::default();
         if mqs.is_empty() {
-            return;
+            return summary;
         }
+        // One guard covers the whole table, so cancellation is honoured before the write starts and
+        // never during it: an active local writer is always allowed to finish (plan 49a F10).
+        if cancelled() {
+            summary.skipped += mqs.len() as u64;
+            return summary;
+        }
+        let count = mqs.len() as u64;
+        summary.attempted = count;
         let guard = self.file_io.clone().lock_owned().await;
         let offsets = self
             .offset_table
@@ -216,19 +231,25 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
             Ok(())
         })
         .await;
-        if !matches!(result, Ok(Ok(()))) {
+        if matches!(result, Ok(Ok(()))) {
+            summary.succeeded += count;
+        } else {
             error!("persistAll consumer offset failed: {}", self.store_path);
+            summary.failed += count;
         }
+        summary
     }
 
     async fn persist(&mut self, mq: &MessageQueue) {
-        self.persist_all(&HashSet::from([mq.clone()])).await;
+        self.persist_all(&HashSet::from([mq.clone()]), &|| false).await;
     }
 
     async fn remove_offset(&self, mq: &MessageQueue) {
         let mut offset_table = self.offset_table.lock().await;
         offset_table.remove(mq);
-        info!(
+        // Per-queue bookkeeping is routine: one line per revoked queue buries the summaries that
+        // matter (plan 49a F10).
+        debug!(
             "remove unnecessary messageQueue offset. group={}, mq={}, offsetTableSize={}",
             mq,
             self.group_name,

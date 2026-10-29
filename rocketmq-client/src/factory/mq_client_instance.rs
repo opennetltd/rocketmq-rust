@@ -1085,6 +1085,12 @@ impl MQClientInstance {
         result
     }
 
+    /// Shared summary-rate gate, so a component that reports per-pass rather than per-item can
+    /// reuse the same interval instead of amplifying logs with its own.
+    pub(crate) fn log_gate(&self) -> &crate::utils::log_gate::LogGate {
+        &self.log_gate
+    }
+
     pub async fn persist_all_consumer_offset(&mut self) {
         let consumers = {
             let consumer_table = self.consumer_table.read().await;

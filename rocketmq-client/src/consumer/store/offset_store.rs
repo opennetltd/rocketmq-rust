@@ -100,15 +100,13 @@ impl OffsetStore {
             summary.skipped += remote.skipped;
         }
         if let Some(store) = self.local_file_offset_store.as_mut() {
-            // The file writer owns its guard and cannot be parallelised with a second writer.
-            let count = mqs.len() as u64;
-            summary.attempted += count;
-            store.persist_all(mqs).await;
-            if store.io_complete().await {
-                summary.succeeded += count;
-            } else {
-                summary.failed += count;
-            }
+            // The file writer owns its guard for the whole table: it is never cancelled mid-write
+            // and reports its own accounting (plan 49a F10).
+            let local = store.persist_all(mqs, &|| false).await;
+            summary.attempted += local.attempted;
+            summary.succeeded += local.succeeded;
+            summary.failed += local.failed;
+            summary.skipped += local.skipped;
         }
         summary
     }
@@ -158,13 +156,30 @@ impl OffsetStore {
         0
     }
 
-    pub async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>) {
+    /// Periodic persistence for one consumer. `cancelled` is consulted between queues so stopping a
+    /// consumer does not depend on stopping its siblings or the client's scheduled task, and never
+    /// in the middle of a write (plan 49a F10).
+    pub async fn persist_all(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> PersistSummary {
+        let mut summary = PersistSummary::default();
         if let Some(ref mut store) = self.remote_broker_offset_store {
-            store.persist_all(mqs).await;
+            let remote = store.persist_all(mqs, cancelled).await;
+            summary.attempted += remote.attempted;
+            summary.succeeded += remote.succeeded;
+            summary.failed += remote.failed;
+            summary.skipped += remote.skipped;
         }
         if let Some(ref mut store) = self.local_file_offset_store {
-            store.persist_all(mqs).await;
+            let local = store.persist_all(mqs, cancelled).await;
+            summary.attempted += local.attempted;
+            summary.succeeded += local.succeeded;
+            summary.failed += local.failed;
+            summary.skipped += local.skipped;
         }
+        summary
     }
 
     pub async fn persist(&mut self, mq: &MessageQueue) {
@@ -218,13 +233,19 @@ pub trait OffsetStoreTrait {
     async fn update_and_freeze_offset(&self, mq: &MessageQueue, offset: i64);
     async fn read_offset(&self, mq: &MessageQueue, type_: ReadOffsetType) -> i64;
 
-    async fn persist_all(&mut self, mqs: &HashSet<MessageQueue>);
+    /// Write every assigned offset, stopping between queues once `cancelled` says so. The periodic
+    /// task and cleanup share this primitive (and the snapshot behind it) so their accounting
+    /// cannot drift.
+    async fn persist_all(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> PersistSummary;
 
     /// Bounded variant used by cleanup. Stores that issue remote writes override this so broker
     /// lookup, route refresh and the send all share one deadline.
     async fn persist_all_until(&mut self, mqs: &HashSet<MessageQueue>, _deadline: TokioInstant) -> PersistSummary {
-        self.persist_all(mqs).await;
-        PersistSummary::default()
+        self.persist_all(mqs, &|| false).await
     }
 
     async fn persist(&mut self, mq: &MessageQueue);
