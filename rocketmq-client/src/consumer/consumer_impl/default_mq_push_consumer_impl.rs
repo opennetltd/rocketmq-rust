@@ -1086,12 +1086,19 @@ impl DefaultMQPushConsumerImpl {
             service.shutdown(remaining_millis(deadline)).await;
         }
         report.record("consume_service", started);
-        // Reserve before persisting, not after (plan 49c C5): what unregistration and client
-        // teardown need is set aside while there is still time to hand it over, so a
-        // listener that released late cannot leave the final phases with nothing and bulk
-        // writes cannot spend their slice.
+        // The remote phase opens **here**, when required local release has finished, and is
+        // measured from this instant instead of from session creation (plan 49d R5). What a
+        // listener took to hand its batches back used to be subtracted from the broker's
+        // chance to take the offsets and this group's unregistration, so releasing late
+        // could leave both with nothing while still taking the finalization reserve with
+        // them. The envelope is the persist opportunity plus what finalization keeps back -
+        // a fast drain therefore gets no more than the configured remote budget - and every
+        // step inside it keeps an absolute deadline that neither a retry nor a re-observing
+        // caller can renew. An observer whose own wait expired is not part of any of this
+        // arithmetic: it stopped watching, it did not shorten this pass.
         let finalization_reserve = self.finalization_reserve();
         let persist_opportunity = self.remote_persist_opportunity();
+        let remote_deadline = TokioInstant::now() + persist_opportunity + finalization_reserve;
         if let Some(store) = self.offset_store.as_mut() {
             let queues = self
                 .rebalance_impl
@@ -1122,7 +1129,7 @@ impl DefaultMQPushConsumerImpl {
                     store,
                     assigned: &assigned,
                 },
-                deadline,
+                remote_deadline,
                 persist_opportunity,
                 finalization_reserve,
                 || {
@@ -1170,9 +1177,10 @@ impl DefaultMQPushConsumerImpl {
                 // transport.
                 // The attempt gets at most five seconds of what is left, and never less than a
                 // finalization reserve, so teardown cannot be cut off mid-release. What is left
-                // here is what the reservation made before persistence promised it
-                // (plan 49c C5).
-                let remaining = deadline.saturating_duration_since(TokioInstant::now());
+                // here is what the reservation made before persistence promised it,
+                // inside the envelope opened when local release finished (plan 49c
+                // C5, plan 49d R5).
+                let remaining = remote_deadline.saturating_duration_since(TokioInstant::now());
                 let reserve = std::time::Duration::from_secs(2).min(remaining / 4);
                 let remote_budget = remaining.saturating_sub(reserve).min(std::time::Duration::from_secs(5));
                 let remote_deadline = TokioInstant::now() + remote_budget;
@@ -2872,5 +2880,117 @@ mod tests {
             .await
             .expect_err("an invalid thread bound must be rejected");
         assert!(matches!(err, RocketMQError::Configuration(_)), "{err:?}");
+    }
+
+    /// Plan 49d R5: what draining took may not be spent out of the broker's chance to take the
+    /// offsets and this group's unregistration. The remote envelope opens when local release
+    /// finishes, so a stalled lookup still receives its post-drain window even though the
+    /// session ceiling expired long before that release - while callers whose waits expired
+    /// neither shorten it nor start a second pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_local_release_gets_a_fresh_remote_envelope() {
+        use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+        use crate::consumer::store::offset_store::OffsetStore;
+        use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+
+        let group = CheetahString::from_static_str("late-drain-group");
+        let mut cc = ClientConfig::default();
+        cc.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            ..Default::default()
+        });
+        let mut consumer = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = consumer.clone();
+        consumer.set_default_mqpush_consumer_impl(handle);
+
+        // One claimed batch, released only after the session ceiling has expired. Remote
+        // persistence may take 60ms with 20ms kept back for finalization; the session
+        // itself gets 10ms.
+        let permit = consumer
+            .delivery
+            .admit()
+            .expect("an open gate admits the batch that is already running");
+        consumer.set_cleanup_session_ceiling(Duration::from_millis(10));
+        consumer.set_remote_budgets(Duration::from_millis(60), Duration::from_millis(20));
+
+        // One offset to hand to a broker whose lookup cannot answer while this lock is held.
+        let client = MQClientInstance::new_arc(cc.clone(), 0, "late-drain-client", None);
+        let nameserver = client.nameserver_lock();
+        let stalled_lookup = nameserver.lock().await;
+        let mq = MessageQueue::from_parts("T", "missing-broker", 0);
+        let store = OffsetStore::new_with_remote(RemoteBrokerOffsetStore::new(client.clone(), group.clone()));
+        store.update_offset(&mq, 1, false).await;
+        consumer.offset_store = Some(ArcMut::new(store));
+        consumer.client_instance = Some(client);
+        consumer
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(mq.clone(), Arc::new(ProcessQueue::new()));
+
+        // A caller whose wait expires while the batch is still held.
+        assert!(
+            !consumer
+                .shutdown_until(TokioInstant::now() + Duration::from_millis(5))
+                .await,
+            "an elapsed wait reports not proved yet"
+        );
+
+        // Local release happens long after that ceiling expired.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(permit);
+        let released = TokioInstant::now();
+
+        // A second caller that also cannot wait: it joins the one pass and changes nothing about
+        // it.
+        assert!(
+            !consumer.shutdown_until(TokioInstant::now()).await,
+            "a second elapsed caller also gets not proved yet"
+        );
+        let during = consumer
+            .cleanup_progress()
+            .expect("the stop request started one session");
+        assert!(during.running, "one pass keeps running for every caller: {during:?}");
+
+        // The remote envelope opened at release, so the stalled lookup is still being bounded by
+        // it. It ends on that deadline rather than reaching past it, and cleanup proves
+        // itself afterwards.
+        let mut settled = None;
+        for _ in 0..300 {
+            let progress = consumer.cleanup_progress().expect("session still there");
+            if !progress.running {
+                settled = Some(progress);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(stalled_lookup);
+        let after = settled.expect("the abandoned pass finishes on its own");
+        assert!(after.proved, "cleanup must prove itself unwatched: {after:?}");
+
+        let post_drain = released.elapsed();
+        assert!(
+            post_drain >= Duration::from_millis(20),
+            "the stalled lookup received no post-drain remote window: {post_drain:?}"
+        );
+        // The envelope is the configured opportunity plus its reserve, not an unbounded wait: an
+        // unreachable broker may not extend it.
+        assert!(
+            post_drain <= Duration::from_millis(3_000),
+            "the remote envelope outlived its policy budget: {post_drain:?}"
+        );
+
+        // A later caller gets the remembered answer; no second pass and no second writer ran.
+        assert!(
+            consumer
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(1))
+                .await,
+            "a proved session answers every later caller"
+        );
+        let again = consumer.cleanup_progress().expect("session still there");
+        assert_eq!(again.phase, after.phase, "no second pass rewrote the outcome");
     }
 }
