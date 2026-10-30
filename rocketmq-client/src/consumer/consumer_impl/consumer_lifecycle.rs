@@ -27,8 +27,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_common::TimeUtils::get_current_millis;
+use tracing::debug;
 
 /// SDK-owned recovery policy (plan 49 section 3.2). These are explicit SDK policy choices, not
 /// application configuration: the managed entry point intentionally exposes no copies of them.
@@ -181,7 +183,7 @@ impl Reason {
 }
 
 /// Progress counters and timestamps read at the SDK's own work transitions.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProgressSnapshot {
     pub now_ms: u64,
     pub started_at_ms: u64,
@@ -215,15 +217,30 @@ pub(crate) struct ProgressSnapshot {
     /// latest one that could not. Which is newer decides whether a zero assignment is explicit.
     pub last_route_ok_ms: u64,
     pub last_route_miss_ms: u64,
-    /// What the newest completed allocation pass concluded. A zero assignment is only "explicitly
-    /// idle" when a pass actually answered; which answer it was decides whether health repairs in
-    /// place or reports a failed refresh (plan 49a F4 section 4.3 item 1). `None` means no pass has
-    /// reported one, so health falls back to route observations alone.
-    pub alloc_outcome: Option<AllocationOutcome>,
-    pub alloc_outcome_ms: u64,
+    /// What the latest completed allocation pass concluded **for each topic**, ordered by topic.
+    /// A zero assignment is only "explicitly idle" when a pass actually answered for that
+    /// subscription; which answer it was decides whether health repairs in place or reports a
+    /// failed refresh, and one topic's answer never stands in for another's (plan 49c C3).
+    /// Empty means no pass has reported yet, so health falls back to route observations alone.
+    pub allocations: Vec<(CheetahString, AllocationOutcome, u64)>,
 }
 
 impl ProgressSnapshot {
+    /// Subscriptions whose latest completed pass did not get what it asked for, in topic order.
+    pub(crate) fn failed_allocations(&self) -> impl Iterator<Item = &(CheetahString, AllocationOutcome, u64)> {
+        self.allocations.iter().filter(|(_, outcome, _)| outcome.is_failure())
+    }
+
+    /// Whether every reported subscription was explicitly given nothing. Used only to decide
+    /// whether a zero-assignment consumer is idle; a single failed record makes it false.
+    pub(crate) fn all_allocations_explicit_zero(&self) -> bool {
+        !self.allocations.is_empty()
+            && self
+                .allocations
+                .iter()
+                .all(|(_, outcome, _)| *outcome == AllocationOutcome::ExplicitZero)
+    }
+
     fn age_ms(&self, since_ms: u64) -> Duration {
         Duration::from_millis(self.now_ms.saturating_sub(since_ms))
     }
@@ -289,8 +306,12 @@ impl Drop for PullLease {
 pub(crate) enum AllocationOutcome {
     /// The pass read the control plane and this consumer was explicitly assigned no queues.
     ExplicitZero,
-    /// The pass read the control plane and this consumer was assigned at least one queue.
+    /// The pass read the control plane and this consumer was assigned at least one queue, and that
+    /// queue's preparation succeeded well enough to keep working on it.
     QueuesOwned,
+    /// The topic has no route to allocate from: there is nothing to consume yet, and no pull loop
+    /// exists. Reported apart from a lookup failure because the two need different repairs.
+    RouteAbsent,
     /// The pass could not read what it needed - typically the consumer list of the topic.
     LookupFailed,
     /// Queues were allocated but a newly acquired queue's starting offset could not be prepared, so
@@ -299,17 +320,23 @@ pub(crate) enum AllocationOutcome {
 }
 
 impl AllocationOutcome {
-    /// A packed record keeps its kind in the high byte and its timestamp in the low 56 bits; a zero
-    /// record means "no pass has reported yet" and must not be read as an answer.
-    fn from_packed(record: u64) -> Option<Self> {
-        match record >> 56 {
-            1 => Some(Self::ExplicitZero),
-            2 => Some(Self::QueuesOwned),
-            3 => Some(Self::LookupFailed),
-            4 => Some(Self::OffsetPreparationFailed),
-            _ => None,
-        }
+    /// Whether this conclusion means the subscription did not get what it asked for. A sibling
+    /// topic's explicit zero must never certify a failed topic as idle (plan 49c C3), so health
+    /// asks each record this question instead of reading one shared answer.
+    pub(crate) fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::RouteAbsent | Self::LookupFailed | Self::OffsetPreparationFailed
+        )
     }
+}
+
+/// One topic's latest completed allocation pass, kept so that evidence belongs to the subscription
+/// it describes.
+pub(crate) struct AllocationRecord {
+    pub(crate) outcome: AllocationOutcome,
+    /// Millisecond timestamp of the pass that produced this conclusion.
+    pub(crate) at_ms: u64,
 }
 
 /// Why a pull failed, used only to choose the repair action.
@@ -347,9 +374,12 @@ pub(crate) struct ConsumerProgress {
     last_callback_progress_ms: AtomicU64,
     last_assignment_ms: AtomicU64,
     last_offset_ms: AtomicU64,
-    /// Newest allocation outcome, packed as kind in the high byte and its timestamp in the low 56
-    /// bits, so reading the answer and when it was given cannot observe two different passes.
-    alloc_outcome: AtomicU64,
+    /// Latest completed allocation pass **per topic**. One consumer-wide answer cannot describe a
+    /// consumer with several subscriptions: an explicit zero for the retry topic would certify a
+    /// business topic whose lookup failed, and reversing iteration order would reverse the
+    /// diagnosis (plan 49c C3). Bounded by the subscription set; entries are dropped on
+    /// unsubscribe.
+    allocations: parking_lot::Mutex<HashMap<CheetahString, AllocationRecord>>,
     last_route_ok_ms: AtomicU64,
     last_route_miss_ms: AtomicU64,
     /// Source of queue epochs for this incarnation. Epochs are never reused: a revoked queue and
@@ -361,9 +391,6 @@ pub(crate) struct ConsumerProgress {
 }
 
 impl ConsumerProgress {
-    /// Timestamps packed with an allocation outcome keep 56 bits of milliseconds.
-    const ALLOC_MS_MASK: u64 = (1 << 56) - 1;
-
     pub(crate) fn new() -> Arc<Self> {
         let now = get_current_millis();
         Arc::new(Self {
@@ -474,22 +501,36 @@ impl ConsumerProgress {
         self.bump(&self.flow_controls);
     }
 
-    /// Records what the latest rebalance pass could actually see. A pass with no route for this
-    /// consumer's own subscriptions is a failed assignment refresh, which section 3.2 treats as a
-    /// fault to repair; only a pass that saw routes can prove that a zero assignment was explicit.
-    /// What one completed allocation pass concluded. Recorded per pass so a zero assignment can be
-    /// read as "the broker answered and gave us nothing" instead of being guessed from route
-    /// timestamps - and so the two ways an allocation can fail stay distinguishable from that
-    /// answer.
-    pub(crate) fn note_allocation_pass(&self, outcome: AllocationOutcome) {
-        let kind: u64 = match outcome {
-            AllocationOutcome::ExplicitZero => 1,
-            AllocationOutcome::QueuesOwned => 2,
-            AllocationOutcome::LookupFailed => 3,
-            AllocationOutcome::OffsetPreparationFailed => 4,
-        };
-        let now = get_current_millis() & Self::ALLOC_MS_MASK;
-        self.alloc_outcome.store(kind << 56 | now, Ordering::Relaxed);
+    /// Records what the latest completed rebalance pass concluded **for one topic**. Only that
+    /// topic's previous answer is replaced, so a failed subscription stays visible until its own
+    /// next successful pass (plan 49c C3).
+    pub(crate) fn note_allocation_pass(&self, topic: &str, outcome: AllocationOutcome) {
+        self.allocations.lock().insert(
+            CheetahString::from_slice(topic),
+            AllocationRecord {
+                outcome,
+                at_ms: get_current_millis(),
+            },
+        );
+    }
+
+    /// Drops evidence for topics this consumer no longer subscribes to, so the record set stays
+    /// bounded by the subscription table instead of remembering every topic it ever served.
+    pub(crate) fn retain_allocation_passes(&self, topics: &[CheetahString]) {
+        let mut allocations = self.allocations.lock();
+        allocations.retain(|topic, _| topics.iter().any(|subscribed| subscribed == topic));
+    }
+
+    /// Every completed pass, ordered by topic so aggregation cannot depend on map iteration order.
+    pub(crate) fn allocation_records(&self) -> Vec<(CheetahString, AllocationOutcome, u64)> {
+        let mut records = self
+            .allocations
+            .lock()
+            .iter()
+            .map(|(topic, record)| (topic.clone(), record.outcome, record.at_ms))
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        records
     }
 
     pub(crate) fn note_route_observation(&self, routed: bool) {
@@ -511,23 +552,51 @@ impl ConsumerProgress {
         self.last_assignment_ms.store(now, Ordering::Relaxed);
         let mut queues = self.queues.write();
         for queue in assigned {
-            match queues.get_mut(queue) {
-                // Retained: identity and lease are the running work's, not this pass's to reset.
-                Some(_) => {}
-                None => {
-                    // A fresh acquisition always receives a strictly larger epoch than any this
-                    // incarnation handed out before, including the one this queue held when it was
-                    // revoked. Retained queues keep theirs (plan 49a F4 section 4.3 item 2).
-                    let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-                    queues.insert(
-                        queue.clone(),
-                        QueueProgress {
-                            epoch,
-                            last_progress_ms: now,
-                            pull_leased: false,
-                        },
-                    );
-                }
+            Self::acquire_queue(&mut queues, &self.next_epoch, queue, now);
+        }
+    }
+
+    /// Publishes the acquisition of one queue whose process queue has just been installed. This is
+    /// the authoritative moment ownership begins - before any pull is dispatched for it (plan 49c
+    /// C1)
+    /// - and a queue that could not be prepared never reaches it.
+    pub(crate) fn note_queue_installed(&self, queue: &MessageQueue) {
+        let now = get_current_millis();
+        self.bump(&self.assignments);
+        self.last_assignment_ms.store(now, Ordering::Relaxed);
+        let mut queues = self.queues.write();
+        Self::acquire_queue(&mut queues, &self.next_epoch, queue, now);
+    }
+
+    /// Ends one queue's acquisition because its process queue left the table. Its epoch is retired
+    /// with it, so a replacement installation receives a strictly newer identity even when the
+    /// desired allocation never changed.
+    pub(crate) fn note_queue_revoked(&self, queue: &MessageQueue) {
+        self.note_revocation(std::slice::from_ref(queue));
+    }
+
+    fn acquire_queue(
+        queues: &mut HashMap<MessageQueue, QueueProgress>,
+        next_epoch: &AtomicU64,
+        queue: &MessageQueue,
+        now: u64,
+    ) {
+        match queues.get_mut(queue) {
+            // Retained: identity and lease are the running work's, not this pass's to reset.
+            Some(_) => {}
+            None => {
+                // A fresh acquisition always receives a strictly larger epoch than any this
+                // incarnation handed out before, including the one this queue held when it was
+                // revoked. Retained queues keep theirs (plan 49a F4 section 4.3 item 2).
+                let epoch = next_epoch.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                queues.insert(
+                    queue.clone(),
+                    QueueProgress {
+                        epoch,
+                        last_progress_ms: now,
+                        pull_leased: false,
+                    },
+                );
             }
         }
     }
@@ -653,8 +722,7 @@ impl ConsumerProgress {
             last_callback_progress_ms: self.last_callback_progress_ms.load(Ordering::Relaxed),
             last_assignment_ms: self.last_assignment_ms.load(Ordering::Relaxed),
             last_offset_ms: self.last_offset_ms.load(Ordering::Relaxed),
-            alloc_outcome: AllocationOutcome::from_packed(self.alloc_outcome.load(Ordering::Relaxed)),
-            alloc_outcome_ms: self.alloc_outcome.load(Ordering::Relaxed) & Self::ALLOC_MS_MASK,
+            allocations: self.allocation_records(),
             last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
             last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
         }
@@ -955,15 +1023,15 @@ impl RecoveryMachine {
             // is reported as such. It repairs in place and deliberately does not spend
             // the replacement budget - replacing an incarnation cannot fix a
             // control-plane outage.
-            // The newest completed pass answers this directly when one has been recorded: only "you
-            // get nothing" makes idleness explicit, and every other conclusion -
-            // including queues allocated that this incarnation does not actually own -
-            // is a refresh that did not finish. Without such a record there is nothing
-            // better than the route observation itself.
-            let refresh_failed = match snapshot.alloc_outcome {
-                Some(AllocationOutcome::ExplicitZero) => false,
-                Some(_) => true,
-                None => snapshot.last_route_miss_ms > snapshot.last_route_ok_ms,
+            // The completed passes answer this directly when any have been recorded: only "you get
+            // nothing" from every subscription makes idleness explicit, and any other conclusion -
+            // including queues allocated that this incarnation does not actually own, or a sibling
+            // topic's failure - is a refresh that did not finish. Without any record there is
+            // nothing better than the route observation itself.
+            let refresh_failed = if snapshot.allocations.is_empty() {
+                snapshot.last_route_miss_ms > snapshot.last_route_ok_ms
+            } else {
+                !snapshot.all_allocations_explicit_zero()
             };
             if refresh_failed {
                 self.state = MachineState {
@@ -1032,6 +1100,32 @@ impl RecoveryMachine {
                 self.state,
                 vec![
                     Effect::Repair(RepairKind::LostPull),
+                    Effect::Idle(self.policy.progress_check),
+                ],
+            );
+        }
+
+        // A subscription whose latest completed pass failed remains a fault while other
+        // subscriptions keep working: owning some queues does not certify every one of
+        // them, and looking only at the zero-assignment case hides a partially failed
+        // acquisition behind the queues that did install (plan 49c C3). It repairs in place
+        // and spends no replacement budget, because a new incarnation cannot change what
+        // the control plane answered.
+        if let Some((topic, outcome, _)) = snapshot.failed_allocations().next() {
+            debug!(
+                topic = %topic,
+                ?outcome,
+                "latest allocation pass did not obtain this subscription; repairing the assignment in place"
+            );
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
+                reason: Reason::AssignmentRefreshFailed,
+            };
+            return (
+                self.state,
+                vec![
+                    Effect::Repair(RepairKind::Assignment),
                     Effect::Idle(self.policy.progress_check),
                 ],
             );
@@ -1584,7 +1678,7 @@ mod tests {
         let progress = ConsumerProgress::new();
         assigned(&progress, 0);
         progress.note_route_observation(false);
-        progress.note_allocation_pass(AllocationOutcome::ExplicitZero);
+        progress.note_allocation_pass("TopicA", AllocationOutcome::ExplicitZero);
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
         let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
@@ -1600,12 +1694,157 @@ mod tests {
         let progress = ConsumerProgress::new();
         assigned(&progress, 0);
         progress.note_route_observation(true);
-        progress.note_allocation_pass(AllocationOutcome::LookupFailed);
+        progress.note_allocation_pass("TopicA", AllocationOutcome::LookupFailed);
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
         let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
         assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
+    }
+
+    /// Plan 49c C3: allocation evidence belongs to the topic it describes. The consumer's automatic
+    /// retry subscription is routinely assigned nothing, and that explicit zero must never be read
+    /// as proof that a business topic whose consumer-list lookup failed is simply idle - in either
+    /// recording order.
+    #[test]
+    fn another_topics_explicit_zero_does_not_certify_a_failed_topic() {
+        for business_first in [true, false] {
+            let progress = ConsumerProgress::new();
+            assigned(&progress, 0);
+            progress.note_route_observation(true);
+            let record = |topic: &str, outcome| progress.note_allocation_pass(topic, outcome);
+            if business_first {
+                record("TopicA", AllocationOutcome::LookupFailed);
+                record("%RETRY%group", AllocationOutcome::ExplicitZero);
+            } else {
+                record("%RETRY%group", AllocationOutcome::ExplicitZero);
+                record("TopicA", AllocationOutcome::LookupFailed);
+            }
+
+            let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+            let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+            assert_eq!(
+                state.reason,
+                Reason::AssignmentRefreshFailed,
+                "iteration order must not decide the diagnosis"
+            );
+            assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
+        }
+    }
+
+    /// Only a completed pass for the topic itself clears that topic's failure; every subscription
+    /// has to answer before an idle consumer is healthy.
+    #[test]
+    fn a_successful_pass_clears_only_its_own_topics_failure() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 0);
+        progress.note_allocation_pass("TopicA", AllocationOutcome::LookupFailed);
+        progress.note_allocation_pass("TopicB", AllocationOutcome::RouteAbsent);
+
+        progress.note_allocation_pass("TopicA", AllocationOutcome::ExplicitZero);
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, _) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(
+            state.reason,
+            Reason::AssignmentRefreshFailed,
+            "TopicB has still not answered for itself"
+        );
+
+        progress.note_allocation_pass("TopicB", AllocationOutcome::ExplicitZero);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::WaitingForAssignment);
+        assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
+        assert!(matches!(effects.first(), Some(Effect::Idle(_))));
+    }
+
+    /// Owning some queues does not certify every subscription: a partially failed acquisition stays
+    /// visible while the installed queues keep working (plan 49c C3).
+    #[test]
+    fn a_partially_failed_subscription_is_visible_while_other_queues_are_owned() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 2);
+        progress.note_allocation_pass("TopicA", AllocationOutcome::QueuesOwned);
+        progress.note_allocation_pass("TopicB", AllocationOutcome::OffsetPreparationFailed);
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(
+            state.reason,
+            Reason::AssignmentRefreshFailed,
+            "a queue that could not be prepared must not hide behind the ones that were"
+        );
+        assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
+    }
+
+    /// Evidence is bounded by the subscription table: a topic that is no longer subscribed stops
+    /// contributing its conclusion (plan 49c C3).
+    #[test]
+    fn allocation_evidence_stops_with_the_subscription() {
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 0);
+        progress.note_allocation_pass("TopicA", AllocationOutcome::LookupFailed);
+        assert_eq!(1, progress.allocation_records().len());
+
+        progress.retain_allocation_passes(&[CheetahString::from_slice("%RETRY%group")]);
+        assert!(
+            progress.allocation_records().is_empty(),
+            "an unsubscribed topic is forgotten"
+        );
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, _) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        assert_eq!(state.reason, Reason::WaitingForAssignment);
+    }
+
+    /// Plan 49c C1: a queue can only be dispatched once its installation has published an owner,
+    /// and the acquisition ends with the process queue that held it.
+    #[test]
+    fn a_queue_can_pull_only_after_its_installation_published_it() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("TopicA", 0);
+        assert!(
+            progress.acquire_pull_lease(&mq).is_none(),
+            "an uninstalled queue has no acquisition to dispatch under"
+        );
+
+        progress.note_queue_installed(&mq);
+        let lease = progress
+            .acquire_pull_lease(&mq)
+            .expect("installation publishes ownership before any dispatch");
+        assert!(
+            progress.acquire_pull_lease(&mq).is_none(),
+            "the running loop keeps the single in-flight pull"
+        );
+        drop(lease);
+
+        progress.note_queue_revoked(&mq);
+        assert!(
+            progress.acquire_pull_lease(&mq).is_none(),
+            "removal ends the acquisition with the table entry"
+        );
+    }
+
+    /// Replacing a process queue under an unchanged desired allocation must not inherit the old
+    /// loop's identity, or its outstanding lease would block the replacement forever.
+    #[test]
+    fn a_replaced_process_queue_starts_a_new_acquisition() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("TopicA", 0);
+        progress.note_queue_installed(&mq);
+        let stale = progress
+            .acquire_pull_lease(&mq)
+            .expect("the installed queue is owned by this incarnation");
+        let epoch = stale.epoch();
+
+        progress.note_queue_revoked(&mq);
+        progress.note_queue_installed(&mq);
+        drop(stale);
+
+        let replacement = progress
+            .acquire_pull_lease(&mq)
+            .expect("a replacement installation pulls under its own identity");
+        assert!(replacement.epoch() > epoch, "identities are never reused");
+        assert!(!progress.is_current(&mq, epoch), "the old loop cannot publish");
     }
 
     #[test]

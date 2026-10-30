@@ -105,14 +105,27 @@ where
         self.rebalance_generation() == generation
     }
 
-    /// Forward one completed allocation pass to the consumer that owns this rebalance, if any.
+    /// Forward one completed allocation pass to the consumer that owns this rebalance, if any. It
+    /// carries the topic it describes: one answer for the whole consumer cannot separate a failed
+    /// subscription from another subscription's explicit zero (plan 49c C3).
     #[inline]
-    async fn note_allocation_pass(&mut self, outcome: AllocationOutcome) {
+    async fn note_allocation_pass(&mut self, topic: &str, outcome: AllocationOutcome) {
         let Some(inner) = self.sub_rebalance_impl.as_mut() else {
             return;
         };
         if let Some(mut sub_rebalance) = inner.upgrade() {
-            sub_rebalance.note_allocation_pass(outcome).await;
+            sub_rebalance.note_allocation_pass(topic, outcome).await;
+        }
+    }
+
+    /// Keep the consumer's allocation evidence bounded by this rebalance's subscription set.
+    #[inline]
+    async fn note_subscription_set(&mut self, topics: &[CheetahString]) {
+        let Some(inner) = self.sub_rebalance_impl.as_mut() else {
+            return;
+        };
+        if let Some(mut sub_rebalance) = inner.upgrade() {
+            sub_rebalance.note_subscription_set(topics).await;
         }
     }
 
@@ -136,6 +149,9 @@ where
         if !sub_table.is_empty() {
             let topics = sub_table.keys().cloned().collect::<Vec<CheetahString>>();
             drop(sub_table);
+            // A topic this consumer no longer serves must stop contributing allocation evidence,
+            // otherwise its last conclusion would be reported forever (plan 49c C3).
+            self.note_subscription_set(&topics).await;
             for topic in &topics {
                 if !self.is_rebalance_generation_current(generation) {
                     return false;
@@ -473,8 +489,16 @@ where
                 false
             };
             if removed {
-                let mut process_queue_table = self.process_queue_table.write().await;
-                if process_queue_table.remove(&mq).is_some() {
+                let removed = {
+                    let mut process_queue_table = self.process_queue_table.write().await;
+                    process_queue_table.remove(&mq).is_some()
+                };
+                if removed {
+                    // Same rule as the plain rebalance path: leaving the table ends the acquisition
+                    // (plan 49c C1).
+                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
+                        sub_rebalance.note_queue_revoked(&mq).await;
+                    }
                     changed = true;
                     info!(
                         "doRebalance, {:?}, remove unnecessary mq, {}",
@@ -562,19 +586,29 @@ where
                     sub_rebalance_impl.remove_dirty_offset(mq).await;
                     let pq = Arc::new(sub_rebalance_impl.create_process_queue());
                     pq.set_locked(true);
-                    let next_offset = sub_rebalance_impl.compute_pull_from_where_with_exception(mq).await;
-                    if next_offset.is_err() {
+                    let prepared = sub_rebalance_impl.compute_pull_from_where_with_exception(mq).await;
+                    let Ok(next_offset) = prepared else {
+                        // Allocated but not preparable: recorded as this topic's conclusion, and
+                        // never dispatched (plan 49c C1/C3).
+                        sub_rebalance_impl
+                            .note_allocation_pass(topic, AllocationOutcome::OffsetPreparationFailed)
+                            .await;
                         continue;
-                    }
-                    let next_offset = next_offset.unwrap();
+                    };
                     if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
-                        let mut process_queue_table = process_queue_table_clone.write().await;
-                        if process_queue_table.insert(mq.clone(), pq.clone()).is_none() {
+                        let inserted = {
+                            let mut process_queue_table = process_queue_table_clone.write().await;
+                            process_queue_table.insert(mq.clone(), pq.clone()).is_none()
+                        };
+                        if inserted {
                             info!(
                                 "doRebalance, {:?}, add a new mq, {}",
                                 self.consumer_group,
                                 mq.get_topic()
                             );
+                            // Ownership is published before the request is queued for dispatch
+                            // (plan 49c C1).
+                            sub_rebalance_impl.note_queue_installed(mq).await;
                             pull_request_list.push(PullRequest::new(
                                 self.consumer_group.as_ref().unwrap().clone(),
                                 mq.clone(),
@@ -595,6 +629,11 @@ where
                             self.consumer_group,
                             mq.get_topic()
                         );
+                        if next_offset < 0 {
+                            sub_rebalance_impl
+                                .note_allocation_pass(topic, AllocationOutcome::OffsetPreparationFailed)
+                                .await;
+                        }
                     }
                 }
             }
@@ -682,8 +721,18 @@ where
                 false
             };
             if removed {
-                let mut process_queue_table = process_queue_table_cloned.write().await;
-                if process_queue_table.remove(&mq).is_some() {
+                let removed = {
+                    let mut process_queue_table = process_queue_table_cloned.write().await;
+                    process_queue_table.remove(&mq).is_some()
+                };
+                if removed {
+                    // Ownership ends with the table entry. Retiring the acquisition here - rather
+                    // than in an assignment callback that has to wait for a heartbeat - means no
+                    // later dispatch, and no replacement installation of the same queue, can
+                    // inherit this loop's identity (plan 49c C1).
+                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
+                        sub_rebalance.note_queue_revoked(&mq).await;
+                    }
                     changed = true;
                     info!(
                         "doRebalance, {:?}, remove unnecessary mq, {}",
@@ -722,13 +771,24 @@ where
                 pq.set_locked(true);
                 let next_offset = sub_rebalance_impl.compute_pull_from_where(mq).await;
                 if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
-                    let mut process_queue_table = process_queue_table_cloned.write().await;
-                    if process_queue_table.insert(mq.clone(), pq.clone()).is_none() {
+                    let inserted = {
+                        let mut process_queue_table = process_queue_table_cloned.write().await;
+                        process_queue_table.insert(mq.clone(), pq.clone()).is_none()
+                    };
+                    if inserted {
                         info!(
                             "doRebalance, {:?}, add a new mq, {}",
                             self.consumer_group,
                             mq.get_topic()
                         );
+                        // Publish this queue's acquisition before it is dispatched. The initial
+                        // pull is only scheduled after this loop returns,
+                        // but the admission check that guards it needs an
+                        // owner by then, and waiting for the assignment callback
+                        // would make a slow heartbeat drop the first pull of every new queue with
+                        // no retry until the lost-pull detector fires (plan
+                        // 49c C1).
+                        sub_rebalance_impl.note_queue_installed(mq).await;
                         pull_request_list.push(PullRequest::new(
                             self.consumer_group.as_ref().unwrap().clone(),
                             mq.clone(),
@@ -755,7 +815,7 @@ where
                     // rebalance generation moved on is not that.
                     if next_offset < 0 {
                         sub_rebalance_impl
-                            .note_allocation_pass(AllocationOutcome::OffsetPreparationFailed)
+                            .note_allocation_pass(topic, AllocationOutcome::OffsetPreparationFailed)
                             .await;
                     }
                 }
@@ -784,15 +844,23 @@ where
                         .update_process_queue_table_in_rebalance(topic, mq_set, is_order)
                         .await;
                     if changed {
+                        // Callbacks observe the committed actual set rather than the desired one: a
+                        // queue whose preparation failed was not installed and must not be reported
+                        // as owned (plan 49c C3).
+                        let working = self.get_working_message_queue(topic).await;
                         let sub_rebalance_impl = self.sub_rebalance_impl.as_mut().unwrap();
                         if let Some(mut sub_rebalance_impl) = sub_rebalance_impl.upgrade() {
-                            sub_rebalance_impl.message_queue_changed(topic, mq_set, mq_set).await;
+                            sub_rebalance_impl.message_queue_changed(topic, mq_set, &working).await;
                         }
                     }
                     mq_set.eq(&self.get_working_message_queue(topic).await)
                 } else {
-                    let sub_rebalance_impl = self.sub_rebalance_impl.as_mut().unwrap();
-                    if let Some(mut sub_rebalance_impl) = sub_rebalance_impl.upgrade() {
+                    if let Some(mut sub_rebalance_impl) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
+                        // The pass completed and there is nothing to allocate from. That is a
+                        // conclusion about this topic, recorded as one, and not an idle assignment.
+                        sub_rebalance_impl
+                            .note_allocation_pass(topic, AllocationOutcome::RouteAbsent)
+                            .await;
                         sub_rebalance_impl
                             .message_queue_changed(topic, &HashSet::new(), &HashSet::new())
                             .await;
@@ -819,6 +887,9 @@ where
                 if mq_set.is_none() && !topic.starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
                     if let Some(mut sub_rebalance_impl) = self.sub_rebalance_impl.as_ref().unwrap().upgrade() {
                         sub_rebalance_impl
+                            .note_allocation_pass(topic, AllocationOutcome::RouteAbsent)
+                            .await;
+                        sub_rebalance_impl
                             .message_queue_changed(topic, &HashSet::new(), &HashSet::new())
                             .await;
                         warn!(
@@ -837,7 +908,7 @@ where
                     // The pass ended without an answer: health must not read the resulting zero
                     // assignment as an explicit idle assignment (plan 49a F4
                     // section 4.3 item 1).
-                    self.note_allocation_pass(AllocationOutcome::LookupFailed).await;
+                    self.note_allocation_pass(topic, AllocationOutcome::LookupFailed).await;
                     return true;
                 }
                 if let (Some(mq_set), Some(mut ci_all)) = (mq_set, cid_all) {
@@ -860,18 +931,21 @@ where
                                 self.allocate_message_queue_strategy.as_ref().unwrap().get_name(),
                                 e.to_string()
                             );
-                            self.note_allocation_pass(AllocationOutcome::LookupFailed).await;
+                            self.note_allocation_pass(topic, AllocationOutcome::LookupFailed).await;
                             return false;
                         }
                     };
                     let allocate_result_set = allocate_result.into_iter().collect::<HashSet<MessageQueue>>();
                     // The pass has an answer, and its kind is what tells a later zero assignment
                     // apart from a refresh that never finished.
-                    self.note_allocation_pass(if allocate_result_set.is_empty() {
-                        AllocationOutcome::ExplicitZero
-                    } else {
-                        AllocationOutcome::QueuesOwned
-                    })
+                    self.note_allocation_pass(
+                        topic,
+                        if allocate_result_set.is_empty() {
+                            AllocationOutcome::ExplicitZero
+                        } else {
+                            AllocationOutcome::QueuesOwned
+                        },
+                    )
                     .await;
                     let changed = self
                         .update_process_queue_table_in_rebalance(topic, &allocate_result_set, is_order)
@@ -891,10 +965,11 @@ where
                             allocate_result_set
                         );
 
+                        // The committed actual set again: whatever could not be prepared is not
+                        // owned, and its failure stays recorded for this topic alone.
+                        let working = self.get_working_message_queue(topic).await;
                         if let Some(mut sub_rebalance_impl) = self.sub_rebalance_impl.as_ref().unwrap().upgrade() {
-                            sub_rebalance_impl
-                                .message_queue_changed(topic, mq_set, &allocate_result_set)
-                                .await;
+                            sub_rebalance_impl.message_queue_changed(topic, mq_set, &working).await;
                         }
                     }
                     return allocate_result_set.eq(&self.get_working_message_queue(topic).await);

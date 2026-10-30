@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 
+use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_remoting::protocol::heartbeat::consume_type::ConsumeType;
 
@@ -42,12 +43,27 @@ pub trait RebalanceLocal {
         mq_divided: &HashSet<MessageQueue>,
     );
 
-    /// What one completed allocation pass concluded (plan 49a F4 section 4.3 item 1). Consumers
-    /// that do not observe their own assignment record nothing.
+    /// What one completed allocation pass concluded **for `topic`** (plan 49c C3). Consumers that
+    /// do not observe their own assignment record nothing.
     async fn note_allocation_pass(
         &mut self,
+        topic: &str,
         outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
     );
+
+    /// Reports the subscription set this rebalance pass is working over, so allocation evidence for
+    /// topics that are no longer subscribed stops being reported (plan 49c C3).
+    async fn note_subscription_set(&mut self, topics: &[CheetahString]);
+
+    /// Publishes the acquisition identity of a process queue that has just been installed.
+    /// Ownership begins here, before any pull is dispatched for that queue; waiting for an
+    /// assignment callback
+    /// - which waits for a heartbeat - would let the first pull arrive unowned (plan 49c C1).
+    async fn note_queue_installed(&mut self, mq: &MessageQueue);
+
+    /// Ends the acquisition identity of a process queue that has left the table. Its epoch retires
+    /// with it so a replacement installation cannot inherit an older loop's lease.
+    async fn note_queue_revoked(&mut self, mq: &MessageQueue);
 
     /// Removes an unnecessary message queue.
     ///

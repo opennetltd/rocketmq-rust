@@ -150,14 +150,29 @@ const UNLOCK_BATCH_MQ_TIMEOUT_MS: u64 = 1_000;
 impl Rebalance for RebalancePushImpl {
     async fn note_allocation_pass(
         &mut self,
+        topic: &str,
         outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
     ) {
-        // Only consumers whose assignment is tracked by the SDK keep a progress record; for others
-        // it would describe a table that is never populated.
         if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
-            if impl_.tracks_assignment() {
-                impl_.progress.note_allocation_pass(outcome);
-            }
+            impl_.note_allocation_pass(topic, outcome);
+        }
+    }
+
+    async fn note_queue_installed(&mut self, mq: &MessageQueue) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.note_queue_installed(mq);
+        }
+    }
+
+    async fn note_queue_revoked(&mut self, mq: &MessageQueue) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.note_queue_revoked(mq);
+        }
+    }
+
+    async fn note_subscription_set(&mut self, topics: &[cheetah_string::CheetahString]) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.note_subscription_set(topics);
         }
     }
 
@@ -403,6 +418,13 @@ impl Rebalance for RebalancePushImpl {
         let mut process_queue_table = self.rebalance_impl_inner.process_queue_table.write().await;
         let prev = process_queue_table.remove(mq);
         drop(process_queue_table);
+        if prev.is_some() {
+            // The queue left the table, so its acquisition ends here: a pull answer that arrives
+            // later for this queue can no longer publish into whoever installs next (plan 49c C1).
+            if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+                impl_.note_queue_revoked(mq);
+            }
+        }
         if let Some(pq) = prev {
             let droped = pq.is_dropped();
             pq.set_dropped(true);

@@ -810,6 +810,43 @@ impl DefaultMQPushConsumerImpl {
         self.managed_lifecycle.store(true, Ordering::Release);
     }
 
+    /// Records what a completed allocation pass concluded for one topic, when the SDK owns this
+    /// consumer's assignment. For other consumers such a record would describe a table that is
+    /// never populated.
+    pub(crate) fn note_allocation_pass(
+        &self,
+        topic: &str,
+        outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
+    ) {
+        if self.tracks_assignment() {
+            self.progress.note_allocation_pass(topic, outcome);
+        }
+    }
+
+    /// Publishes the acquisition identity of an installed process queue, so that ownership exists
+    /// before any pull is dispatched for it (plan 49c C1). A legacy consumer that leaves assignment
+    /// observation to the application publishes nothing.
+    pub(crate) fn note_queue_installed(&self, mq: &MessageQueue) {
+        if self.tracks_assignment() {
+            self.progress.note_queue_installed(mq);
+        }
+    }
+
+    /// Ends an acquisition whose process queue left the table, retiring its epoch so a replacement
+    /// installation receives a newer identity.
+    pub(crate) fn note_queue_revoked(&self, mq: &MessageQueue) {
+        if self.tracks_assignment() {
+            self.progress.note_queue_revoked(mq);
+        }
+    }
+
+    /// Keeps allocation evidence bounded by the subscription table (plan 49c C3).
+    pub(crate) fn note_subscription_set(&self, topics: &[cheetah_string::CheetahString]) {
+        if self.tracks_assignment() {
+            self.progress.retain_allocation_passes(topics);
+        }
+    }
+
     pub(crate) fn set_cleanup_session_ceiling(&self, ceiling: std::time::Duration) {
         self.cleanup_ceiling_millis
             .store(ceiling.as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Release);
@@ -1228,6 +1265,15 @@ impl DefaultMQPushConsumerImpl {
     /// resuming at the offset this consumer has actually reached rather than at a guessed
     /// position. Queues no longer owned here are skipped: assignment belongs to rebalance,
     /// which will place them again.
+    ///
+    /// The lease is claimed *before* the offset is prepared and revalidated afterwards, so that one
+    /// lost queue cannot accumulate queued repairs while its preparation waits on an offset store
+    /// or a broker, and so that a repair whose acquisition disappeared during preparation -
+    /// revoked, or replaced by another process queue under the same desired allocation - never
+    /// dispatches against work it does not own (plan 49c C1). A queue whose starting offset
+    /// cannot be determined is left stalled rather than pulled from an invalid position:
+    /// leaving it untouched keeps the fault visible, and the next bounded repair pass tries
+    /// again.
     pub(crate) async fn repair_lost_pulls(&mut self, stall_after: std::time::Duration) {
         let lost = self.progress.lost_pulls(stall_after);
         if lost.is_empty() {
@@ -1251,6 +1297,16 @@ impl DefaultMQPushConsumerImpl {
         };
         let mut requests = Vec::new();
         for (mq, pq) in owned {
+            // One repair per acquisition at a time: whoever holds the queue's lease already owns
+            // its next pull, and this repair has nothing to add.
+            let Some(lease) = self.progress.acquire_pull_lease(&mq) else {
+                debug!(
+                    queue = %mq,
+                    "a pull loop or repair already owns this queue, leaving the lost-pull repair to it"
+                );
+                continue;
+            };
+            let epoch = lease.epoch();
             let commit_offset = match &mut self.offset_store {
                 Some(store) => store.read_offset(&mq, ReadOffsetType::MemoryFirstThenStore).await,
                 None => -1,
@@ -1262,12 +1318,35 @@ impl DefaultMQPushConsumerImpl {
             } else {
                 Rebalance::compute_pull_from_where(self.rebalance_impl.as_mut(), &mq).await
             };
-            requests.push(PullRequest::new(
-                self.consumer_config.consumer_group.clone(),
-                mq,
-                pq,
-                next_offset,
-            ));
+            // Preparation awaited on other tasks: the acquisition may have ended, and the table may
+            // hold a different process queue under this key.
+            let still_ours = self.progress.is_current(&mq, epoch) && {
+                let table = self
+                    .rebalance_impl
+                    .rebalance_impl_inner
+                    .process_queue_table
+                    .read()
+                    .await;
+                matches!(table.get(&mq), Some(current) if Arc::ptr_eq(current, &pq))
+            };
+            if !still_ours {
+                debug!(
+                    queue = %mq,
+                    epoch,
+                    "this queue's acquisition ended while its offset was prepared, dropping the repair"
+                );
+                continue;
+            }
+            if next_offset < 0 {
+                warn!(
+                    queue = %mq,
+                    "cannot determine where to resume this queue, leaving it stalled for the next bounded repair"
+                );
+                continue;
+            }
+            let mut request = PullRequest::new(self.consumer_config.consumer_group.clone(), mq, pq, next_offset);
+            request.hold_lease(lease);
+            requests.push(request);
         }
         if requests.is_empty() || self.client_instance.is_none() {
             return;
