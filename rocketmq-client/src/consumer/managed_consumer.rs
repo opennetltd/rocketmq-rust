@@ -21,6 +21,7 @@
 //! `ConfigurationError`/`Blocked` and stops creating work instead.
 
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -52,6 +53,8 @@ use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscri
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::validate_consumer_config;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::ListenerPresence;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
+use crate::consumer::default_mq_push_consumer::LostPullRepairPass;
+use crate::consumer::default_mq_push_consumer::RouteRepairPass;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
 use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
 use crate::consumer::listener::consume_concurrently_status::ConsumeConcurrentlyStatus;
@@ -1016,27 +1019,40 @@ async fn run_incarnation(
     let mut ticker = tokio::time::interval(policy.progress_check);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut effects = std::collections::VecDeque::from(effects);
-    // The repair currently in progress, kept as a **cursor** rather than as a future: each round
-    // runs one bounded slice and remembers where it stopped, so a repair that outlives a status
-    // tick is neither restarted from the beginning (throwing away what it already prepared) nor
-    // run to exhaustion before status is published again (plan 49c C2).
+    // What is left of the repair the machine asked for. The cursor is plain data - it names real
+    // remaining work - and each round turns one cursor into a **pinned operation** that the loop
+    // owns (plan 49d R3): a status tick neither restarts it, duplicates it, nor abandons what
+    // it prepared.
     let mut repair: Option<RepairCursor> = None;
+    let mut pending: Option<PendingRepair> = None;
     loop {
-        // 1. Advance the retained repair by one slice. Stop stays selectable throughout; a slice
-        //    ends between queues or topics, never in the middle of an in-flight round trip.
-        if let Some(cursor) = repair.take() {
-            let next = tokio::select! {
-                biased;
-                _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
-                next = advance_repair(consumer, cursor, policy.progress_check / 2) => next,
-            };
-            repair = next;
+        // 1. Start the next bounded pass only when none is in flight. Building a pass borrows the
+        //    consumer for the length of this statement; what it returns holds cloned handles, so
+        //    the operation stays alive beside later status work.
+        if pending.is_none() {
+            match repair.take() {
+                Some(RepairCursor::LostPull { .. }) => {
+                    pending = Some(PendingRepair::LostPull(consumer.lost_pull_repair_pass(
+                        stall_after(),
+                        pull_deadline(),
+                        policy.progress_check / 2,
+                    )));
+                }
+                Some(RepairCursor::Routes { after }) => {
+                    match consumer.route_repair_pass(after, policy.progress_check / 2) {
+                        Some(pass) => pending = Some(PendingRepair::Routes(pass)),
+                        // No client instance to repair through: there is no remaining work to carry.
+                        None => repair = None,
+                    }
+                }
+                None => {}
+            }
         }
 
-        // 2. With no repair running, take the effects the machine asked for. Anything queued behind
-        //    a repair is re-derived from fresh state on the following round instead of executed
-        //    blindly.
-        if repair.is_none() {
+        // 2. With no repair owned at all, take the effects the machine asked for. Anything queued
+        //    behind an operation is re-derived from fresh state on the following round instead of
+        //    executed blindly, and a second refresh is never started beside the first.
+        if pending.is_none() && repair.is_none() {
             while let Some(effect) = effects.pop_front() {
                 match effect {
                     Effect::Idle(delay) => {
@@ -1061,22 +1077,50 @@ async fn run_incarnation(
             }
         }
 
-        // 3. Status stays on the cadence while a repair runs. With nothing in flight the loop
-        //    simply waits for the next tick; with a repair retained it checks the cadence without
-        //    blocking and goes straight back to work, so publication is never delayed behind a
-        //    nameserver.
-        if repair.is_some() {
-            if !cadence_due(&mut ticker) {
-                continue;
+        // 3. Wait for whichever comes first: the pinned operation settling, the status cadence, or
+        //    stop. Polling them in one select is what keeps publication on schedule behind a held
+        //    nameserver or a held offset read - slicing alone could not, because the wait happens
+        //    inside a single topic or queue (plan 49d R3).
+        let mut settled = None;
+        match pending.as_mut() {
+            Some(op) => {
+                tokio::select! {
+                    biased;
+                    _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
+                    outcome = &mut *op => settled = Some(outcome),
+                    _ = ticker.tick() => {}
+                }
             }
-        } else {
-            tokio::select! {
-                biased;
-                _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
-                _ = ticker.tick() => {}
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = stop_token.cancelled() => return IncarnationEnd::StopRequested,
+                    _ = ticker.tick() => {}
+                }
             }
         }
+
+        // 4. An operation that finished is judged on its own evidence: the remaining cursor moves
+        //    forward, and only a pass that completed reports to the replacement budget.
         let snapshot = progress.snapshot(stall_after(), pull_deadline());
+        if let Some(settled) = settled {
+            pending = None;
+            match settled {
+                RepairOutcome::Routes(next_topic) => {
+                    repair = next_topic.map(|topic| RepairCursor::Routes { after: Some(topic) });
+                    if repair.is_none() {
+                        machine.note_repair_settled(route_repair_resolved(&snapshot));
+                    }
+                }
+                RepairOutcome::LostPull(finished) => {
+                    repair = (!finished).then_some(RepairCursor::LostPull { after: None });
+                    if finished {
+                        machine.note_repair_settled(snapshot.lost_pull_queues == 0);
+                    }
+                }
+            }
+        }
+
         let (state, next) = machine.on_tick(&snapshot, pull_deadline(), jitter_unit());
         publisher.publish(state, machine.incarnation(), &snapshot);
         effects = next.into();
@@ -1088,9 +1132,9 @@ async fn run_incarnation(
     }
 }
 
-/// Where a retained repair continues from (plan 49c C2). Plain data on purpose: the controller
-/// keeps owning the consumer instead of holding a self-referential future across status ticks, and
-/// each position names real remaining work rather than a restart.
+/// Where a retained repair continues from (plan 49c C2, plan 49d R3). Plain data on purpose: it
+/// says what work is still owed between one owned pass and the next, so nothing that already
+/// succeeded is repeated and no future has to borrow the consumer across status ticks.
 #[derive(Clone, Debug)]
 enum RepairCursor {
     /// Re-dispatch lost pulls. Queues already repaired leave the lost set, so the next slice picks
@@ -1105,37 +1149,45 @@ enum RepairCursor {
     },
 }
 
-/// Run one bounded slice of a retained repair and report where to continue, or `None` when it is
-/// done.
-async fn advance_repair(
-    consumer: &mut DefaultMQPushConsumer,
-    cursor: RepairCursor,
-    slice: Duration,
-) -> Option<RepairCursor> {
-    match cursor {
-        RepairCursor::LostPull { .. } => {
-            if consumer.repair_lost_pulls(stall_after(), pull_deadline(), slice).await {
-                None
-            } else {
-                Some(RepairCursor::LostPull { after: None })
-            }
-        }
-        RepairCursor::Routes { after } => {
-            consumer
-                .repair_routes_and_rebalance(after.as_ref(), slice)
-                .await
-                .map(|next_topic| RepairCursor::Routes {
-                    after: Some(next_topic),
-                })
+/// One repair pass the controller owns, pinned so a status tick can neither drop it nor start a
+/// second one beside it (plan 49d R3). Each variant wraps an already-boxed owned future; polling
+/// this type never allocates.
+enum PendingRepair {
+    Routes(RouteRepairPass),
+    LostPull(LostPullRepairPass),
+}
+
+// Both fields are `Pin<Box<dyn Future>>`, which is `Unpin`, so the enum is: polling it through a
+// bare mutable reference moves nothing, and holding one across status ticks needs no pinning
+// ceremony.
+impl Future for PendingRepair {
+    type Output = RepairOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            PendingRepair::Routes(pass) => pass.as_mut().poll(cx).map(RepairOutcome::Routes),
+            PendingRepair::LostPull(pass) => pass.as_mut().poll(cx).map(RepairOutcome::LostPull),
         }
     }
 }
 
-/// Whether the status cadence has elapsed, without ever blocking behind a running repair.
-fn cadence_due(ticker: &mut tokio::time::Interval) -> bool {
-    let waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    matches!(ticker.poll_tick(&mut cx), std::task::Poll::Ready(_))
+/// What a pinned repair pass reported when it settled.
+enum RepairOutcome {
+    /// The route pass ended; `Some(topic)` means its slice ran out and the next pass continues
+    /// there.
+    Routes(Option<cheetah_string::CheetahString>),
+    /// The lost-pull pass ended; `true` once nothing more is queued for re-dispatch.
+    LostPull(bool),
+}
+
+/// Whether a finished route repair cleared the faults it addresses (a failed allocation, a queue
+/// with no route knowledge, an RPC that timed out, a lost pull loop). Anything still standing means
+/// this attempt did not resolve what asked for it.
+fn route_repair_resolved(snapshot: &ProgressSnapshot) -> bool {
+    snapshot.lost_pull_queues == 0
+        && snapshot.route_miss_queues == 0
+        && snapshot.rpc_timeout_queues == 0
+        && snapshot.failed_allocations().next().is_none()
 }
 
 /// Errors that retrying the same spec cannot fix.
@@ -1801,7 +1853,8 @@ mod tests {
         // One topic per round: a zero slice must stop between topics and hand back where it
         // stopped.
         let cursor = consumer
-            .repair_routes_and_rebalance(None, Duration::ZERO)
+            .route_repair_pass(None, Duration::ZERO)
+            .expect("a client instance is attached")
             .await
             .expect("two subscriptions cannot both fit in a zero-length slice");
         assert_eq!(
@@ -1829,7 +1882,8 @@ mod tests {
             .put_subscription_data(CheetahString::from_static_str("T-B"), late)
             .await;
         let finished = consumer
-            .repair_routes_and_rebalance(Some(&cursor), Duration::from_secs(30))
+            .route_repair_pass(Some(cursor.clone()), Duration::from_secs(30))
+            .expect("a client instance is attached")
             .await;
         assert!(finished.is_none(), "the cursor pass finishes the repair");
         assert_eq!(
@@ -1839,5 +1893,193 @@ mod tests {
         );
         drop(subscriptions);
         client.clone().shutdown().await;
+    }
+
+    fn status_sink() -> (StatusPublisher, broadcast::Receiver<ConsumerStatus>) {
+        let initial = ConsumerStatus {
+            phase: ConsumerPhase::Starting,
+            health: ConsumerHealth::Healthy,
+            reason: Reason::None.as_str(),
+            incarnation: 1,
+            progress: ProgressCounts::default(),
+        };
+        let (status, _observed) = watch::channel(initial);
+        let (events, receiver) = broadcast::channel(512);
+        (
+            StatusPublisher {
+                status,
+                events: Arc::new(events),
+            },
+            receiver,
+        )
+    }
+
+    /// Plan 49d R3: a repair pass is pinned and polled **beside** the status cadence. Holding the
+    /// nameserver lock makes one route refresh wait inside that pass; publications must keep their
+    /// cadence, elapsed ticks may not be read as further failed attempts (which used to escalate a
+    /// still-running repair into incarnation replacement), and stop must still be answered at once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_keeps_its_cadence_while_a_route_repair_waits_on_the_nameserver() {
+        use crate::factory::mq_client_instance::MQClientInstance;
+        use cheetah_string::CheetahString;
+
+        let group = "49d-r3-route-repair";
+        let mut consumer = managed_incarnation(group, "T-A");
+        let client = MQClientInstance::new_arc(
+            crate::base::client_config::ClientConfig {
+                namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:1")),
+                ..Default::default()
+            },
+            0,
+            "49d-r3-route-repair-client",
+            None,
+        );
+        consumer.default_mqpush_consumer_impl.as_mut().unwrap().client_instance = Some(client.clone());
+        let progress = consumer.progress();
+        let mut machine = RecoveryMachine::new(
+            LifecyclePolicy {
+                progress_check: Duration::from_millis(20),
+                ..LifecyclePolicy::default()
+            },
+            1,
+        );
+        let (publisher, mut events) = status_sink();
+
+        // One route refresh waits on this lock for the whole observation window.
+        let hold = client.nameserver_lock();
+        let held = tokio::spawn(async move {
+            let _guard = hold.lock().await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+
+        let stop = CancellationToken::new();
+        let stopper = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                stop.cancel();
+            })
+        };
+
+        let began = std::time::Instant::now();
+        let end = run_incarnation(
+            &mut consumer,
+            &mut machine,
+            &publisher,
+            &stop,
+            &progress,
+            vec![Effect::Repair(RepairKind::Assignment)],
+        )
+        .await;
+        let elapsed = began.elapsed();
+
+        // Stop was requested while the same pass was still waiting, and answered without waiting
+        // for it - and never by an escalation that replaced a healthy incarnation.
+        assert_eq!(end, IncarnationEnd::StopRequested);
+        assert!(
+            (Duration::from_millis(140)..Duration::from_millis(320)).contains(&elapsed),
+            "stop must be answered promptly beside a waiting repair: {elapsed:?}"
+        );
+
+        let mut publications = 0usize;
+        while events.try_recv().is_ok() {
+            publications += 1;
+        }
+        assert!(
+            publications >= 4,
+            "a waiting nameserver delayed status: {publications} publications in {elapsed:?}"
+        );
+
+        stopper.abort();
+        held.abort();
+    }
+
+    /// Plan 49d R3, offset side: the same guarantee while a lost-pull repair waits inside its own
+    /// preparation. The process-queue table is write-locked, so the pass blocks where real offset
+    /// preparation blocks; status and stop must be unaffected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_keeps_its_cadence_while_a_lost_pull_repair_waits_on_preparation() {
+        use rocketmq_common::common::message::message_queue::MessageQueue;
+
+        let mut consumer = managed_incarnation("49d-r3-lost-pull", "T-A");
+        let progress = consumer.progress();
+        let table = consumer
+            .default_mqpush_consumer_impl
+            .as_mut()
+            .unwrap()
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .clone();
+
+        // One acquisition whose own RPC window has already passed: lost, and repairable.
+        let mq = MessageQueue::from_parts("T-A", "broker-a", 0);
+        progress.note_queue_installed(&mq);
+        let lease = progress.acquire_pull_lease(&mq).expect("an installed queue is owned");
+        let epoch = lease.epoch();
+        progress.begin_pull_attempt(&mq, epoch, Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            progress.lost_pulls(stall_after(), pull_deadline()).len(),
+            1,
+            "fixture: one overdue attempt"
+        );
+
+        let mut machine = RecoveryMachine::new(
+            LifecyclePolicy {
+                progress_check: Duration::from_millis(20),
+                ..LifecyclePolicy::default()
+            },
+            1,
+        );
+        let (publisher, mut events) = status_sink();
+
+        let hold = table.clone();
+        let held = tokio::spawn(async move {
+            let _guard = hold.write().await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        // Let the write guard be taken before the controller starts, so its first repair pass is
+        // the one that waits.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let stop = CancellationToken::new();
+        let stopper = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                stop.cancel();
+            })
+        };
+
+        let began = std::time::Instant::now();
+        let end = run_incarnation(
+            &mut consumer,
+            &mut machine,
+            &publisher,
+            &stop,
+            &progress,
+            vec![Effect::Repair(RepairKind::LostPull)],
+        )
+        .await;
+        let elapsed = began.elapsed();
+
+        assert_eq!(end, IncarnationEnd::StopRequested);
+        assert!(
+            (Duration::from_millis(140)..Duration::from_millis(320)).contains(&elapsed),
+            "stop must be answered promptly beside a waiting repair: {elapsed:?}"
+        );
+        let mut publications = 0usize;
+        while events.try_recv().is_ok() {
+            publications += 1;
+        }
+        assert!(
+            publications >= 4,
+            "held offset preparation delayed status: {publications} publications in {elapsed:?}"
+        );
+
+        drop(lease);
+        stopper.abort();
+        held.abort();
     }
 }

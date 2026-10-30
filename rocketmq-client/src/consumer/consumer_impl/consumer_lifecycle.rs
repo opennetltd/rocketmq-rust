@@ -1257,6 +1257,19 @@ impl RecoveryMachine {
         self.startup_budget
     }
 
+    /// The controller reports a repair attempt that **finished** (plan 49d R3). Only a settled
+    /// attempt speaks for the replacement budget: while a pass is still owned - waiting on a
+    /// nameserver, on an offset read, or simply working through its time slice - elapsed status
+    /// ticks measure wall clock, not failed work, and charging them escalated repairs that had
+    /// not been judged yet.
+    pub(crate) fn note_repair_settled(&mut self, resolved: bool) {
+        if resolved {
+            self.stalled_repairs = 0;
+        } else {
+            self.stalled_repairs = self.stalled_repairs.saturating_add(1);
+        }
+    }
+
     pub(crate) fn state(&self) -> MachineState {
         self.state
     }
@@ -1483,7 +1496,9 @@ impl RecoveryMachine {
                 health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
                 reason: Reason::ExpectedPullMissing,
             };
-            self.stalled_repairs = self.stalled_repairs.saturating_add(1);
+            // The budget is spent by repair attempts that finished without resolving the fault,
+            // never by status ticks elapsed while one pass is still running (plan 49d
+            // R3).
             if self.stalled_repairs > self.policy.max_repairs_before_replace {
                 self.stalled_repairs = 0;
                 return (self.state, vec![Effect::Stop { grace: Duration::ZERO }]);
@@ -1577,9 +1592,9 @@ impl RecoveryMachine {
                 Reason::AssignmentRefreshFailed => RepairKind::Assignment,
                 _ => RepairKind::RouteAndPull,
             };
-            self.stalled_repairs = self.stalled_repairs.saturating_add(1);
-            // In-place repair is always tried first. Only after repeated repairs produce no
-            // progress does the shell roll one guarded incarnation replacement.
+            // In-place repair is always tried first. Only after repeated repairs - each one
+            // reported by the controller once it actually settled - produce no progress
+            // does the shell roll one guarded incarnation replacement.
             if self.stalled_repairs > self.policy.max_repairs_before_replace {
                 self.stalled_repairs = 0;
                 return (self.state, vec![Effect::Stop { grace: Duration::ZERO }]);
@@ -1849,6 +1864,65 @@ mod tests {
             assert!(
                 !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
                 "replacement would not restore a missing route: {effects:?}"
+            );
+        }
+    }
+
+    /// Plan 49d R3: ticks that pass while one repair is still running say nothing about whether
+    /// that attempt worked. Only an attempt the controller reports as **settled** spends the
+    /// replacement budget, and a settled attempt that resolved its fault clears what earlier
+    /// ones accumulated.
+    #[test]
+    fn elapsed_ticks_do_not_spend_the_replacement_budget() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 2);
+        for id in 0..2 {
+            progress.note_pull_failed(&queue("T", id), PullFailureKind::RouteOrBrokerMiss);
+        }
+        let mut machine = RecoveryMachine::new(policy, 1);
+        let snap = snapshot(&progress);
+
+        // The same fault observed across many cadence ticks while one pass is still working: it
+        // stays a repair in place, however long that pass takes.
+        for _ in 0..policy.max_repairs_before_replace + 4 {
+            let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+            assert_eq!(state.reason, Reason::RouteOrBrokerMiss);
+            assert!(
+                !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+                "elapsed ticks escalated a repair that had not settled: {effects:?}"
+            );
+        }
+
+        // Attempts that finish without resolving anything do spend it - one at a time.
+        for _ in 0..policy.max_repairs_before_replace {
+            machine.note_repair_settled(false);
+            let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+            assert!(
+                !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+                "replacement comes only after the allowance is spent: {effects:?}"
+            );
+        }
+        machine.note_repair_settled(false);
+        let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+        assert!(
+            matches!(effects.first(), Some(Effect::Stop { .. })),
+            "repeated settled-but-fruitless attempts must roll one guarded replacement: {effects:?}"
+        );
+
+        // And progress pays the debt back: a full allowance of fruitless attempts followed by one
+        // that resolved its fault starts counting again from nothing.
+        let mut machine = RecoveryMachine::new(policy, 1);
+        for _ in 0..policy.max_repairs_before_replace {
+            machine.note_repair_settled(false);
+        }
+        machine.note_repair_settled(true);
+        for _ in 0..policy.max_repairs_before_replace {
+            machine.note_repair_settled(false);
+            let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+            assert!(
+                !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+                "a resolved attempt cleared the accumulated failures: {effects:?}"
             );
         }
     }
@@ -2676,12 +2750,18 @@ mod tests {
             }
             let snap = snapshot(&progress);
             let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+            // The repair this tick asked for runs and settles without resolving anything: attempts
+            // are charged when they finish, never per status tick (plan 49d R3).
+            machine.note_repair_settled(false);
             assert_eq!(
                 state.phase,
                 crate::consumer::managed_consumer::ConsumerPhase::Recovering,
                 "a fruitless repair never becomes terminal: {state:?}"
             );
-            assert!(machine.stalled_repairs <= policy.max_repairs_before_replace);
+            // Bounded either way: an attempt charges itself when it settles, and the following
+            // status tick is what escalates, so the counter may sit one over the
+            // allowance in between.
+            assert!(machine.stalled_repairs <= policy.max_repairs_before_replace + 1);
             if effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })) {
                 replacements += 1;
                 // The controller proves cleanup before the next incarnation is built.

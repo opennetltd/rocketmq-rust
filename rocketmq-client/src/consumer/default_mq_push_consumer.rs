@@ -23,6 +23,8 @@ use rocketmq_remoting::protocol::namespace_util::NamespaceUtil;
 use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -645,6 +647,14 @@ pub enum ConsumerCleanup {
     Incomplete,
 }
 
+/// One bounded route-repair pass, owned by whoever asked for it so it can be pinned and polled
+/// beside other work instead of blocking it (plan 49d R3). Resolves to the topic a later pass
+/// continues from, or `None` when the repair is finished.
+pub(crate) type RouteRepairPass = Pin<Box<dyn Future<Output = Option<CheetahString>> + Send>>;
+
+/// One bounded lost-pull repair pass. Resolves to whether anything is still lost.
+pub(crate) type LostPullRepairPass = Pin<Box<dyn Future<Output = bool> + Send>>;
+
 impl DefaultMQPushConsumer {
     /// The SDK-owned progress bus of this instance. Shared with the recovery controller so it can
     /// observe real work transitions without an application observer.
@@ -677,11 +687,15 @@ impl DefaultMQPushConsumer {
     /// at its time slice between topics, returning the topic to continue from so the next round
     /// carries on instead of repeating what already succeeded. An in-flight bounded route wait
     /// is never cut short.
-    pub(crate) async fn repair_routes_and_rebalance(
+    ///
+    /// It is returned as an **owned** future (plan 49d R3) holding only cloned handles - the
+    /// runtime subscription table and this client's instance - so the controller can pin it and
+    /// keep polling its status cadence beside it instead of being blocked behind a nameserver.
+    pub(crate) fn route_repair_pass(
         &mut self,
-        after: Option<&cheetah_string::CheetahString>,
+        after: Option<cheetah_string::CheetahString>,
         slice: std::time::Duration,
-    ) -> Option<cheetah_string::CheetahString> {
+    ) -> Option<RouteRepairPass> {
         let impl_ = self.default_mqpush_consumer_impl.as_ref()?;
         // The **runtime** subscription table is authoritative (plan 49d R2). Managed construction
         // detaches the builder's subscriptions and re-applies them through `subscribe`,
@@ -690,62 +704,68 @@ impl DefaultMQPushConsumer {
         // subscribed topic. Namespace normalisation and later subscribe/unsubscribe also
         // land only here, including the SDK retry topic added at start.
         let subscriptions = impl_.rebalance_impl.get_subscription_inner();
-        let topics: Vec<cheetah_string::CheetahString> = {
-            let guard = subscriptions.read().await;
-            let mut keys = guard.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            keys
-        };
         let instance = impl_.client_instance.clone()?;
-        let mut instance = instance;
-        let started = std::time::Instant::now();
-        let pending: Vec<_> = topics
-            .into_iter()
-            .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
-            .collect();
-        for (index, topic) in pending.iter().enumerate() {
-            // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must not
-            // get route work for a subscription this consumer no longer holds.
-            if !subscriptions.read().await.contains_key(topic) {
-                tracing::debug!(
-                    topic = %topic,
-                    "this topic is no longer subscribed, dropping it from the route repair"
-                );
-                continue;
+        Some(Box::pin(async move {
+            let mut instance = instance;
+            let topics: Vec<cheetah_string::CheetahString> = {
+                let guard = subscriptions.read().await;
+                let mut keys = guard.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            };
+            let started = std::time::Instant::now();
+            let after = after.as_ref();
+            let pending: Vec<_> = topics
+                .into_iter()
+                .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
+                .collect();
+            for (index, topic) in pending.iter().enumerate() {
+                // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must
+                // not get route work for a subscription this consumer no longer holds.
+                if !subscriptions.read().await.contains_key(topic) {
+                    tracing::debug!(
+                        topic = %topic,
+                        "this topic is no longer subscribed, dropping it from the route repair"
+                    );
+                    continue;
+                }
+                let refreshed = instance
+                    .as_mut()
+                    .repair_route_after_broker_miss(topic, Duration::from_millis(500))
+                    .await;
+                if !refreshed {
+                    tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
+                }
+                if index + 1 < pending.len() && started.elapsed() >= slice {
+                    instance.re_balance_immediately();
+                    tracing::debug!(
+                        topic = %topic,
+                        "route repair reached its time slice, continuing with the remaining topics on the next status round"
+                    );
+                    return Some(topic.clone());
+                }
             }
-            let refreshed = instance
-                .as_mut()
-                .repair_route_after_broker_miss(topic, Duration::from_millis(500))
-                .await;
-            if !refreshed {
-                tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
-            }
-            if index + 1 < pending.len() && started.elapsed() >= slice {
-                instance.re_balance_immediately();
-                tracing::debug!(
-                    topic = %topic,
-                    "route repair reached its time slice, continuing with the remaining topics on the next status round"
-                );
-                return Some(topic.clone());
-            }
-        }
-        instance.re_balance_immediately();
-        None
+            instance.re_balance_immediately();
+            None
+        }))
     }
 
     /// Re-dispatch the pulls that were lost, if any (plan 49a F4 section 4.3 item 5). Used by the
-    /// recovery controller when a queue this consumer owns stopped having a pull request in
-    /// flight.
-    pub(crate) async fn repair_lost_pulls(
+    /// recovery controller when a queue this consumer owns stopped having a pull request in flight.
+    ///
+    /// Owned future for the same reason as [`Self::route_repair_pass`]: one pass is pinned and
+    /// polled beside status, so an offset read that waits on another task delays only the
+    /// repair.
+    pub(crate) fn lost_pull_repair_pass(
         &mut self,
         stall_after: std::time::Duration,
         pull_deadline: std::time::Duration,
         slice: std::time::Duration,
-    ) -> bool {
-        let Some(impl_) = self.default_mqpush_consumer_impl.as_mut() else {
-            return true;
+    ) -> LostPullRepairPass {
+        let Some(mut impl_) = self.default_mqpush_consumer_impl.as_mut().cloned() else {
+            return Box::pin(async { true });
         };
-        impl_.repair_lost_pulls(stall_after, pull_deadline, slice).await
+        Box::pin(async move { impl_.repair_lost_pulls(stall_after, pull_deadline, slice).await })
     }
 
     /// Where this consumer's single cleanup session stands, or `None` while no stop has been
