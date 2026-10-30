@@ -52,6 +52,29 @@ pub struct RemoteBrokerOffsetStore {
     offset_table: Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>>,
 }
 
+/// The budget for acquiring the offset snapshot: a pass' own absolute deadline when it has one, and
+/// otherwise one finite allowance - never more than a single offset write was ever given - so even
+/// the periodic task cannot wait on the table lock indefinitely (plan 49d R6).
+fn preparation_deadline(deadline: Option<TokioInstant>) -> TokioInstant {
+    match deadline {
+        Some(deadline) => deadline,
+        None => TokioInstant::now() + std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS),
+    }
+}
+
+/// What acquiring the offset snapshot produced (plan 49d R6).
+pub(crate) enum OffsetSnapshot {
+    /// The assigned offsets this pass may write. Assignments with no recorded offset are absent
+    /// from the list, which is a conclusion this pass actually established.
+    Ready(Vec<(MessageQueue, i64)>),
+    /// The snapshot was not acquired before its budget ended, so this pass cannot tell which of its
+    /// assignments have stored offsets. It writes nothing and prunes nothing: the difference
+    /// between an offset of zero and no offset at all is exactly what the snapshot could not
+    /// establish, and either pruning or reporting an empty success would turn a stall into lost
+    /// progress.
+    NotAcquired,
+}
+
 /// How many offset writes one pass may have in flight at once (plan 49a F10 section 4.6 item 2).
 /// Enough that a pass over hundreds of queues is not dominated by sequential connection setup, few
 /// enough that one consumer's offset persistence cannot become a burst against the brokers.
@@ -165,8 +188,34 @@ impl RemoteBrokerOffsetStore {
         if mqs.is_empty() {
             return summary;
         }
+        // Preparation belongs to this pass' budget (plan 49d R6): acquiring the snapshot is bounded
+        // by the same absolute instant as the writes, and a periodic pass with no caller
+        // deadline gets one finite preparation allowance rather than waiting on the table
+        // lock for however long its holder feels like keeping it. Cancellation is consulted
+        // before preparation starts, so a consumer that has begun stopping does not queue
+        // behind a lock at all.
+        if cancelled() {
+            summary.skipped += mqs.len() as u64;
+            return summary;
+        }
+        let preparation_deadline = preparation_deadline(deadline);
         // Snapshot only the assigned offsets once; the table lock is never held across I/O.
-        let pending = self.snapshot_assigned(mqs).await;
+        let pending = match self.snapshot_assigned(mqs, preparation_deadline).await {
+            OffsetSnapshot::Ready(pending) => pending,
+            OffsetSnapshot::NotAcquired => {
+                // One explanation per pass, and every assignment reported as unwritten work:
+                // nothing was sent, and which of them have stored offsets is
+                // unknown rather than absent.
+                warn!(
+                    "[persistAll] offset snapshot not acquired before its deadline, group={}, {} assigned queue(s) \
+                     left unwritten",
+                    self.group_name,
+                    mqs.len()
+                );
+                summary.skipped += mqs.len() as u64;
+                return summary;
+            }
+        };
         let total = pending.len() as u64;
         // A second shared handle to the same API object: writes borrow it, they never take it
         // mutably, so overlapping them cannot produce two mutable aliases of the client.
@@ -391,13 +440,29 @@ impl RemoteBrokerOffsetStore {
 
     /// Assigned offsets plus the unused entries pruned from the table. Kept out of the send loop so
     /// a stalled broker cannot hold the table lock.
-    async fn snapshot_assigned(&mut self, mqs: &HashSet<MessageQueue>) -> Vec<(MessageQueue, i64)> {
+    /// Read the assigned offsets, and drop the entries no longer assigned. The table lock is taken
+    /// inside `preparation_deadline` (plan 49d R6): a holder cannot make this pass outlive its own
+    /// budget, and a pass that loses that race says so instead of writing on stale information or
+    /// pruning what it never looked at.
+    async fn snapshot_assigned(
+        &mut self,
+        mqs: &HashSet<MessageQueue>,
+        preparation_deadline: TokioInstant,
+    ) -> OffsetSnapshot {
         let mut unused_mq = HashSet::new();
         let mut used_mq = Vec::new();
         if mqs.is_empty() {
-            return used_mq;
+            return OffsetSnapshot::Ready(used_mq);
         }
-        let mut offset_table = self.offset_table.lock().await;
+        // Polling the lock first means an acquisition that succeeds right at the deadline still
+        // counts as a success; only a wait that outlives the budget is reported as not
+        // acquired.
+        let offset_table = tokio::select! {
+            biased;
+            guard = self.offset_table.lock() => guard,
+            _ = tokio::time::sleep_until(preparation_deadline) => return OffsetSnapshot::NotAcquired,
+        };
+        let mut offset_table = offset_table;
         for (mq, offset) in offset_table.iter_mut() {
             if mqs.contains(mq) {
                 let offset = offset.get_offset();
@@ -410,7 +475,15 @@ impl RemoteBrokerOffsetStore {
             offset_table.remove(&mq);
             info!("remove unused mq, {}, {}", mq, self.group_name);
         }
-        used_mq
+        OffsetSnapshot::Ready(used_mq)
+    }
+
+    /// Test seam (plan 49d R6): the handle for the offset table lock, so a test can hold it and
+    /// make a pass wait for preparation exactly as it would behind another writer. Never
+    /// compiled into anything that ships.
+    #[cfg(test)]
+    pub(crate) fn offset_table_lock(&self) -> Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>> {
+        self.offset_table.clone()
     }
 
     /// One offset write including its broker lookup and any route refresh. `timeout_millis` bounds
@@ -805,11 +878,13 @@ mod tests {
             store.update_offset(mq, id as i64 + 1, false).await;
         }
 
-        // Stop after the first queue has been offered: exactly one write is taken.
+        // Stop after the first queue has been offered: exactly one write is taken. The probe is
+        // asked once before preparation (plan 49d R6) and then again for each queue before
+        // it is offered, so this lands ahead of the second queue rather than on the way in.
         let checks = std::sync::atomic::AtomicUsize::new(0);
         let summary = store
             .persist_all(&assigned, &|| {
-                checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+                checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
             })
             .await;
         assert_eq!(1, summary.attempted, "{summary}");
@@ -821,5 +896,143 @@ mod tests {
         let full = store.persist_all(&assigned, &|| false).await;
         assert_eq!(6, full.attempted, "{full}");
         assert_eq!(0, full.skipped, "{full}");
+    }
+
+    /// Plan 49d R6: preparation belongs to the pass' budget. Taking the offset-table snapshot used
+    /// to be an unbounded await outside it, so a holder of that lock decided how long a
+    /// persistence pass ran - past its own deadline for a cleanup session, and indefinitely for
+    /// the periodic task.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_snapshot_lock_ends_the_pass_on_its_own_deadline() {
+        let mut store = RemoteBrokerOffsetStore::new(
+            dead_instance("snapshot-contention-test"),
+            CheetahString::from("snapshot-group"),
+        );
+        let assigned = queues("ContendedTopic", 3);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+
+        // Hold the table lock, and give the pass more budget than it needs to prepare.
+        let handle = store.offset_table_lock();
+        let held = handle.lock().await;
+        let deadline = TokioInstant::now() + Duration::from_millis(40);
+        let started = TokioInstant::now();
+        let summary = tokio::time::timeout(Duration::from_secs(5), store.persist_all_until(&assigned, deadline))
+            .await
+            .expect("the pass ended on its own deadline instead of waiting for the snapshot lock");
+        let elapsed = started.elapsed();
+
+        assert_eq!(0, summary.attempted, "preparation never reached a write: {summary}");
+        assert_eq!(3, summary.skipped, "{summary}");
+        assert_eq!(0, summary.succeeded, "{summary}");
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "the pass did not use the budget it was given: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(2_000),
+            "a lock holder decided how long this pass ran: {elapsed:?}",
+        );
+
+        // And nothing was pruned or forgotten while the snapshot could not be read: with the lock
+        // free again, every assignment is still there to write.
+        drop(held);
+        let after = store
+            .persist_all_until(&assigned, TokioInstant::now() + Duration::from_secs(5))
+            .await;
+        assert_eq!(3, after.attempted, "{after}");
+        assert_eq!(0, after.skipped, "{after}");
+    }
+
+    /// A consumer that has begun stopping may not queue behind the snapshot lock either:
+    /// cancellation is consulted before preparation, so it reports its assignments without
+    /// touching the table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopping_consumer_does_not_wait_to_prepare() {
+        let mut store = RemoteBrokerOffsetStore::new(
+            dead_instance("cancel-prepare-test"),
+            CheetahString::from("cancel-prepare-group"),
+        );
+        let assigned = queues("CancelPrepareTopic", 4);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+        let handle = store.offset_table_lock();
+        let _held = handle.lock().await;
+
+        // Cancellation ahead of preparation is the only way this pass ends while the lock is held
+        // and its deadline is a minute away.
+        let started = TokioInstant::now();
+        let summary = tokio::time::timeout(Duration::from_secs(5), store.persist_all(&assigned, &|| true))
+            .await
+            .expect("a stopping consumer waited on the snapshot lock");
+        assert_eq!(0, summary.attempted, "{summary}");
+        assert_eq!(4, summary.skipped, "{summary}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a stopping consumer queued behind a lock: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Nothing assigned means nothing to prepare, and no lock is needed at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_assignment_prepares_nothing() {
+        let mut store = RemoteBrokerOffsetStore::new(
+            dead_instance("empty-assign-test"),
+            CheetahString::from("empty-assign-group"),
+        );
+        let handle = store.offset_table_lock();
+        let _held = handle.lock().await;
+        let summary = tokio::time::timeout(
+            Duration::from_millis(200),
+            store.persist_all_until(&HashSet::new(), TokioInstant::now() + Duration::from_secs(60)),
+        )
+        .await
+        .expect("an empty pass must not wait for the table lock");
+        assert_eq!(0, summary.attempted + summary.skipped, "{summary}");
+    }
+
+    /// An uncontended snapshot taken close to the deadline still counts as preparation that
+    /// succeeded: the writes are issued, and only what the budget could not reach is reported
+    /// unwritten.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_snapshot_acquired_before_the_deadline_still_writes() {
+        let mut store = RemoteBrokerOffsetStore::new(
+            dead_instance("near-deadline-test"),
+            CheetahString::from("near-deadline-group"),
+        );
+        let assigned = queues("NearDeadlineTopic", 2);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+        let summary = store
+            .persist_all_until(&assigned, TokioInstant::now() + Duration::from_millis(500))
+            .await;
+        assert_eq!(
+            2, summary.attempted,
+            "preparation succeeded, so both were offered: {summary}"
+        );
+        assert_eq!(0, summary.skipped, "{summary}");
+    }
+
+    /// A periodic pass has no caller deadline, so preparation gets one finite allowance rather than
+    /// an unbounded wait - and never more than a single write was ever given.
+    #[test]
+    fn a_pass_without_a_deadline_still_prepares_inside_a_budget() {
+        let budget = std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS);
+        let before = TokioInstant::now();
+        let deadline = preparation_deadline(None);
+        let after = TokioInstant::now();
+        assert!(
+            deadline >= before + budget && deadline <= after + budget,
+            "preparation allowance drifted off the offset timeout: {deadline:?}"
+        );
+
+        // A supplied absolute deadline is used as it stands: preparation may not extend a pass that
+        // was given one, and cannot shorten it either.
+        let absolute = TokioInstant::now() + Duration::from_millis(25);
+        assert_eq!(preparation_deadline(Some(absolute)), absolute);
     }
 }

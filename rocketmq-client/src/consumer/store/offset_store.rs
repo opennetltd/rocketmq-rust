@@ -32,8 +32,11 @@ pub struct PersistSummary {
     /// answer to give (plan 49c C5).
     pub succeeded: u64,
     pub failed: u64,
-    /// Assigned offsets left unwritten because the deadline or a stopping consumer came first.
-    /// These were never sent.
+    /// Assigned offsets left unwritten because the deadline, a stopping consumer, or a snapshot
+    /// that could not be acquired in time came first. These were never sent. When the snapshot
+    /// itself lost its budget, every assigned queue is counted here: such a pass cannot
+    /// distinguish an assignment with no recorded offset from one it never got to read (plan
+    /// 49d R6).
     pub skipped: u64,
     /// Writes handed to the transport without a broker acknowledgement. They left this process,
     /// which is not the same statement as "the broker stored this offset", so they are kept
