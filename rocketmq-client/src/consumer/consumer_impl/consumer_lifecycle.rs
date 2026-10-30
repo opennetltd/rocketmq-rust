@@ -31,6 +31,7 @@ use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_common::TimeUtils::get_current_millis;
 use tracing::debug;
+use tracing::error;
 
 /// SDK-owned recovery policy (plan 49 section 3.2). These are explicit SDK policy choices, not
 /// application configuration: the managed entry point intentionally exposes no copies of them.
@@ -203,6 +204,10 @@ pub(crate) struct ProgressSnapshot {
     /// When the longest-running listener call entered user code, `0` when none is active. One
     /// blocked callback therefore stays visible while other callbacks keep churning (plan 49c C2).
     pub oldest_callback_ms: u64,
+    /// Releases that asked for more outstanding work than there was. Any non-zero value means the
+    /// delivery ownership pairing is broken somewhere, and every other delivery count should be
+    /// read with that in mind (plan 49c C4).
+    pub accounting_underflows: u64,
     pub pulls_started: u64,
     pub pulls_completed: u64,
     pub pulls_empty: u64,
@@ -214,6 +219,11 @@ pub(crate) struct ProgressSnapshot {
     pub assignments: u64,
     pub revocations: u64,
     pub pending_delivery_msgs: u64,
+    /// Messages whose listener call already returned but whose offsets are not committed yet. Kept
+    /// apart from `pending_delivery_msgs` because the two phases need different remedies: queued or
+    /// in-listener work can be slow in user code, while commit-phase work is SDK bookkeeping that
+    /// cleanup must still drain (plan 49c C4).
+    pub committing_delivery_msgs: u64,
     pub active_callbacks: u64,
     pub callbacks_started: u64,
     pub callbacks_finished: u64,
@@ -259,9 +269,10 @@ impl ProgressSnapshot {
         Duration::from_millis(self.now_ms.saturating_sub(since_ms))
     }
 
-    /// True when work is outstanding: messages are waiting for or inside a listener.
+    /// True when work is outstanding: messages are queued for, inside, or just past a listener
+    /// whose offsets are not committed yet.
     pub(crate) fn has_pending_work(&self) -> bool {
-        self.pending_delivery_msgs > 0 || self.active_callbacks > 0
+        self.pending_delivery_msgs > 0 || self.committing_delivery_msgs > 0 || self.active_callbacks > 0
     }
 
     /// A long poll that is still inside its own deadline is an expected wait, not silence. Judged
@@ -394,6 +405,12 @@ pub(crate) struct ConsumerProgress {
     assignments: AtomicU64,
     revocations: AtomicU64,
     pending_delivery_msgs: AtomicU64,
+    /// Messages in the post-listener commit phase, held by a [`DeliveryOwner`] until its batch is
+    /// committed or discarded.
+    committing_delivery_msgs: AtomicU64,
+    /// Times a delivery counter was released more than it was admitted - evidence of two owners for
+    /// one batch, never a condition to average away.
+    accounting_underflows: AtomicU64,
     active_callbacks: AtomicU64,
     /// Every listener call currently running, by id and the moment it entered the listener. One
     /// blocked callback therefore stays visible while other callbacks keep starting and finishing;
@@ -721,6 +738,22 @@ impl ConsumerProgress {
         }
     }
 
+    /// Take accounting ownership of one admitted batch (plan 49c C4). The returned owner is the
+    /// only thing that may release these messages, it releases them exactly once, and it can
+    /// hand part of its count to a delayed retry without ever letting the count fall to zero in
+    /// between.
+    pub(crate) fn admit_batch(self: &Arc<Self>, queue: &MessageQueue, messages: usize) -> DeliveryOwner {
+        let messages = u64::try_from(messages).unwrap_or(0);
+        self.pending_delivery_msgs.fetch_add(messages, Ordering::Relaxed);
+        DeliveryOwner {
+            progress: Arc::clone(self),
+            queue: queue.clone(),
+            messages,
+            phase: OwnerPhase::Scheduled,
+            callback_id: 0,
+        }
+    }
+
     /// Messages handed to the delivery layer but not yet acknowledged by a listener.
     pub(crate) fn note_delivery_pending(&self, messages: u64) {
         self.pending_delivery_msgs.fetch_add(messages, Ordering::Relaxed);
@@ -729,6 +762,7 @@ impl ConsumerProgress {
     /// Registers a listener call that has entered user code and returns the id its owner hands back
     /// when it finishes.
     pub(crate) fn note_callback_started(&self, messages: u64) -> u64 {
+        let _ = messages;
         let id = self.next_callback_id.fetch_add(1, Ordering::Relaxed);
         self.bump(&self.callbacks_started);
         self.active_callbacks.fetch_add(1, Ordering::Relaxed);
@@ -740,22 +774,66 @@ impl ConsumerProgress {
 
     pub(crate) fn note_callback_finished(&self, id: u64, messages: u64) {
         self.bump(&self.callbacks_finished);
-        self.active_callbacks.fetch_sub(1, Ordering::Relaxed);
+        self.release(&self.active_callbacks, 1, "active callback count");
         self.callback_started_at.lock().remove(&id);
-        self.pending_delivery_msgs.fetch_sub(
-            messages.min(self.pending_delivery_msgs.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        self.release_pending(messages);
         let now = get_current_millis();
         self.last_callback_progress_ms.store(now, Ordering::Relaxed);
     }
 
     /// A batch that will never reach a listener (its queue was revoked) stops counting as work.
     pub(crate) fn note_delivery_dropped(&self, messages: u64) {
-        self.pending_delivery_msgs.fetch_sub(
-            messages.min(self.pending_delivery_msgs.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
+        self.release_pending(messages);
+    }
+
+    /// Move a released batch's count into the post-listener commit phase. Held until the batch's
+    /// offsets are committed or it is discarded.
+    pub(crate) fn note_commit_started(&self, messages: u64) {
+        self.committing_delivery_msgs.fetch_add(messages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_commit_finished(&self, messages: u64) {
+        self.release(&self.committing_delivery_msgs, messages, "committing delivery count");
+    }
+
+    fn release_pending(&self, messages: u64) {
+        self.release(&self.pending_delivery_msgs, messages, "pending delivery count");
+    }
+
+    /// Release counted work in one atomic step. A release larger than what is outstanding is a
+    /// broken ownership pairing: it is reported and counted as an underflow, and the counter is
+    /// left alone - clamping to zero would erase other batches' still-outstanding counts and
+    /// hide which pairing broke. Leaving it means the over-release is a no-op and every
+    /// legitimately admitted batch stays counted until its own owner releases it (plan 49c C4).
+    fn release(&self, counter: &AtomicU64, messages: u64, what: &'static str) {
+        if messages == 0 {
+            return;
+        }
+        if Self::subtract(counter, messages).is_err() {
+            self.note_accounting_underflow(what);
+        }
+    }
+
+    /// Atomic compare-and-subtract. `fetch_update` was renamed to `try_update` on newer toolchains
+    /// only; keeping the old spelling here so the crate's minimum supported compiler still builds.
+    #[allow(deprecated)]
+    fn subtract(counter: &AtomicU64, amount: u64) -> Result<u64, u64> {
+        counter.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |v| v.checked_sub(amount))
+    }
+
+    fn note_accounting_underflow(&self, what: &'static str) {
+        let seen = self.accounting_underflows.fetch_add(1, Ordering::Relaxed) + 1;
+        error!(
+            counter = what,
+            times = seen,
+            "delivery accounting released more than it was given - a batch has two owners"
         );
+    }
+
+    /// How many times delivery accounting was released more than it was admitted. Non-zero means an
+    /// ownership bug somewhere in the consume path, not a transient condition.
+    pub(crate) fn accounting_underflows(&self) -> u64 {
+        self.accounting_underflows.load(Ordering::Relaxed)
     }
 
     pub(crate) fn note_offset_persisted(&self) {
@@ -847,6 +925,7 @@ impl ConsumerProgress {
             assignments: self.assignments.load(Ordering::Relaxed),
             revocations: self.revocations.load(Ordering::Relaxed),
             pending_delivery_msgs: self.pending_delivery_msgs.load(Ordering::Relaxed),
+            committing_delivery_msgs: self.committing_delivery_msgs.load(Ordering::Relaxed),
             active_callbacks: self.active_callbacks.load(Ordering::Relaxed),
             callbacks_started: self.callbacks_started.load(Ordering::Relaxed),
             callbacks_finished: self.callbacks_finished.load(Ordering::Relaxed),
@@ -860,6 +939,7 @@ impl ConsumerProgress {
             route_miss_queues,
             rpc_timeout_queues,
             oldest_callback_ms: self.callback_started_at.lock().values().copied().min().unwrap_or(0),
+            accounting_underflows: self.accounting_underflows.load(Ordering::Relaxed),
             last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
             last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
             last_pull_ok_ms: self.last_pull_ok_ms.load(Ordering::Relaxed),
@@ -925,47 +1005,123 @@ pub(crate) struct MachineState {
     pub reason: Reason,
 }
 
-/// Pairs delivery accounting for one batch of messages handed to a listener.
+/// Where the batch an [`DeliveryOwner`] holds is right now. The phases are what make queued work, a
+/// running listener, a delayed retry and a stuck commit distinguishable (plan 49c C4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerPhase {
+    /// Admitted and waiting for its listener.
+    Scheduled,
+    /// Inside application code.
+    Listener,
+    /// The listener returned; offsets are being committed or the batch is being retried.
+    Committing,
+}
+
+/// Accounting ownership of one admitted batch of messages.
 ///
-/// The guard is created when the batch enters the consume path and releases its pending count on
-/// drop, so an early return or an unwind inside a user listener cannot leave `active_callbacks` or
-/// `pending_delivery_msgs` inflated - the machine would read that as stalled delivery forever. A
-/// queue whose callbacks keep finishing is progressing even when its pulls are quiet.
-pub(crate) struct DeliveryGuard {
+/// Ownership is taken when a batch is accepted for delivery - not inside whichever task eventually
+/// runs it - and travels with those messages through queueing, a delayed retry, listener execution
+/// and final commit or discard, releasing its counts exactly once on drop. Part of a batch can be
+/// handed to a retry with [`Self::split_off`] without the outstanding count ever dropping to zero
+/// in between, which is what used to make a sleeping retry invisible and let the next attempt
+/// subtract messages it never added. An early return or an unwind inside a user listener likewise
+/// cannot leave `active_callbacks` or `pending_delivery_msgs` inflated.
+pub(crate) struct DeliveryOwner {
     progress: Arc<ConsumerProgress>,
     queue: MessageQueue,
     messages: u64,
-    listener_started: bool,
+    phase: OwnerPhase,
     callback_id: u64,
 }
 
-impl DeliveryGuard {
+impl DeliveryOwner {
+    /// Adopt a batch whose messages were already admitted as pending work. Production handover uses
+    /// [`ConsumerProgress::admit_batch`], which counts them once here.
     pub(crate) fn new(progress: &Arc<ConsumerProgress>, queue: &MessageQueue, messages: usize) -> Self {
         Self {
             progress: Arc::clone(progress),
             queue: queue.clone(),
             messages: u64::try_from(messages).unwrap_or(0),
-            listener_started: false,
+            phase: OwnerPhase::Scheduled,
             callback_id: 0,
         }
+    }
+
+    /// How many messages this owner is responsible for.
+    pub(crate) fn messages(&self) -> usize {
+        usize::try_from(self.messages).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn queue(&self) -> &MessageQueue {
+        &self.queue
+    }
+
+    /// Move ownership of `count` of this batch's messages into a new owner - the same messages, so
+    /// no counter is added or subtracted. Used when part of a batch goes to a delayed retry
+    /// while the rest is committed (plan 49c C4).
+    pub(crate) fn split_off(&mut self, count: usize) -> Option<Self> {
+        let count = u64::try_from(count).unwrap_or(0);
+        if count == 0 {
+            return None;
+        }
+        // A batch cannot hand out more messages than it owns; that is a broken pairing and must be
+        // loud rather than absorbed by a clamp.
+        debug_assert!(
+            count <= self.messages,
+            "delivery ownership split {} down to {count}",
+            self.messages
+        );
+        let count = count.min(self.messages);
+        self.messages -= count;
+        // A batch handed on from the commit phase is queued work again, so those messages stop
+        // being counted as committing and start being counted as pending once more. From
+        // any earlier phase the messages simply change hands with no counter movement,
+        // which is what keeps a sleeping retry visible instead of double-counted (plan 49c
+        // C4).
+        if self.phase == OwnerPhase::Committing {
+            self.progress.note_commit_finished(count);
+            self.progress.note_delivery_pending(count);
+        }
+        Some(Self {
+            progress: Arc::clone(&self.progress),
+            queue: self.queue.clone(),
+            messages: count,
+            phase: OwnerPhase::Scheduled,
+            callback_id: 0,
+        })
     }
 
     /// Marks the entry into the application listener; only then is a callback "active", and it is
     /// registered individually so no other callback's completion can retire it (plan 49c C2).
     pub(crate) fn enter_listener(&mut self) {
-        if !self.listener_started {
-            self.listener_started = true;
+        if self.phase == OwnerPhase::Scheduled {
+            self.phase = OwnerPhase::Listener;
             self.callback_id = self.progress.note_callback_started(self.messages);
+        }
+    }
+
+    /// The listener call returned. Its callback stops counting as running user code and the batch
+    /// moves to the commit phase, which cleanup still has to drain before it may finish.
+    pub(crate) fn leave_listener(&mut self) {
+        if self.phase == OwnerPhase::Listener {
+            self.progress.note_callback_finished(self.callback_id, self.messages);
+            self.progress.note_commit_started(self.messages);
+            self.phase = OwnerPhase::Committing;
         }
     }
 }
 
-impl Drop for DeliveryGuard {
+impl Drop for DeliveryOwner {
     fn drop(&mut self) {
-        if self.listener_started {
-            self.progress.note_callback_finished(self.callback_id, self.messages);
-        } else {
-            self.progress.note_delivery_dropped(self.messages);
+        match self.phase {
+            // Never reached a listener: queue revoked, work closed, or cancelled before entry.
+            OwnerPhase::Scheduled => self.progress.note_delivery_dropped(self.messages),
+            // Unwound or abandoned inside user code: end the callback and release its messages.
+            OwnerPhase::Listener => {
+                self.progress.note_callback_finished(self.callback_id, self.messages);
+            }
+            // The commit phase owns these counts now; closing the owner ends it.
+            OwnerPhase::Committing => self.progress.note_commit_finished(self.messages),
         }
         self.progress.touch(&self.queue);
     }
@@ -2273,7 +2429,7 @@ mod tests {
         progress.note_delivery_pending(3);
         {
             // A revoked queue returns before the listener runs; Drop must still release the batch.
-            let _guard = DeliveryGuard::new(&progress, &queue, 3);
+            let _guard = DeliveryOwner::new(&progress, &queue, 3);
         }
         let snap = snapshot(&progress);
         assert_eq!(snap.pending_delivery_msgs, 0);
@@ -2291,7 +2447,7 @@ mod tests {
         // Drop runs on unwind exactly as it does on return, so an exception inside a user listener
         // cannot leave active callbacks behind.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = DeliveryGuard::new(&progress, &queue, 2);
+            let mut guard = DeliveryOwner::new(&progress, &queue, 2);
             guard.enter_listener();
             panic!("listener unwound");
         }));
@@ -2303,6 +2459,84 @@ mod tests {
         assert_eq!(snap.callbacks_finished, 1);
         // The queue stamped progress on the way out, so it is not counted as stalled.
         assert_eq!(snapshot(&progress).stalled_queues, 0);
+    }
+
+    /// Plan 49c C4: a batch whose retry is still sleeping must stay counted as outstanding work
+    /// while the attempt that scheduled it finishes. Before this, the finished attempt
+    /// subtracted the whole batch - including the messages it had just handed to the delayed
+    /// task - so the sleeping retry was invisible and its own later release underflowed.
+    #[test]
+    fn a_sleeping_retry_keeps_its_messages_pending_until_it_runs() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_assignment(&HashSet::from([mq.clone()]));
+
+        // One admitted batch of three; two are committed now, one goes to a delayed retry.
+        let mut batch = progress.admit_batch(&mq, 3);
+        batch.enter_listener();
+        batch.leave_listener();
+        let mut retry = batch.split_off(1).expect("the batch owns the retried message");
+
+        let snap = snapshot(&progress);
+        assert_eq!(snap.committing_delivery_msgs, 2, "two messages are being committed now");
+        assert_eq!(snap.pending_delivery_msgs, 1, "and one is queued for its retry");
+
+        drop(batch);
+
+        let snap = snapshot(&progress);
+        assert_eq!(
+            snap.pending_delivery_msgs + snap.committing_delivery_msgs,
+            1,
+            "the sleeping retry is still outstanding work"
+        );
+        assert_eq!(
+            snap.committing_delivery_msgs, 0,
+            "the attempt that handed it off kept only its own messages"
+        );
+        assert_eq!(progress.accounting_underflows(), 0);
+
+        // The retry runs and finishes; that releases exactly the one message it owns.
+        retry.enter_listener();
+        retry.leave_listener();
+        drop(retry);
+        let snap = snapshot(&progress);
+        assert_eq!(snap.pending_delivery_msgs, 0);
+        assert_eq!(snap.committing_delivery_msgs, 0);
+        assert_eq!(snap.active_callbacks, 0);
+        assert_eq!(
+            progress.accounting_underflows(),
+            0,
+            "one batch was released once, not twice"
+        );
+    }
+
+    /// Ownership that never reaches a listener - rejected admission or cancellation before entry -
+    /// still releases exactly what it was given (plan 49c C4).
+    #[test]
+    fn ownership_taken_at_admission_is_released_even_when_nothing_runs() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_assignment(&HashSet::from([mq.clone()]));
+        {
+            let batch = progress.admit_batch(&mq, 4);
+            assert_eq!(snapshot(&progress).pending_delivery_msgs, 4);
+            assert_eq!(batch.messages(), 4);
+        }
+        let snap = snapshot(&progress);
+        assert_eq!(snap.pending_delivery_msgs, 0);
+        assert_eq!(snap.callbacks_started, 0, "a batch that never ran is not a callback");
+        assert_eq!(progress.accounting_underflows(), 0);
+
+        // Releasing more than is outstanding is a broken ownership pairing. It is reported and the
+        // counter is left alone rather than clamped, so other batches keep their counts (plan 49c
+        // C4).
+        progress.note_delivery_dropped(3);
+        let snap = snapshot(&progress);
+        assert_eq!(snap.pending_delivery_msgs, 0, "the counter never went negative");
+        assert_eq!(
+            snap.accounting_underflows, 1,
+            "and the status projection carries the broken pairing where operators can see it"
+        );
     }
 
     #[test]

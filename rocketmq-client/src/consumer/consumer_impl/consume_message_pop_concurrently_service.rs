@@ -441,6 +441,11 @@ impl ConsumeRequest {
                     self.msgs.len(),
                     self.message_queue
                 );
+                // Same rule as the non-pop concurrently path: an acknowledgement a panicking
+                // listener set on its way out is void, because this batch is being
+                // retried and acknowledging it here would durably ack messages
+                // whose work did not finish (plan 49c C4).
+                context.ack_index = None;
                 has_exception = true;
             }
         }

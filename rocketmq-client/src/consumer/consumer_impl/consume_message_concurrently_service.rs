@@ -28,6 +28,7 @@ use rocketmq_remoting::protocol::body::consume_message_directly_result::ConsumeM
 use rocketmq_remoting::protocol::heartbeat::message_model::MessageModel;
 use rocketmq_runtime::RocketMQRuntime;
 use rocketmq_rust::ArcMut;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -35,7 +36,7 @@ use tracing::warn;
 use crate::base::client_config::ClientConfig;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
 use crate::consumer::consumer_impl::consumer_lifecycle::call_listener_catching;
-use crate::consumer::consumer_impl::consumer_lifecycle::DeliveryGuard;
+use crate::consumer::consumer_impl::consumer_lifecycle::DeliveryOwner;
 use crate::consumer::consumer_impl::consumer_lifecycle::ListenerCall;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
@@ -150,12 +151,23 @@ impl ConsumeMessageConcurrentlyService {
                         }
                     }
                     if !to_retry.is_empty() {
+                        // The retried messages leave this attempt but are not finished: their
+                        // ownership moves to the delayed request, which
+                        // releases them when it commits. Without the
+                        // transfer this batch's owner would subtract them at the end of the attempt
+                        // and the sleeping retry would be invisible until
+                        // it ran again (plan 49c C4).
+                        let accounting = consume_request
+                            .accounting
+                            .as_mut()
+                            .and_then(|owner| owner.split_off(to_retry.len()));
                         self.submit_consume_request_later_with_delay(
                             to_retry,
                             this,
                             consume_request.process_queue.clone(),
                             consume_request.message_queue.clone(),
                             retry_delay,
+                            accounting,
                         );
                     }
                 }
@@ -181,11 +193,19 @@ impl ConsumeMessageConcurrentlyService {
                 }
                 if !msg_back_failed.is_empty() {
                     consume_request.msgs.append(&mut msg_back_success);
+                    // Same transfer as the broadcasting retry above: these messages are queued
+                    // again and stay outstanding work until that attempt
+                    // commits them (plan 49c C4).
+                    let accounting = consume_request
+                        .accounting
+                        .as_mut()
+                        .and_then(|owner| owner.split_off(msg_back_failed.len()));
                     self.submit_consume_request_later(
                         msg_back_failed,
                         this,
                         consume_request.process_queue.clone(),
                         consume_request.message_queue.clone(),
+                        accounting,
                     );
                 }
             }
@@ -211,18 +231,23 @@ impl ConsumeMessageConcurrentlyService {
         }
     }
 
+    /// Queue a retry of messages whose accounting ownership was transferred from the attempt that
+    /// failed them. `accounting` is `None` only when the batch carried no SDK ownership; a
+    /// cancelled sleep releases it here rather than leaving the count held by a task that will
+    /// never run.
     fn submit_consume_request_later(
         &self,
         msgs: Vec<ArcMut<MessageExt>>,
         this: ArcMut<Self>,
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
+        accounting: Option<DeliveryOwner>,
     ) {
         self.work
             .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let this_ = this.clone();
-                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                this.submit_consume_request_accounted(this_, msgs, process_queue, message_queue, true, accounting)
                     .await;
             });
     }
@@ -234,12 +259,13 @@ impl ConsumeMessageConcurrentlyService {
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
         delay: Duration,
+        accounting: Option<DeliveryOwner>,
     ) {
         self.work
             .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
                 tokio::time::sleep(delay).await;
                 let this_ = this.clone();
-                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                this.submit_consume_request_accounted(this_, msgs, process_queue, message_queue, true, accounting)
                     .await;
             });
     }
@@ -361,11 +387,45 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
     ) {
+        // No SDK ownership accompanies a batch submitted without one; such a request neither adds
+        // nor releases counts of its own.
+        self.submit_consume_request_accounted(this, msgs, process_queue, message_queue, dispatch_to_consume, None)
+            .await;
+    }
+
+    async fn submit_consume_request_accounted(
+        &self,
+        this: ArcMut<Self>,
+        msgs: Vec<ArcMut<MessageExt>>,
+        process_queue: Arc<ProcessQueue>,
+        message_queue: MessageQueue,
+        dispatch_to_consume: bool,
+        mut accounting: Option<DeliveryOwner>,
+    ) {
+        let queued = accounting.as_ref().map_or(0, |owner| owner.messages());
         if self.work.is_closed() {
+            // Rejected admission: this batch will never run, so its ownership ends here rather than
+            // being counted as work forever (plan 49c C4).
+            debug!(
+                messages = queued,
+                "consume service is closed, releasing the queued batch instead of admitting it"
+            );
+            return;
+        }
+        if !dispatch_to_consume {
+            // Nothing was scheduled for these messages; they stay in the process queue until a
+            // later submit dispatches them. Their pull-side ownership ends with this
+            // call - holding it would report a listener that has not been called as
+            // outstanding work.
+            debug!(
+                messages = queued,
+                "batch not dispatched, its messages wait in the process queue for the next submit"
+            );
             return;
         }
         let consume_batch_size = self.consumer_config.consume_message_batch_max_size;
         if msgs.len() <= consume_batch_size as usize {
+            let owned = accounting.as_mut().and_then(|owner| owner.split_off(msgs.len()));
             let mut consume_request = ConsumeRequest {
                 msgs,
                 message_listener: self.message_listener.clone(),
@@ -375,6 +435,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                 consumer_group: self.consumer_group.clone(),
                 default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
                 delivery: self.delivery.clone(),
+                accounting: owned,
             };
 
             self.work
@@ -382,25 +443,29 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                     consume_request.run(this).await
                 });
         } else {
-            msgs.chunks(consume_batch_size as usize)
-                .map(|t| t.to_vec())
-                .for_each(|msgs| {
-                    let mut consume_request = ConsumeRequest {
-                        msgs,
-                        message_listener: self.message_listener.clone(),
-                        process_queue: process_queue.clone(),
-                        message_queue: message_queue.clone(),
-                        dispatch_to_consume,
-                        consumer_group: self.consumer_group.clone(),
-                        default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
-                        delivery: self.delivery.clone(),
-                    };
-                    let consume_message_concurrently_service = this.clone();
-                    self.work
-                        .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
-                            consume_request.run(consume_message_concurrently_service).await
-                        });
-                });
+            // One owner per chunk, taken from the single batch admitted at handover, so the chunks
+            // can commit in any order and each releases exactly its own messages (plan
+            // 49c C4).
+            for chunk in msgs.chunks(consume_batch_size as usize) {
+                let chunk = chunk.to_vec();
+                let owned = accounting.as_mut().and_then(|owner| owner.split_off(chunk.len()));
+                let mut consume_request = ConsumeRequest {
+                    msgs: chunk,
+                    message_listener: self.message_listener.clone(),
+                    process_queue: process_queue.clone(),
+                    message_queue: message_queue.clone(),
+                    dispatch_to_consume,
+                    consumer_group: self.consumer_group.clone(),
+                    default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                    delivery: self.delivery.clone(),
+                    accounting: owned,
+                };
+                let consume_message_concurrently_service = this.clone();
+                self.work
+                    .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                        consume_request.run(consume_message_concurrently_service).await
+                    });
+            }
         }
     }
 
@@ -416,6 +481,9 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
 }
 
 struct ConsumeRequest {
+    /// Accounting ownership of `msgs`, taken when the batch was admitted. `None` for a request
+    /// built without SDK ownership, which then neither adds nor releases counts.
+    accounting: Option<DeliveryOwner>,
     msgs: Vec<ArcMut<MessageExt>>,
     message_listener: ArcBoxMessageListenerConcurrently,
     process_queue: Arc<ProcessQueue>,
@@ -428,17 +496,12 @@ struct ConsumeRequest {
 
 impl ConsumeRequest {
     async fn run(&mut self, mut consume_message_concurrently_service: ArcMut<ConsumeMessageConcurrentlyService>) {
-        // SDK-owned delivery accounting (plan 49 section 4.2): the guard is armed before any early
-        // return so a revoked queue still releases the batch it will never deliver, and a listener
-        // that blocks or unwinds cannot leave pending work counted forever.
+        // SDK-owned delivery accounting (plan 49 section 4.2, plan 49c C4): this request holds the
+        // ownership taken when its batch was admitted, so a revoked queue still releases the batch
+        // it will never deliver and a listener that blocks or unwinds cannot leave pending
+        // work counted forever - and nothing here has to add a count that someone else
+        // already added.
         let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
-        let mut delivery = (!self.msgs.is_empty()).then(|| {
-            DeliveryGuard::new(
-                &default_mqpush_consumer_impl.progress,
-                &self.message_queue,
-                self.msgs.len(),
-            )
-        });
         if self.process_queue.is_dropped() {
             info!(
                 "the message queue not be able to consume, because it's dropped. group={} {}",
@@ -491,8 +554,8 @@ impl ConsumeRequest {
                 default_mqpush_consumer_impl.execute_hook_before(&mut consume_message_context);
             }
             let vec = self.msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>();
-            if let Some(delivery) = delivery.as_mut() {
-                delivery.enter_listener();
+            if let Some(owner) = self.accounting.as_mut() {
+                owner.enter_listener();
             }
             match call_listener_catching(|| self.message_listener.consume_message(&vec, &mut context)) {
                 ListenerCall::Returned(Ok(value)) => {
@@ -510,8 +573,20 @@ impl ConsumeRequest {
                         self.msgs.len(),
                         self.message_queue
                     );
+                    // A listener that unwound may have acknowledged part of the batch on its way
+                    // out. That acknowledgement is void: the panic means the
+                    // work it covered did not finish, and honouring it would
+                    // advance consumption past business work while reporting the batch
+                    // as retried (plan 49c C4). A listener that *returned* with an ack index keeps
+                    // it.
+                    context.ack_index = None;
                     has_exception = true;
                 }
+            }
+            // The callback is over: user code no longer occupies a slot, and the batch moves to the
+            // commit phase whose offsets this call still has to write (plan 49c C4).
+            if let Some(owner) = self.accounting.as_mut() {
+                owner.leave_listener();
             }
             // Update last_consume_timestamp after the listener returns so that
             // admin/running-info reflects real callback progress, not flow-control entries.

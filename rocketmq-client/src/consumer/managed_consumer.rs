@@ -135,6 +135,9 @@ pub struct ProgressCounts {
     pub pulls_completed: u64,
     pub callbacks_finished: u64,
     pub offsets_persisted: u64,
+    /// Releases that exceeded outstanding work. Non-zero means an ownership pairing is broken, so
+    /// the delivery counts above cannot be trusted until it is understood (plan 49c C4).
+    pub accounting_underflows: u64,
 }
 
 /// One immutable status observation.
@@ -154,7 +157,7 @@ impl fmt::Display for ConsumerStatus {
         write!(
             f,
             "phase={} health={} reason={} incarnation={} assigned_queues={} stalled_queues={} pending_delivery={} \
-             active_callbacks={}",
+             active_callbacks={} accounting_underflows={}",
             self.phase.as_str(),
             self.health.as_str(),
             self.reason,
@@ -163,6 +166,7 @@ impl fmt::Display for ConsumerStatus {
             self.progress.stalled_queues,
             self.progress.pending_delivery_msgs,
             self.progress.active_callbacks,
+            self.progress.accounting_underflows,
         )
     }
 }
@@ -181,6 +185,7 @@ fn project(state: MachineState, incarnation: u64, snapshot: &ProgressSnapshot) -
             pulls_completed: snapshot.pulls_completed,
             callbacks_finished: snapshot.callbacks_finished,
             offsets_persisted: snapshot.offsets_persisted,
+            accounting_underflows: snapshot.accounting_underflows,
         },
     }
 }

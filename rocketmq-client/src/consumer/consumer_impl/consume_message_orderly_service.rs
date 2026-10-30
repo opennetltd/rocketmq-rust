@@ -552,6 +552,14 @@ impl ConsumeRequest {
                 if msgs.is_empty() {
                     break;
                 }
+                // Accounting ownership of exactly the messages this iteration took from the queue
+                // (plan 49c C4). An orderly consumer is not handed a batch at pull time - it drains
+                // its process queue here - so this is where its delivery becomes
+                // real work. The owner spans the listener call and the commit
+                // below, and releases once when the iteration ends.
+                let mut accounting = default_mqpush_consumer_impl
+                    .progress
+                    .admit_batch(&self.message_queue, msgs.len());
                 let mut context = ConsumeOrderlyContext::new(self.message_queue.clone());
                 let mut consume_message_context = None;
                 let mut status = None;
@@ -584,6 +592,7 @@ impl ConsumeRequest {
                     break;
                 }
                 let vec = &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>()[..];
+                accounting.enter_listener();
 
                 match call_listener_catching(|| {
                     consume_message_orderly_service_inner
@@ -608,6 +617,9 @@ impl ConsumeRequest {
                         has_exception = true;
                     }
                 }
+                // User code is done with this batch; it now waits on the SDK's own commit (plan 49c
+                // C4).
+                accounting.leave_listener();
                 drop(consume_lock);
                 if status.is_none()
                     || *status.as_ref().unwrap() == ConsumeOrderlyStatus::Rollback

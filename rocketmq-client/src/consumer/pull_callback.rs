@@ -189,17 +189,18 @@ impl PullCallback for DefaultPullCallback {
                         .unwrap()
                         .queue_offset;
                     let vec = pull_result_ext.pull_result.msg_found_list.clone();
-                    // Pending work is counted here, from the very list handed to put_message and
-                    // submit_consume_request below, because that batch's delivery guard releases
-                    // exactly this many messages. Counting the
-                    // undecoded/filtered list instead either missed every delivered
-                    // batch - hiding a stalled listener as idleness - or kept filtered-out messages
-                    // pending forever (plan 49a F5 section 4.4 item 1).
-                    if let Some(list) = vec.as_ref() {
-                        if !list.is_empty() {
-                            push_consumer_impl.progress.note_delivery_pending(list.len() as u64);
-                        }
-                    }
+                    // Accounting ownership is taken here, from the very list handed to put_message
+                    // and submit_consume_request below, because that batch
+                    // travels from here through queueing, any delayed retry,
+                    // listener execution and final commit. Counting at handover keeps a
+                    // stalled listener visible even when its pulls are quiet; taking *ownership*
+                    // here is what stops the consume path from releasing
+                    // messages a sleeping retry still holds (plan 49a
+                    // F5 section 4.4 item 1, plan 49c C4).
+                    let accounting = push_consumer_impl.progress.admit_batch(
+                        pull_request.get_message_queue(),
+                        vec.as_ref().map(|list| list.len()).unwrap_or(0),
+                    );
                     let dispatch_to_consume = pull_request.process_queue.put_message(vec.unwrap_or_default()).await;
                     push_consumer_impl
                         .consume_message_service
@@ -210,6 +211,7 @@ impl PullCallback for DefaultPullCallback {
                             pull_request.get_process_queue().clone(),
                             pull_request.get_message_queue().clone(),
                             dispatch_to_consume,
+                            accounting,
                         )
                         .await;
                     let pull_interval = push_consumer_impl.consumer_config.pull_interval;
