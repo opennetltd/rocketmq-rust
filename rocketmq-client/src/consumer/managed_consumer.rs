@@ -1737,4 +1737,107 @@ mod tests {
         let progress = consumer.cleanup_progress().expect("still the same session");
         assert!(progress.running, "{progress:?}");
     }
+
+    /// A managed incarnation built through the unmodified spec: subscriptions live only in the
+    /// runtime table, exactly as after `start`, while configuration stays empty (plan 49d R2).
+    fn managed_incarnation(group: &str, topic: &str) -> DefaultMQPushConsumer {
+        let spec = ManagedConsumerSpec::new(
+            DefaultMQPushConsumer::builder()
+                .consumer_group(group)
+                .subscribe(topic, "*"),
+        )
+        .with_listener(Arc::new(|_, _| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)));
+        spec.build_incarnation(ConsumerProgress::new(), &LifecyclePolicy::default())
+            .expect("a valid managed spec builds an incarnation")
+    }
+
+    /// Plan 49d R2: route repair must read the runtime subscription set. Reading configuration made
+    /// every managed `Assignment` and `RouteAndPull` repair finish without visiting a single
+    /// subscribed topic, so the controller's requested repair refreshed nothing and only later
+    /// periodic SDK refresh could help.
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_repair_visits_the_runtime_subscription_set() {
+        use crate::factory::mq_client_instance::MQClientInstance;
+        use cheetah_string::CheetahString;
+        use rocketmq_common::common::mix_all;
+        use rocketmq_remoting::protocol::filter::filter_api::FilterAPI;
+
+        let group = "49d-r2-repair-scope";
+        let mut consumer = managed_incarnation(group, "T-A");
+        let (subscriptions, client, retry_topic) = {
+            let inner = consumer.default_mqpush_consumer_impl.as_mut().unwrap();
+            let subscriptions = inner.rebalance_impl.get_subscription_inner();
+            assert_eq!(
+                subscriptions.read().await.len(),
+                1,
+                "the managed constructor subscribed at runtime"
+            );
+            assert!(
+                inner.consumer_config.subscription.is_empty(),
+                "managed construction leaves configuration empty - that is what repair must not read"
+            );
+            let client = MQClientInstance::new_arc(
+                crate::base::client_config::ClientConfig {
+                    namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:1")),
+                    ..Default::default()
+                },
+                0,
+                "49d-r2-repair-scope-client",
+                None,
+            );
+            inner.client_instance = Some(client.clone());
+            // What `start` does for the SDK retry topic: a runtime subscription nothing in
+            // configuration mentions.
+            let retry_topic = CheetahString::from_string(mix_all::get_retry_topic(group));
+            let retry_data =
+                FilterAPI::build_subscription_data(&retry_topic, &CheetahString::from_static_str("*")).unwrap();
+            inner
+                .rebalance_impl
+                .put_subscription_data(retry_topic.clone(), retry_data)
+                .await;
+            (subscriptions, client, retry_topic)
+        };
+
+        // One topic per round: a zero slice must stop between topics and hand back where it
+        // stopped.
+        let cursor = consumer
+            .repair_routes_and_rebalance(None, Duration::ZERO)
+            .await
+            .expect("two subscriptions cannot both fit in a zero-length slice");
+        assert_eq!(
+            cursor, retry_topic,
+            "the SDK retry topic is part of the runtime set and sorts first"
+        );
+        assert_eq!(client.route_refresh_guard.len(), 1, "one real refresh request");
+
+        // Membership is re-checked on a resumed slice: an unsubscribed topic gets no route work,
+        // while one subscribed after the previous round is picked up.
+        subscriptions
+            .write()
+            .await
+            .remove(&CheetahString::from_static_str("T-A"));
+        let late = FilterAPI::build_subscription_data(
+            &CheetahString::from_static_str("T-B"),
+            &CheetahString::from_static_str("*"),
+        )
+        .unwrap();
+        consumer
+            .default_mqpush_consumer_impl
+            .as_mut()
+            .unwrap()
+            .rebalance_impl
+            .put_subscription_data(CheetahString::from_static_str("T-B"), late)
+            .await;
+        let finished = consumer
+            .repair_routes_and_rebalance(Some(&cursor), Duration::from_secs(30))
+            .await;
+        assert!(finished.is_none(), "the cursor pass finishes the repair");
+        assert_eq!(
+            client.route_refresh_guard.len(),
+            2,
+            "only the still-subscribed topics are refreshed: the retry topic and T-B, never T-A"
+        );
+        drop(subscriptions);
+        client.clone().shutdown().await;
+    }
 }

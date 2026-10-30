@@ -668,9 +668,10 @@ impl DefaultMQPushConsumer {
             .progress = progress;
     }
 
-    /// In-place repair used by the recovery controller: refresh the route of every subscribed
-    /// topic through the normal publish path, reconcile broker state, then wake this client's own
-    /// rebalance so each queue gets at most one new pull request. Never registers a second client.
+    /// In-place repair used by the recovery controller: refresh the route of every topic this
+    /// consumer actually subscribes to at runtime through the normal publish path, reconcile
+    /// broker state, then wake this client's own rebalance so each queue gets at most one new
+    /// pull request. Never registers a second client.
     ///
     /// The pass is resumable (plan 49c C2): it starts after `after` in sorted topic order and stops
     /// at its time slice between topics, returning the topic to continue from so the next round
@@ -682,9 +683,19 @@ impl DefaultMQPushConsumer {
         slice: std::time::Duration,
     ) -> Option<cheetah_string::CheetahString> {
         let impl_ = self.default_mqpush_consumer_impl.as_ref()?;
-        let mut topics: Vec<cheetah_string::CheetahString> =
-            impl_.consumer_config.subscription.keys().cloned().collect();
-        topics.sort();
+        // The **runtime** subscription table is authoritative (plan 49d R2). Managed construction
+        // detaches the builder's subscriptions and re-applies them through `subscribe`,
+        // which writes here and leaves `consumer_config.subscription` empty, so reading
+        // configuration made every managed repair finish without visiting a single
+        // subscribed topic. Namespace normalisation and later subscribe/unsubscribe also
+        // land only here, including the SDK retry topic added at start.
+        let subscriptions = impl_.rebalance_impl.get_subscription_inner();
+        let topics: Vec<cheetah_string::CheetahString> = {
+            let guard = subscriptions.read().await;
+            let mut keys = guard.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys
+        };
         let instance = impl_.client_instance.clone()?;
         let mut instance = instance;
         let started = std::time::Instant::now();
@@ -693,6 +704,15 @@ impl DefaultMQPushConsumer {
             .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
             .collect();
         for (index, topic) in pending.iter().enumerate() {
+            // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must not
+            // get route work for a subscription this consumer no longer holds.
+            if !subscriptions.read().await.contains_key(topic) {
+                tracing::debug!(
+                    topic = %topic,
+                    "this topic is no longer subscribed, dropping it from the route repair"
+                );
+                continue;
+            }
             let refreshed = instance
                 .as_mut()
                 .repair_route_after_broker_miss(topic, Duration::from_millis(500))
