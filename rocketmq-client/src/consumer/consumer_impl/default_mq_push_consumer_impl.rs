@@ -178,6 +178,40 @@ impl Drop for CleanupReport {
 /// budget a managed stop targets, times the remote allowance beside it.
 const DEFAULT_CLEANUP_CEILING: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Remote opportunity bulk offset persistence gets when no lifecycle policy said otherwise - the
+/// same allowance one best-effort offset write may take, times a small window of them (plan 49c
+/// C5).
+const DEFAULT_REMOTE_PERSIST_OPPORTUNITY: std::time::Duration = std::time::Duration::from_secs(10);
+/// What unregistration and client teardown keep back before persistence starts, for the same
+/// reason.
+const DEFAULT_FINALIZATION_RESERVE: std::time::Duration = std::time::Duration::from_secs(7);
+
+fn millis_or(millis: u64, default: std::time::Duration) -> std::time::Duration {
+    if millis == 0 {
+        default
+    } else {
+        std::time::Duration::from_millis(millis)
+    }
+}
+
+/// How much of the session ceiling bulk offset persistence may use, measured from `now` - the
+/// moment local work finished draining - with `reserve` already promised to unregistration and
+/// teardown (plan 49c C5).
+///
+/// The opportunity starts here rather than at session creation: slow local release used to be spent
+/// out of the same budget, so a late listener could leave the remote step with nothing while still
+/// taking the finalization reserve with it. Zero means no remote step may start, which is reported
+/// as unwritten offsets rather than attempted and abandoned writes.
+fn remote_step(
+    now: TokioInstant,
+    session_deadline: TokioInstant,
+    opportunity: std::time::Duration,
+    reserve: std::time::Duration,
+) -> std::time::Duration {
+    let available = session_deadline.saturating_duration_since(now).saturating_sub(reserve);
+    opportunity.min(available)
+}
+
 fn remaining_millis(deadline: TokioInstant) -> u64 {
     deadline
         .saturating_duration_since(TokioInstant::now())
@@ -227,6 +261,12 @@ pub struct DefaultMQPushConsumerImpl {
     /// Millis of finalization ceiling the SDK gives its own cleanup pass; `0` means unset so the
     /// default applies. Never derived from an observer's wait (plan 49b R2).
     cleanup_ceiling_millis: std::sync::atomic::AtomicU64,
+    /// Millis of remote opportunity bulk offset persistence gets once local work has drained, and
+    /// millis of the session ceiling that unregistration and client teardown keep back for
+    /// themselves. `0` means unset, so the defaults apply; both come from the lifecycle policy
+    /// and never from an observer's wait (plan 49c C5).
+    remote_persist_millis: std::sync::atomic::AtomicU64,
+    finalization_reserve_millis: std::sync::atomic::AtomicU64,
     /// Set when the SDK-owned controller built this incarnation. Startup classification differs
     /// between the two owners on purpose: legacy callers keep the error variants they already
     /// match on, while a managed incarnation reports configuration failures as a typed
@@ -502,6 +542,8 @@ impl DefaultMQPushConsumerImpl {
             default_mqpush_consumer_impl: None,
             cleanup_session: Arc::new(parking_lot::Mutex::new(None)),
             cleanup_ceiling_millis: std::sync::atomic::AtomicU64::new(0),
+            remote_persist_millis: std::sync::atomic::AtomicU64::new(0),
+            finalization_reserve_millis: std::sync::atomic::AtomicU64::new(0),
             managed_lifecycle: std::sync::atomic::AtomicBool::new(false),
         };
         let wrapper = ArcMut::downgrade(&this.rebalance_impl);
@@ -852,6 +894,32 @@ impl DefaultMQPushConsumerImpl {
             .store(ceiling.as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Release);
     }
 
+    /// The two remote budgets of a cleanup pass, taken from the lifecycle policy alongside its
+    /// ceiling: how long bulk offset persistence may take once local work has drained, and what
+    /// the final phases keep back before it starts (plan 49c C5).
+    pub(crate) fn set_remote_budgets(&self, persist_opportunity: std::time::Duration, reserve: std::time::Duration) {
+        self.remote_persist_millis.store(
+            persist_opportunity.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+        self.finalization_reserve_millis
+            .store(reserve.as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Release);
+    }
+
+    fn remote_persist_opportunity(&self) -> std::time::Duration {
+        millis_or(
+            self.remote_persist_millis.load(Ordering::Acquire),
+            DEFAULT_REMOTE_PERSIST_OPPORTUNITY,
+        )
+    }
+
+    fn finalization_reserve(&self) -> std::time::Duration {
+        millis_or(
+            self.finalization_reserve_millis.load(Ordering::Acquire),
+            DEFAULT_FINALIZATION_RESERVE,
+        )
+    }
+
     /// Where the cleanup session stands, or `None` while no stop has been requested. Observation
     /// only: reading it cannot start, restart or cancel anything.
     pub(crate) fn cleanup_progress(&self) -> Option<CleanupSessionProgress> {
@@ -912,6 +980,12 @@ impl DefaultMQPushConsumerImpl {
             service.shutdown(remaining_millis(deadline)).await;
         }
         report.record("consume_service", started);
+        // Reserve before persisting, not after (plan 49c C5): what unregistration and client
+        // teardown need is set aside while there is still time to hand it over, so a
+        // listener that released late cannot leave the final phases with nothing and bulk
+        // writes cannot spend their slice.
+        let finalization_reserve = self.finalization_reserve();
+        let persist_opportunity = self.remote_persist_opportunity();
         if let Some(store) = self.offset_store.as_mut() {
             let queues = self
                 .rebalance_impl
@@ -925,7 +999,13 @@ impl DefaultMQPushConsumerImpl {
             // deadline, and anything the budget could not reach is reported, not hidden.
             driver.enter("offset_persist");
             let started = TokioInstant::now();
-            let summary = store.persist_all_until(&assigned, deadline).await;
+            // A policy-sized remote opportunity that starts *here*, after the local drains, instead
+            // of sharing the session's elapsed time with them: slow local release used
+            // to be able to leave this step with a deadline already expired. It is
+            // capped by what remains once the reserve above is taken away, so
+            // persistence can never reach into finalization (plan 49c C5).
+            let opportunity = remote_step(started, deadline, persist_opportunity, finalization_reserve);
+            let summary = store.persist_all_until(&assigned, started + opportunity).await;
             report.record("offset_persist", started);
             report.detail(format!("offsets[{summary}]"));
             if !store.io_complete().await {
@@ -958,7 +1038,9 @@ impl DefaultMQPushConsumerImpl {
                 // Only the owner may unregister this group remotely; notify before closing
                 // transport.
                 // The attempt gets at most five seconds of what is left, and never less than a
-                // finalization reserve, so teardown cannot be cut off mid-release.
+                // finalization reserve, so teardown cannot be cut off mid-release. What is left
+                // here is what the reservation made before persistence promised it
+                // (plan 49c C5).
                 let remaining = deadline.saturating_duration_since(TokioInstant::now());
                 let reserve = std::time::Duration::from_secs(2).min(remaining / 4);
                 let remote_budget = remaining.saturating_sub(reserve).min(std::time::Duration::from_secs(5));
@@ -2258,6 +2340,45 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Plan 49c C5: bulk persistence gets its own remote window, measured from the moment local
+    /// work drained, capped by policy, and never allowed to eat what unregistration and
+    /// teardown keep back.
+    #[test]
+    fn offset_persistence_gets_its_own_remote_window_after_the_drain() {
+        let now = TokioInstant::now();
+        let ceiling = now + DEFAULT_CLEANUP_CEILING;
+        let reserve = Duration::from_secs(7);
+
+        // Plenty of session left: the policy opportunity caps the step, not everything that
+        // remains.
+        assert_eq!(
+            remote_step(now, ceiling, Duration::from_secs(10), reserve),
+            Duration::from_secs(10)
+        );
+
+        // Local release was slow and took most of the session: persistence gets what is left once
+        // the reserve is set aside - no more than that, and never more than its
+        // opportunity.
+        let drained = ceiling - Duration::from_secs(14);
+        assert_eq!(
+            remote_step(drained, ceiling, Duration::from_secs(10), reserve),
+            Duration::from_secs(7)
+        );
+
+        // Only the reserve is left: starting no write at all beats dispatching writes past their
+        // own deadline, and those offsets are then reported unwritten rather than silently
+        // lost.
+        assert_eq!(
+            remote_step(ceiling - reserve, ceiling, Duration::from_secs(10), reserve),
+            Duration::ZERO
+        );
+        // The session already over: same answer, and no panic from the elapsed comparison.
+        assert_eq!(
+            remote_step(now + Duration::from_secs(5), now, Duration::from_secs(10), reserve),
+            Duration::ZERO
+        );
+    }
 
     /// Plan 49 section 5: a delivery that never yields must cost the caller its deadline and
     /// nothing else - no wedged process, no lost status, and completion as soon as the batch is

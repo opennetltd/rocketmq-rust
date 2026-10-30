@@ -58,6 +58,14 @@ pub(crate) struct LifecyclePolicy {
     pub cleanup_budget: Duration,
     /// Failed in-place repairs tolerated before one guarded incarnation replacement.
     pub max_repairs_before_replace: u32,
+    /// Remote opportunity granted to bulk offset persistence, counted from the moment local work
+    /// has drained. A listener that releases late therefore cannot spend it, and a fast drain
+    /// does not let persistence run past this bound either (plan 49c C5).
+    pub remote_persist_opportunity: Duration,
+    /// What unregistration and client teardown keep for themselves. It is set aside before bulk
+    /// persistence starts, so the last steps of cleanup cannot be starved by the writes before them
+    /// (plan 49c C5).
+    pub finalization_reserve: Duration,
 }
 
 impl LifecyclePolicy {
@@ -84,6 +92,8 @@ impl Default for LifecyclePolicy {
             pending_delivery_warn: Duration::from_secs(60),
             cleanup_budget: Duration::from_secs(30),
             max_repairs_before_replace: 3,
+            remote_persist_opportunity: Duration::from_secs(10),
+            finalization_reserve: Duration::from_secs(7),
         }
     }
 }

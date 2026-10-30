@@ -28,18 +28,25 @@ use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PersistSummary {
     pub attempted: u64,
+    /// Writes the broker answered. A one-way dispatch is never counted here, because it has no
+    /// answer to give (plan 49c C5).
     pub succeeded: u64,
     pub failed: u64,
-    /// Assigned offsets left unwritten because the cleanup budget ran out first.
+    /// Assigned offsets left unwritten because the deadline or a stopping consumer came first.
+    /// These were never sent.
     pub skipped: u64,
+    /// Writes handed to the transport without a broker acknowledgement. They left this process,
+    /// which is not the same statement as "the broker stored this offset", so they are kept
+    /// apart from `succeeded` rather than reported as durable persistence (plan 49c C5).
+    pub unproven: u64,
 }
 
 impl std::fmt::Display for PersistSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "attempted={} succeeded={} failed={} skipped={}",
-            self.attempted, self.succeeded, self.failed, self.skipped
+            "attempted={} succeeded={} failed={} skipped={} unproven={}",
+            self.attempted, self.succeeded, self.failed, self.skipped, self.unproven
         )
     }
 }
@@ -52,6 +59,7 @@ impl PersistSummary {
         self.succeeded += other.succeeded;
         self.failed += other.failed;
         self.skipped += other.skipped;
+        self.unproven += other.unproven;
     }
 }
 
@@ -293,7 +301,15 @@ mod tests {
             succeeded: 4,
             failed: 1,
             skipped: 2,
+            unproven: 2,
         };
-        assert_eq!(summary.to_string(), "attempted=7 succeeded=4 failed=1 skipped=2");
+        assert_eq!(
+            summary.to_string(),
+            "attempted=7 succeeded=4 failed=1 skipped=2 unproven=2"
+        );
+        // Every write this pass touched is counted once, and only `succeeded` may be read as a
+        // broker acknowledgement: one-way dispatch and unwritten offsets are reported apart
+        // (plan 49c C5).
+        assert_eq!(summary.attempted, summary.succeeded + summary.failed + summary.unproven);
     }
 }

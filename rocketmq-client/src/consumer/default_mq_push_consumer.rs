@@ -779,6 +779,19 @@ impl DefaultMQPushConsumer {
         }
     }
 
+    /// Give this consumer the remote budgets of its lifecycle policy: how long bulk offset
+    /// persistence may take once local work has drained, and what unregistration and teardown
+    /// keep back before it starts (plan 49c C5).
+    pub(crate) fn set_remote_budgets(
+        &mut self,
+        persist_opportunity: std::time::Duration,
+        reserve: std::time::Duration,
+    ) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.set_remote_budgets(persist_opportunity, reserve);
+        }
+    }
+
     /// Join the consumer's one cleanup session until `deadline`. The deadline bounds only this
     /// wait: an elapsed answer means "not proved yet", and the pass keeps running to release what
     /// it holds. Use [`Self::cleanup_progress`] to tell a still-running pass from a settled one.

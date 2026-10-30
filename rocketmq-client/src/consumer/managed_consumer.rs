@@ -291,6 +291,9 @@ impl ManagedConsumerSpec {
         // by how long an observer happens to wait (plan 49b R2).
         consumer.mark_managed_lifecycle();
         consumer.set_cleanup_session_ceiling(policy.cleanup_session_ceiling());
+        // The remote half of cleanup is policy-sized too: what bulk persistence may take once local
+        // work drained, and what unregistration keeps back before it starts (plan 49c C5).
+        consumer.set_remote_budgets(policy.remote_persist_opportunity, policy.finalization_reserve);
         consumer.set_progress(Arc::clone(&progress));
         if let Some(listener) = self.listener.clone() {
             consumer.register_message_listener_concurrently(SpecListener { listener });

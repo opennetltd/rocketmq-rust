@@ -60,8 +60,12 @@ pub(crate) const MAX_INFLIGHT_OFFSET_WRITES: usize = 8;
 /// What one offset write produced, before it is folded into a [`PersistSummary`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteOutcome {
+    /// A broker answered - only a request-reply write can produce this.
     Succeeded,
     Failed,
+    /// Handed to the transport with no answer expected. The pass may report that it sent the
+    /// offset, and nothing more (plan 49c C5).
+    Dispatched,
 }
 
 /// Issues items of work with at most `max` of them in flight, and never abandons one that started.
@@ -112,29 +116,39 @@ impl<'a, R> BoundedInFlight<'a, R> {
     async fn next_result(&mut self) -> Option<R> {
         self.in_flight.next().await
     }
+
+    /// Whether anything is admitted right now - the guard that lets a caller race result collection
+    /// against other work without spinning on an empty window.
+    fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
 }
 
 /// One write's outcome folded into the pass summary, counted exactly once.
 fn count(summary: &mut PersistSummary, outcome: WriteOutcome) {
+    summary.attempted += 1;
     match outcome {
-        WriteOutcome::Succeeded => {
-            summary.attempted += 1;
-            summary.succeeded += 1;
-        }
-        WriteOutcome::Failed => {
-            summary.attempted += 1;
-            summary.failed += 1;
-        }
+        WriteOutcome::Succeeded => summary.succeeded += 1,
+        WriteOutcome::Failed => summary.failed += 1,
+        // Dispatched with no answer to believe: counted as attempted and unproven, never as persisted
+        // (plan 49c C5).
+        WriteOutcome::Dispatched => summary.unproven += 1,
     }
 }
 
 impl RemoteBrokerOffsetStore {
     /// One pass over the assigned offsets, shared by the periodic task and cleanup so their
-    /// snapshot and write primitive cannot drift apart (plan 49a F10). `deadline` bounds each
-    /// individual write; `cancelled` is consulted before a queue is offered - never during a
-    /// write - so a consumer that is stopping stops issuing new writes without waiting for its
-    /// siblings or the client's scheduled task, and without abandoning a write already on the
-    /// wire.
+    /// snapshot and write primitive cannot drift apart (plan 49a F10). `deadline` is an absolute
+    /// instant bounding the whole remote step of each queue - offset snapshot, broker lookup, route
+    /// refresh, in-flight slot admission, send and result handling - and `cancelled` is consulted
+    /// before a queue is offered and again once its lookup returns, never during a write, so a
+    /// consumer that is stopping stops issuing new writes without waiting for its siblings or
+    /// the client's scheduled task, and without abandoning a write already on the wire (plan
+    /// 49c C5).
+    ///
+    /// No step computes its own relative budget from scratch: each one is bounded by the same
+    /// instant, so a lookup that waits on the nameserver lock cannot silently restart the clock
+    /// and leave the caller's deadline exceeded by however long the wait was.
     ///
     /// Broker resolution stays sequential because the client hands out its route tables through a
     /// mutable handle; the writes themselves only need a shared one, so up to
@@ -166,25 +180,39 @@ impl RemoteBrokerOffsetStore {
                 summary.skipped += remaining_here;
                 break;
             }
-            let (timeout_millis, budget) = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(TokioInstant::now());
-                    let timeout_millis = offset_rpc_timeout(remaining);
-                    if timeout_millis == 0 {
-                        // No budget: report it instead of starting a write that would be cut off.
-                        summary.skipped += remaining_here;
-                        break;
-                    }
-                    (timeout_millis, remaining)
-                }
-                None => (
-                    OFFSET_WRITE_TIMEOUT_MILLIS,
-                    std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS),
-                ),
+            // One absolute instant bounds this queue's whole remote step. Even with no caller
+            // deadline the step cannot run forever: one write timeout is its historical
+            // ceiling.
+            let attempt_deadline = match deadline {
+                Some(deadline) => deadline,
+                None => TokioInstant::now() + std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS),
             };
-            // Resolution needs the mutable client handle and stays where the per-queue budget is
-            // spent.
-            let addr = match self.resolve_write_addr(&mq).await {
+            if TokioInstant::now() >= attempt_deadline {
+                // No budget: report it instead of starting work that would be cut off.
+                summary.skipped += remaining_here;
+                break;
+            }
+            // Lookup needs the client's mutable handle, so it stays sequential - but it is bounded
+            // by that same instant, and the writes already admitted keep being polled
+            // while it waits, because a future nobody polls makes the window slower
+            // than it actually is (plan 49c C5).
+            let mut resolve = Box::pin(self.resolve_write_addr(&mq, attempt_deadline));
+            let addr = loop {
+                tokio::select! {
+                    biased;
+                    resolved = &mut resolve => break resolved,
+                    Some(outcome) = in_flight.next_result(), if !in_flight.is_empty() => {
+                        count(&mut summary, outcome);
+                    }
+                }
+            };
+            // The lookup either answered or hit the same deadline; both are visible here. Expiry is
+            // reported as unwritten work rather than a broker failure, because nothing was sent.
+            if TokioInstant::now() >= attempt_deadline {
+                summary.skipped += remaining_here;
+                break;
+            }
+            let addr = match addr {
                 Some(addr) => addr,
                 None => {
                     summary.attempted += 1;
@@ -193,6 +221,19 @@ impl RemoteBrokerOffsetStore {
                     continue;
                 }
             };
+            // Both gates again now that lookup has returned: the consumer may have started stopping
+            // and the deadline may have expired while a nameserver lock was held.
+            // Dispatching past either would be work nobody asked for, after its own
+            // deadline (plan 49c C5).
+            if cancelled() {
+                summary.skipped += remaining_here;
+                break;
+            }
+            let timeout_millis = offset_rpc_timeout(attempt_deadline.saturating_duration_since(TokioInstant::now()));
+            if timeout_millis == 0 {
+                summary.skipped += remaining_here;
+                break;
+            }
             let request_header = UpdateConsumerOffsetRequestHeader {
                 consumer_group: group_name.clone(),
                 topic: mq.get_topic_cs().clone(),
@@ -208,19 +249,22 @@ impl RemoteBrokerOffsetStore {
                     }),
                 }),
             };
-            // A one-way write is best effort and cannot be confirmed, so finishing its dispatch is
-            // the most this pass can claim.
+            // A one-way write is best effort and cannot be confirmed, so dispatching it is the most
+            // this pass can claim - reported as unproven, never as persisted. Its bound
+            // is the absolute end of this queue's step, not a budget measured before
+            // lookup started.
+            let write_deadline = TokioInstant::now() + std::time::Duration::from_millis(timeout_millis);
             let api = &api;
             let write = async move {
                 let step = api.update_consumer_offset_oneway(addr.as_str(), request_header, timeout_millis);
-                match tokio::time::timeout(budget, step).await {
-                    Ok(Ok(())) => WriteOutcome::Succeeded,
+                match tokio::time::timeout_at(write_deadline, step).await {
+                    Ok(Ok(())) => WriteOutcome::Dispatched,
                     Ok(Err(e)) => {
                         debug!("[persistAll] updateConsumeOffsetToBroker failed, {}", e);
                         WriteOutcome::Failed
                     }
                     Err(_) => {
-                        debug!("[persistAll] offset write cut off by its budget, {}", addr);
+                        debug!("[persistAll] offset write cut off by its deadline, {}", addr);
                         WriteOutcome::Failed
                     }
                 }
@@ -239,7 +283,17 @@ impl RemoteBrokerOffsetStore {
 
     /// Where a queue's offset goes: the master broker from the shared route tables, refreshed once
     /// on a miss exactly as before. `None` means this pass cannot address the write.
-    async fn resolve_write_addr(&mut self, mq: &MessageQueue) -> Option<CheetahString> {
+    ///
+    /// The lookup waits on the client's route lock and may fetch a route from the nameserver, so it
+    /// is bounded by the deadline of the step that needs it: an unreachable nameserver must not
+    /// extend a pass whose budget has already run out (plan 49c C5).
+    async fn resolve_write_addr(&mut self, mq: &MessageQueue, deadline: TokioInstant) -> Option<CheetahString> {
+        tokio::time::timeout_at(deadline, self.lookup_write_addr(mq))
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn lookup_write_addr(&mut self, mq: &MessageQueue) -> Option<CheetahString> {
         let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
         let mut found = self
             .client_instance
@@ -682,6 +736,37 @@ mod tests {
         );
         assert_eq!(10, summary.attempted, "{summary}");
         assert_eq!(10, summary.succeeded, "{summary}");
+    }
+
+    /// Plan 49c C5: broker lookup used to sit outside the pass budget, so a consumer whose route
+    /// lookup was waiting on the nameserver lock never returned - a ten millisecond deadline
+    /// kept running past an independent eighty millisecond timeout. Lookup is now bounded by
+    /// the same absolute instant as the write it feeds: the step ends when its deadline says so
+    /// and reports what it did not send.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waiting_lookup_cannot_outrun_the_persistence_deadline() {
+        let instance = dead_instance("lookup-deadline-test");
+        let mut store = RemoteBrokerOffsetStore::new(instance.clone(), CheetahString::from("deadline-group"));
+        let assigned = queues("StuckLookupTopic", 4);
+        for (id, mq) in assigned.iter().enumerate() {
+            store.update_offset(mq, id as i64 + 1, false).await;
+        }
+
+        // Hold the lock every route refresh takes, as a stalled nameserver would.
+        let handle = instance.nameserver_lock();
+        let _held = handle.lock().await;
+
+        let deadline = TokioInstant::now() + Duration::from_millis(10);
+        let summary = tokio::time::timeout(Duration::from_millis(80), store.persist_all_until(&assigned, deadline))
+            .await
+            .expect("the pass ends on its own deadline instead of waiting on the lookup");
+
+        assert_eq!(0, summary.attempted, "nothing was dispatched: {summary}");
+        assert_eq!(4, summary.skipped, "{summary}");
+        assert_eq!(
+            0, summary.unproven,
+            "and nothing claims a write it never sent: {summary}"
+        );
     }
 
     /// Plan 49a F10: periodic persistence belongs to its own consumer. Once that consumer is

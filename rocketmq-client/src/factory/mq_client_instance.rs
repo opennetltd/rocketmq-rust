@@ -1477,6 +1477,14 @@ impl MQClientInstance {
         }
     }
 
+    /// Test seam (plan 49c C5): the handle for the nameserver lock, so a test can hold it and make
+    /// a route lookup wait exactly as it would behind a stalled fetch. Never compiled into
+    /// anything that ships.
+    #[cfg(test)]
+    pub(crate) fn nameserver_lock(&self) -> Arc<RocketMQTokioMutex<()>> {
+        self.lock_namesrv.clone()
+    }
+
     pub async fn find_broker_address_in_subscribe(
         &mut self,
         broker_name: &CheetahString,
