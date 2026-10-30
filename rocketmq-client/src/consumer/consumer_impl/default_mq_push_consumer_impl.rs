@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::error::Error;
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -87,6 +88,7 @@ use crate::consumer::pop_status::PopStatus;
 use crate::consumer::pull_callback::DefaultPullCallback;
 use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
 use crate::consumer::store::offset_store::OffsetStore;
+use crate::consumer::store::offset_store::PersistSummary;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
 use crate::factory::mq_client_instance::MQClientInstance;
@@ -185,6 +187,105 @@ const DEFAULT_REMOTE_PERSIST_OPPORTUNITY: std::time::Duration = std::time::Durat
 /// What unregistration and client teardown keep back before persistence starts, for the same
 /// reason.
 const DEFAULT_FINALIZATION_RESERVE: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// First wait before this pass re-runs its own unfinished offset write. Storage faults are usually
+/// transient - a volume remounting, a reader holding the file a moment too long - and one owner
+/// waiting briefly costs less than reporting cleanup unproved for the rest of the process (plan 49c
+/// C6).
+const LOCAL_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// Ceiling on that wait, so repeated attempts cannot dominate the session they belong to.
+const MAX_LOCAL_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+/// Attempts this pass makes before it accepts that the write is not going to land and reports the
+/// blocker instead. Bounded so an unrecoverable fault stays Blocked without spinning.
+const MAX_LOCAL_PERSIST_RETRIES: u32 = 8;
+
+/// Backoff before attempt number `attempt` (0-based) of an unfinished local offset write: doubling
+/// from the first wait up to its ceiling, which it reaches and then holds at.
+pub(crate) fn local_persist_backoff(attempt: u32) -> std::time::Duration {
+    LOCAL_PERSIST_BACKOFF
+        .saturating_mul(1u32 << attempt.min(5))
+        .min(MAX_LOCAL_PERSIST_BACKOFF)
+}
+
+/// How the offset persistence phase of a cleanup pass ended.
+pub(crate) enum PersistPhase {
+    /// The writer finished. Whatever the summary says about individual queues, no local write is
+    /// left unfinished and finalization may proceed.
+    Finished { summary: PersistSummary, attempts: u32 },
+    /// Retry could not help within this session's budget; the blocker has to be reported instead of
+    /// a second writer being imagined into finishing the job.
+    Blocked { summary: PersistSummary, attempts: u32 },
+}
+
+/// What the offset persistence phase drives. Separated from `OffsetStore` so this phase's retry
+/// policy is testable without a broker or a filesystem (plan 49c C6).
+pub(crate) trait PersistTarget {
+    /// One attempt at writing everything assigned, bounded by `deadline`.
+    fn persist(&mut self, deadline: TokioInstant) -> impl Future<Output = PersistSummary>;
+    /// Whether the store's own writer has finished. `false` means an unfinished write is still
+    /// owned here, which is exactly what makes it this phase's work rather than someone else's.
+    fn writer_finished(&mut self) -> impl Future<Output = bool>;
+}
+
+/// The consumer's offset store plus the queues one cleanup pass was assigned.
+struct StorePersist<'a> {
+    store: &'a mut OffsetStore,
+    assigned: &'a HashSet<rocketmq_common::common::message::message_queue::MessageQueue>,
+}
+
+impl PersistTarget for StorePersist<'_> {
+    async fn persist(&mut self, deadline: TokioInstant) -> PersistSummary {
+        self.store.persist_all_until(self.assigned, deadline).await
+    }
+
+    async fn writer_finished(&mut self) -> bool {
+        self.store.io_complete().await
+    }
+}
+
+/// Persist everything assigned on this pass' own store, retrying an unfinished write **in place**
+/// with bounded backoff (plan 49c C6). One owner and one writer repeat work that is safe to repeat,
+/// so storage that becomes available again lets cleanup prove itself rather than leave a consumer
+/// blocked on a fault that outlived its own deadline. Nothing else in this process could make that
+/// write land: re-observing an ended pass from outside certainly cannot.
+///
+/// Each attempt is bounded by the same session deadline minus what finalization reserved, so
+/// retrying cannot reach past the budget the pass was given, and `on_retry` hears about every
+/// attempt so the session can report actual progress rather than a phase name that never moves.
+pub(crate) async fn persist_offsets_with_phase_retry<S: PersistTarget + ?Sized>(
+    store: &mut S,
+    session_deadline: TokioInstant,
+    opportunity: std::time::Duration,
+    reserve: std::time::Duration,
+    mut on_retry: impl FnMut(),
+) -> PersistPhase {
+    let mut summary = PersistSummary::default();
+    let mut attempt = 0u32;
+    loop {
+        let now = TokioInstant::now();
+        let window = remote_step(now, session_deadline, opportunity, reserve);
+        summary.merge(&store.persist(now + window).await);
+        if store.writer_finished().await {
+            return PersistPhase::Finished {
+                summary,
+                attempts: attempt,
+            };
+        }
+        let backoff = local_persist_backoff(attempt);
+        let remaining = session_deadline
+            .saturating_duration_since(TokioInstant::now())
+            .saturating_sub(reserve);
+        if attempt >= MAX_LOCAL_PERSIST_RETRIES || backoff >= remaining {
+            return PersistPhase::Blocked {
+                summary,
+                attempts: attempt,
+            };
+        }
+        attempt += 1;
+        on_retry();
+        tokio::time::sleep(backoff).await;
+    }
+}
 
 fn millis_or(millis: u64, default: std::time::Duration) -> std::time::Duration {
     if millis == 0 {
@@ -1004,15 +1105,40 @@ impl DefaultMQPushConsumerImpl {
             // to be able to leave this step with a deadline already expired. It is
             // capped by what remains once the reserve above is taken away, so
             // persistence can never reach into finalization (plan 49c C5).
-            let opportunity = remote_step(started, deadline, persist_opportunity, finalization_reserve);
-            let summary = store.persist_all_until(&assigned, started + opportunity).await;
+            //
+            // An unfinished local write is retried inside this same phase instead of ending the
+            // pass (plan 49c C6): one owner and one writer repeat work that is safe to
+            // repeat, so storage that becomes available again lets cleanup prove itself
+            // rather than leave a consumer blocked on a fault that outlived its own
+            // deadline. Nothing else in this process could have made that write land -
+            // re-observing an ended pass from outside certainly cannot.
+            let phase = persist_offsets_with_phase_retry(
+                &mut StorePersist {
+                    store,
+                    assigned: &assigned,
+                },
+                deadline,
+                persist_opportunity,
+                finalization_reserve,
+                || {
+                    // Observers see each attempt happen: same session, same owner, real progress.
+                    driver.retry("offset_persist_retry");
+                },
+            )
+            .await;
+            let (summary, attempts) = match phase {
+                PersistPhase::Finished { summary, attempts } => (summary, attempts),
+                PersistPhase::Blocked { summary, attempts } => {
+                    report.detail(format!("offsets[{summary}] retries={attempts}"));
+                    report.block("offset_file_writer_busy");
+                    return false;
+                }
+            };
             report.record("offset_persist", started);
-            report.detail(format!("offsets[{summary}]"));
-            if !store.io_complete().await {
-                // The local file writer still owns the pending write; report it instead of claiming
-                // a second writer finished the job.
-                report.block("offset_file_writer_busy");
-                return false;
+            if attempts > 0 {
+                report.detail(format!("offsets[{summary}] retries={attempts}"));
+            } else {
+                report.detail(format!("offsets[{summary}]"));
             }
         }
         // No offset store means nothing was ever persisted, which is proved, not blocked.
@@ -2378,6 +2504,108 @@ mod tests {
             remote_step(now + Duration::from_secs(5), now, Duration::from_secs(10), reserve),
             Duration::ZERO
         );
+    }
+
+    /// A store whose writer fails a fixed number of times and then succeeds (plan 49c C6 fixture):
+    /// the fault is in the write, not in the caller's patience.
+    struct FlakyStore {
+        failures: u32,
+        writes: std::cell::Cell<u32>,
+    }
+
+    impl PersistTarget for FlakyStore {
+        async fn persist(&mut self, _deadline: TokioInstant) -> PersistSummary {
+            let n = self.writes.get() + 1;
+            self.writes.set(n);
+            let (failed, succeeded) = if n <= self.failures { (1, 0) } else { (0, 1) };
+            PersistSummary {
+                attempted: 1,
+                failed,
+                succeeded,
+                ..Default::default()
+            }
+        }
+
+        async fn writer_finished(&mut self) -> bool {
+            self.writes.get() > self.failures
+        }
+    }
+
+    /// Plan 49c C6: an unfinished offset write belongs to the pass that started it. It retries that
+    /// one phase in place, with one writer and bounded backoff, so storage that becomes
+    /// available again lets cleanup prove itself instead of leaving a consumer blocked on a
+    /// fault that outlived its deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unfinished_write_is_retried_by_the_same_owner_until_it_lands() {
+        let mut store = FlakyStore {
+            failures: 2,
+            writes: std::cell::Cell::new(0),
+        };
+        let mut reported = 0u32;
+        let phase = persist_offsets_with_phase_retry(
+            &mut store,
+            TokioInstant::now() + Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_secs(7),
+            || reported += 1,
+        )
+        .await;
+        match phase {
+            PersistPhase::Finished { summary, attempts } => {
+                assert_eq!(2, attempts, "two failed attempts before the write landed");
+                assert_eq!(3, summary.attempted);
+                assert_eq!(1, summary.succeeded, "only the write that landed claims success");
+            }
+            PersistPhase::Blocked { attempts, .. } => {
+                panic!("storage recovered, so cleanup should have proved: {attempts} attempts")
+            }
+        }
+        assert_eq!(3, store.writes.get(), "one write per attempt, none extra");
+        assert_eq!(2, reported, "each retry is reported to the session as progress");
+    }
+
+    /// Plan 49c C6: a write that does not land stays Blocked with bounded work - no spin, no second
+    /// writer, and no fabricated proof of completion. What bounds it is the session's own budget:
+    /// once the next wait would eat what finalization reserved, the pass stops trying and says
+    /// so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_that_never_lands_stays_blocked_without_spinning() {
+        let mut store = FlakyStore {
+            failures: u32::MAX,
+            writes: std::cell::Cell::new(0),
+        };
+        let began = TokioInstant::now();
+        // One retry fits in this budget; the next wait would not.
+        let phase = persist_offsets_with_phase_retry(
+            &mut store,
+            TokioInstant::now() + Duration::from_millis(150),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            || {},
+        )
+        .await;
+        match phase {
+            PersistPhase::Blocked { summary, attempts } => {
+                assert!(attempts >= 1, "one bounded retry was still affordable: {attempts}");
+                assert!(
+                    attempts < MAX_LOCAL_PERSIST_RETRIES,
+                    "the budget ended first: {attempts}"
+                );
+                assert_eq!(attempts + 1, store.writes.get(), "one write per attempt, no more");
+                assert_eq!(0, summary.succeeded, "a failing write is never reported as persisted");
+            }
+            PersistPhase::Finished { .. } => panic!("the write never lands, so nothing may be proved"),
+        }
+        // Bounded by cadence rather than by how fast the loop can turn over.
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        // And the waits themselves stay bounded and monotonic up to their ceiling.
+        let mut previous = Duration::ZERO;
+        for attempt in 0..16 {
+            let backoff = local_persist_backoff(attempt);
+            assert!(backoff > previous || backoff == MAX_LOCAL_PERSIST_BACKOFF, "{attempt}");
+            assert!(backoff <= MAX_LOCAL_PERSIST_BACKOFF);
+            previous = backoff;
+        }
     }
 
     /// Plan 49 section 5: a delivery that never yields must cost the caller its deadline and

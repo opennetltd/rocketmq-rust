@@ -890,16 +890,18 @@ async fn observe_cleanup(
         if !session.running {
             // The pass ended without proving cleanup. Publish the blocker and keep ownership: this
             // is never an exit request and never a second pass.
-            let state = if stopping {
-                machine.request_stop()
-            } else {
-                machine.on_cleanup_unproved()
-            };
+            //
+            // The unproved fact is recorded even when a stop is already in flight (plan 49c C6):
+            // reasserting `Stopping` alone tells an operator that shutdown is progressing, when
+            // what it means is that ownership has not been released. Recording it first
+            // lets the machine pair the sticky stop with the blocker - phase
+            // `Stopping`, health `Blocked`, reason naming cleanup - instead of hiding
+            // behind one or the other.
+            if stopping {
+                machine.request_stop();
+            }
+            let state = machine.on_cleanup_unproved();
             publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
-            tracing::warn!(
-                phase = session.phase,
-                "managed consumer: cleanup session ended unproved"
-            );
             return CleanupSettled::Unproved(session.phase);
         }
         // Still running: report where it is. A stop changes only what is published.
@@ -928,6 +930,13 @@ async fn observe_cleanup(
 /// Returning means local ownership is quiescent; a stop observed meanwhile stays visible in status
 /// and leaves the handle's proof pending (plan 49b R2). The controller never exits because cleanup
 /// is slow, and it never starts another pass or an overlapping incarnation.
+///
+/// Stop is sticky state that one observation consumes, so it is never a wake-up source here. An
+/// already-cancelled token is permanently ready, and using it as this loop's timer re-observed an
+/// immutable settled result over a hundred thousand times in a tenth of a second (plan 49c C6).
+/// What can change the answer is the session reporting something new - a retry that finally wrote,
+/// a phase that finished - so that is what this waits for, with a real timer bounding only how
+/// often an unchanged blocker is restated.
 async fn await_cleanup_proof(
     consumer: &mut DefaultMQPushConsumer,
     machine: &mut RecoveryMachine,
@@ -936,15 +945,54 @@ async fn await_cleanup_proof(
     progress: Option<&Arc<ConsumerProgress>>,
 ) {
     let cadence = machine.policy().progress_check;
-    while !matches!(
-        observe_cleanup(consumer, machine, publisher, stop_token, progress).await,
-        CleanupSettled::Proved
-    ) {
-        if wait_or_stop(cadence, stop_token).await {
-            // Keep the blocker published and truthful for a waiting handle; still no exit.
-            let state = machine.request_stop();
-            publisher.publish(state, machine.incarnation(), &snapshot_of(progress));
+    let mut blocker: Option<&'static str> = None;
+    loop {
+        match observe_cleanup(consumer, machine, publisher, stop_token, progress).await {
+            CleanupSettled::Proved => return,
+            CleanupSettled::Unproved(phase) => {
+                // One warning per distinct blocker. Repeated observation of the same terminal
+                // result says nothing new, and log volume has to stay bounded by
+                // cadence rather than by how fast this loop can turn over (plan 49c
+                // C6).
+                if blocker != Some(phase) {
+                    tracing::warn!(
+                        phase,
+                        "managed consumer: cleanup session ended unproved, ownership retained; waiting for it to \
+                         change"
+                    );
+                    blocker = Some(phase);
+                }
+            }
         }
+        wait_for_cleanup_change(consumer.cleanup_progress_changes(), cadence).await;
+    }
+}
+
+/// Wait until the cleanup session reports something new, or `cadence` has passed. Only a phase
+/// change and a real timer can wake this: neither a stop request nor an observer coming and going
+/// is a state change, and treating one as such is what turned waiting into spinning (plan 49c C6).
+async fn wait_for_cleanup_change(
+    changes: Option<tokio::sync::watch::Receiver<crate::consumer::cleanup_session::CleanupProgress>>,
+    cadence: Duration,
+) {
+    let Some(mut changes) = changes else {
+        // Nothing exists that could report a change; the timer alone keeps this bounded.
+        tokio::time::sleep(cadence).await;
+        return;
+    };
+    // A phase change is what this waits for. The real timer beside it bounds how often an unchanged
+    // blocker is restated, and also covers a change that landed between observing and subscribing -
+    // without it, an observer could park on a value it had already read.
+    tokio::select! {
+        biased;
+        changed = changes.changed() => {
+            if changed.is_err() {
+                // The session stopped reporting. Wait out the timer rather than re-observing a channel
+                // that answers `Err` instantly forever.
+                tokio::time::sleep(cadence).await;
+            }
+        }
+        _ = tokio::time::sleep(cadence) => {}
     }
 }
 
@@ -1154,6 +1202,66 @@ const _: () = {
 mod tests {
 
     use super::*;
+
+    /// Plan 49c C6: an already-requested stop used to be this loop's timer, and a cancelled token
+    /// is permanently ready - the review fixture re-observed one immutable settled-unproved
+    /// session 156,319 times in about a tenth of a second. Waiting is now bounded by cadence
+    /// and woken only by real progress, so an idle observer costs one wake per cadence and
+    /// nothing else.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_cleanup_progress_is_bounded_by_cadence() {
+        use crate::consumer::cleanup_session::CleanupProgress;
+        let cadence = Duration::from_millis(50);
+        let settled = CleanupProgress {
+            phase: "offset_file_writer_busy",
+            running: false,
+            proved: false,
+            attempts: 3,
+        };
+        let (sender, receiver) = watch::channel(settled.clone());
+
+        // Nothing has changed and stop may already be requested: the wait still ends, and only
+        // after a full cadence. Returning immediately is what turned waiting into spinning.
+        let began = tokio::time::Instant::now();
+        wait_for_cleanup_change(Some(receiver), cadence).await;
+        assert!(began.elapsed() >= cadence, "an idle wait returned early");
+
+        // Actual progress - the session reporting a new phase - wakes it at once, long before the
+        // fallback timer would have. The subscription is taken first because that is what an
+        // observer does: watch for the next change, then read whatever it produced.
+        let witness = sender.subscribe();
+        sender.send_replace(CleanupProgress {
+            phase: "complete",
+            running: false,
+            proved: true,
+            attempts: 3,
+        });
+        let began = tokio::time::Instant::now();
+        wait_for_cleanup_change(Some(witness), cadence * 20).await;
+        assert!(began.elapsed() < cadence, "real progress must not wait for the timer");
+
+        // A session that stopped reporting cannot wake anyone either; the timer bounds that case
+        // too, instead of an immediately-answering error channel spinning the caller.
+        drop(sender);
+        let began = tokio::time::Instant::now();
+        wait_for_cleanup_change(Some(sender_empty()), cadence).await;
+        assert!(
+            began.elapsed() >= cadence,
+            "a closed channel must fall back to the timer"
+        );
+    }
+
+    /// A receiver whose sender is already gone.
+    fn sender_empty() -> watch::Receiver<crate::consumer::cleanup_session::CleanupProgress> {
+        let (sender, receiver) = watch::channel(crate::consumer::cleanup_session::CleanupProgress {
+            phase: "admission_closed",
+            running: true,
+            proved: false,
+            attempts: 0,
+        });
+        drop(sender);
+        receiver
+    }
 
     fn spec() -> ManagedConsumerSpec {
         ManagedConsumerSpec::new(

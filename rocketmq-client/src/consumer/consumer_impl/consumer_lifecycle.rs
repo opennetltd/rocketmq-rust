@@ -2642,6 +2642,29 @@ mod tests {
         assert_eq!(settled.reason, Reason::Stopped);
     }
 
+    /// Plan 49c C6: with a sticky stop, an unproved pass is reported as blocked *because of
+    /// cleanup*, not merely as "still stopping" - and re-observing the same settled result
+    /// restates that state without changing it. An observer must never have to invent progress
+    /// by asking again.
+    #[test]
+    fn an_unproved_pass_under_a_sticky_stop_is_blocked_on_cleanup_and_stays_that_way() {
+        use crate::consumer::managed_consumer::ConsumerHealth;
+        use crate::consumer::managed_consumer::ConsumerPhase;
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.request_stop();
+        let first = machine.on_cleanup_unproved();
+        assert_eq!(first.phase, ConsumerPhase::Stopping);
+        assert_eq!(first.health, ConsumerHealth::Blocked);
+        assert_eq!(
+            first.reason,
+            Reason::CleanupUnproved,
+            "reasserting `stopping` alone hides the fact that ownership was never released"
+        );
+        // A second observation of an unchanged result yields exactly what the first one did.
+        let again = machine.on_cleanup_unproved();
+        assert_eq!(again, first);
+    }
+
     /// Without a requested stop the same completion leaves recovery available; reconciliation must
     /// not turn an ordinary repair into a shutdown.
     #[test]

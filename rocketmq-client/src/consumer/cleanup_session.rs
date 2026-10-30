@@ -39,6 +39,10 @@ pub(crate) struct CleanupProgress {
     pub(crate) running: bool,
     /// Only meaningful once `running` is false: local ownership was proved quiescent.
     pub(crate) proved: bool,
+    /// How many times this pass has re-run an unfinished phase in place. One owner retrying its own
+    /// safe work is progress; an observer must be able to tell that apart from a stuck pass, and it
+    /// cannot if the only number available is a phase name (plan 49c C6).
+    pub(crate) attempts: u32,
 }
 
 impl CleanupProgress {
@@ -47,6 +51,7 @@ impl CleanupProgress {
             phase: "admission_closed",
             running: true,
             proved: false,
+            attempts: 0,
         }
     }
 }
@@ -115,6 +120,18 @@ impl CleanupDriver {
         self.progress.send_modify(|progress| {
             if progress.running {
                 progress.phase = phase;
+            }
+        });
+    }
+
+    /// Announce that the pass is re-running an unfinished phase in place. Same owner, same session,
+    /// one writer; what changed is that observers can see the attempt happen instead of inferring
+    /// it from a phase name that never moves.
+    pub(crate) fn retry(&self, phase: &'static str) {
+        self.progress.send_modify(|progress| {
+            if progress.running {
+                progress.phase = phase;
+                progress.attempts = progress.attempts.saturating_add(1);
             }
         });
     }

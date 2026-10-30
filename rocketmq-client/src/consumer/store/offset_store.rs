@@ -117,6 +117,7 @@ impl OffsetStore {
             summary.succeeded += remote.succeeded;
             summary.failed += remote.failed;
             summary.skipped += remote.skipped;
+            summary.unproven += remote.unproven;
         }
         if let Some(store) = self.local_file_offset_store.as_mut() {
             // The file writer owns its guard for the whole table: it is never cancelled mid-write
