@@ -194,6 +194,15 @@ pub(crate) struct ProgressSnapshot {
     /// Queues with a pull request in flight right now; the only honest evidence of an outstanding
     /// long poll.
     pub leased_queues: u64,
+    /// Queues sitting in a scheduled retry or a deliberate flow control wait (plan 49c C2). These
+    /// wait on purpose and stay healthy until their own expectation fails.
+    pub waiting_queues: u64,
+    /// Queues whose newest outcome is a route miss / RPC timeout rather than completed work.
+    pub route_miss_queues: u64,
+    pub rpc_timeout_queues: u64,
+    /// When the longest-running listener call entered user code, `0` when none is active. One
+    /// blocked callback therefore stays visible while other callbacks keep churning (plan 49c C2).
+    pub oldest_callback_ms: u64,
     pub pulls_started: u64,
     pub pulls_completed: u64,
     pub pulls_empty: u64,
@@ -217,6 +226,11 @@ pub(crate) struct ProgressSnapshot {
     /// latest one that could not. Which is newer decides whether a zero assignment is explicit.
     pub last_route_ok_ms: u64,
     pub last_route_miss_ms: u64,
+    /// Newest completed pull, and newest failed pull outcome by kind. Compared with each other, so
+    /// they describe the present rather than a lifetime tally (plan 49c C2).
+    pub last_pull_ok_ms: u64,
+    pub pull_route_miss_ms: u64,
+    pub pull_rpc_timeout_ms: u64,
     /// What the latest completed allocation pass concluded **for each topic**, ordered by topic.
     /// A zero assignment is only "explicitly idle" when a pass actually answered for that
     /// subscription; which answer it was decides whether health repairs in place or reports a
@@ -269,8 +283,22 @@ impl ProgressSnapshot {
 #[derive(Clone, Copy, Debug)]
 struct QueueProgress {
     epoch: u64,
+    /// When this acquisition last **completed** work. Only completion refreshes it, so a queue that
+    /// keeps launching retries or waiting on flow control still reads as silent (plan 49c C2).
     last_progress_ms: u64,
+    /// Whether a pull loop currently holds this queue's single in-flight lease.
     pull_leased: bool,
+    /// When the admitted pull RPC was handed over, `0` while no loop is in flight. An outstanding
+    /// long poll inside its own deadline is an expected wait; one past it means the answer never
+    /// came back and the loop is gone even though a lease is still held.
+    rpc_started_ms: u64,
+    /// Not before this instant may the next attempt run: a scheduled retry or a deliberate flow
+    /// control wait. Waiting is healthy until its own expectation fails (plan 49c C2).
+    wait_until_ms: u64,
+    /// Newest failed outcome for this acquisition, compared against `last_progress_ms` so an old
+    /// failure cannot stay current forever.
+    failure_ms: u64,
+    failure_kind: PullFailureKind,
 }
 
 /// One in-flight pull of one queue acquisition (plan 49a F4 section 4.3 item 3).
@@ -367,6 +395,17 @@ pub(crate) struct ConsumerProgress {
     revocations: AtomicU64,
     pending_delivery_msgs: AtomicU64,
     active_callbacks: AtomicU64,
+    /// Every listener call currently running, by id and the moment it entered the listener. One
+    /// blocked callback therefore stays visible while other callbacks keep starting and finishing;
+    /// a single counter would let that churn hide it (plan 49c C2).
+    callback_started_at: parking_lot::Mutex<HashMap<u64, u64>>,
+    next_callback_id: AtomicU64,
+    /// Newest completed pull anywhere and newest failed pull outcome by kind, compared with each
+    /// other instead of counted over a lifetime, so a fault stops being evidence as soon as work
+    /// completes after it.
+    last_pull_ok_ms: AtomicU64,
+    pull_route_miss_ms: AtomicU64,
+    pull_rpc_timeout_ms: AtomicU64,
     callbacks_started: AtomicU64,
     callbacks_finished: AtomicU64,
     offsets_persisted: AtomicU64,
@@ -390,6 +429,37 @@ pub(crate) struct ConsumerProgress {
     queues: parking_lot::RwLock<HashMap<MessageQueue, QueueProgress>>,
 }
 
+/// One queue's standing right now, judged from that queue alone (plan 49c C2).
+#[derive(Clone, Copy, Debug)]
+struct QueueStanding {
+    silent: bool,
+    waiting: bool,
+    leased: bool,
+    /// An admitted RPC whose own deadline passed without an answer.
+    overdue: bool,
+}
+
+impl QueueStanding {
+    /// A queue with a request in flight is not lost however old its last answer looks - only its
+    /// own expired RPC deadline says the answer is never coming (plan 49c C2).
+    fn is_lost(&self) -> bool {
+        self.overdue || (!self.leased && !self.waiting && self.silent)
+    }
+}
+
+impl QueueProgress {
+    fn standing(&self, now_ms: u64, stall: u64, rpc_grace: u64) -> QueueStanding {
+        QueueStanding {
+            silent: now_ms.saturating_sub(self.last_progress_ms) >= stall,
+            waiting: self.wait_until_ms > now_ms,
+            leased: self.pull_leased,
+            overdue: self.pull_leased
+                && self.rpc_started_ms > 0
+                && now_ms.saturating_sub(self.rpc_started_ms) >= rpc_grace,
+        }
+    }
+}
+
 impl ConsumerProgress {
     pub(crate) fn new() -> Arc<Self> {
         let now = get_current_millis();
@@ -397,6 +467,11 @@ impl ConsumerProgress {
             started_at_ms: AtomicU64::new(now),
             last_pull_ms: AtomicU64::new(now),
             last_callback_progress_ms: AtomicU64::new(now),
+            callback_started_at: parking_lot::Mutex::new(HashMap::new()),
+            next_callback_id: AtomicU64::new(1),
+            last_pull_ok_ms: AtomicU64::new(now),
+            pull_route_miss_ms: AtomicU64::new(0),
+            pull_rpc_timeout_ms: AtomicU64::new(0),
             last_assignment_ms: AtomicU64::new(0),
             last_offset_ms: AtomicU64::new(now),
             ..Default::default()
@@ -421,6 +496,9 @@ impl ConsumerProgress {
             return None;
         }
         entry.pull_leased = true;
+        // The RPC's own lifetime starts at admission, not at some later dispatch attempt.
+        entry.rpc_started_ms = get_current_millis();
+        entry.wait_until_ms = 0;
         Some(entry.epoch)
     }
 
@@ -454,13 +532,16 @@ impl ConsumerProgress {
         if let Some(entry) = queues.get_mut(queue) {
             if entry.epoch == epoch {
                 entry.pull_leased = false;
+                entry.rpc_started_ms = 0;
             }
         }
     }
 
-    pub(crate) fn note_pull_started(&self, queue: &MessageQueue) {
+    /// Counts an issued pull. It deliberately refreshes **no** progress timestamp: issuing work is
+    /// not completing it, and a queue that only ever launches retries must stay diagnosable
+    /// (plan 49c C2).
+    pub(crate) fn note_pull_started(&self, _queue: &MessageQueue) {
         self.bump(&self.pulls_started);
-        self.touch(queue);
     }
 
     /// Refresh one queue's progress timestamp; the lock is held for a single store.
@@ -479,6 +560,7 @@ impl ConsumerProgress {
         }
         let now = get_current_millis();
         self.last_pull_ms.store(now, Ordering::Relaxed);
+        self.last_pull_ok_ms.store(now, Ordering::Relaxed);
         if let Some(entry) = self.queues.write().get_mut(queue) {
             entry.last_progress_ms = now;
         }
@@ -486,10 +568,32 @@ impl ConsumerProgress {
 
     pub(crate) fn note_pull_failed(&self, queue: &MessageQueue, kind: PullFailureKind) {
         self.bump(&self.pull_failures);
+        let now = get_current_millis();
         match kind {
-            PullFailureKind::RouteOrBrokerMiss => self.bump(&self.route_misses),
-            PullFailureKind::RpcTimeout => self.bump(&self.rpc_timeouts),
+            PullFailureKind::RouteOrBrokerMiss => {
+                self.bump(&self.route_misses);
+                self.pull_route_miss_ms.store(now, Ordering::Relaxed);
+            }
+            PullFailureKind::RpcTimeout => {
+                self.bump(&self.rpc_timeouts);
+                self.pull_rpc_timeout_ms.store(now, Ordering::Relaxed);
+            }
             PullFailureKind::Other => {}
+        }
+        if let Some(entry) = self.queues.write().get_mut(queue) {
+            entry.failure_ms = now;
+            entry.failure_kind = kind;
+        }
+    }
+
+    /// A retry or a deliberate flow control wait for `queue`, with the delay actually scheduled.
+    /// While that wait lies in the future the queue is waiting on purpose; once it has passed with
+    /// no work admitted, the queue's own expectation has failed and it becomes repairable
+    /// (plan 49c C2).
+    pub(crate) fn note_queue_wait(&self, queue: &MessageQueue, delay: Duration) {
+        let wait_until = get_current_millis().saturating_add(delay.as_millis() as u64);
+        if let Some(entry) = self.queues.write().get_mut(queue) {
+            entry.wait_until_ms = entry.wait_until_ms.max(wait_until);
         }
     }
 
@@ -595,6 +699,10 @@ impl ConsumerProgress {
                         epoch,
                         last_progress_ms: now,
                         pull_leased: false,
+                        rpc_started_ms: 0,
+                        wait_until_ms: 0,
+                        failure_ms: 0,
+                        failure_kind: PullFailureKind::Other,
                     },
                 );
             }
@@ -618,16 +726,22 @@ impl ConsumerProgress {
         self.pending_delivery_msgs.fetch_add(messages, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_callback_started(&self, messages: u64) {
+    /// Registers a listener call that has entered user code and returns the id its owner hands back
+    /// when it finishes.
+    pub(crate) fn note_callback_started(&self, messages: u64) -> u64 {
+        let id = self.next_callback_id.fetch_add(1, Ordering::Relaxed);
         self.bump(&self.callbacks_started);
         self.active_callbacks.fetch_add(1, Ordering::Relaxed);
         let now = get_current_millis();
+        self.callback_started_at.lock().insert(id, now);
         self.last_callback_progress_ms.store(now, Ordering::Relaxed);
+        id
     }
 
-    pub(crate) fn note_callback_finished(&self, messages: u64) {
+    pub(crate) fn note_callback_finished(&self, id: u64, messages: u64) {
         self.bump(&self.callbacks_finished);
         self.active_callbacks.fetch_sub(1, Ordering::Relaxed);
+        self.callback_started_at.lock().remove(&id);
         self.pending_delivery_msgs.fetch_sub(
             messages.min(self.pending_delivery_msgs.load(Ordering::Relaxed)),
             Ordering::Relaxed,
@@ -658,18 +772,18 @@ impl ConsumerProgress {
     /// How long a queue may stay silent before its pull loop counts as lost or as stalled. Derived
     /// from the consumer's own long-poll reserve so it adapts when an application tunes that
     /// timeout.
-    /// Queues this incarnation owns whose pull loop is neither running nor advancing: the request
-    /// was dropped, its delayed retry never arrived, or a callback finished without
-    /// re-dispatching (plan 49a F4 section 4.3 item 5). A queue holding its lease is an
-    /// outstanding pull and not a lost one, however old its last answer looks: the RPC timeout
-    /// bounds it.
-    pub(crate) fn lost_pulls(&self, stall_after: Duration) -> Vec<MessageQueue> {
+    /// Queues this incarnation owns whose own expectation has failed: neither running nor waiting
+    /// with no completed work for the stall window, or holding a lease whose RPC deadline passed
+    /// without an answer (plan 49a F4 section 4.3 item 5, plan 49c C2). Health and repair share
+    /// this classification so they cannot disagree about which queues are affected.
+    pub(crate) fn lost_pulls(&self, stall_after: Duration, pull_deadline: Duration) -> Vec<MessageQueue> {
         let now_ms = get_current_millis();
         let window = u64::try_from(stall_after.as_millis()).unwrap_or(u64::MAX);
+        let grace = u64::try_from(pull_deadline.as_millis()).unwrap_or(u64::MAX);
         self.queues
             .read()
             .iter()
-            .filter(|(_, entry)| !entry.pull_leased && now_ms.saturating_sub(entry.last_progress_ms) >= window)
+            .filter(|(_, entry)| entry.standing(now_ms, window, grace).is_lost())
             .map(|(queue, _)| queue.clone())
             .collect()
     }
@@ -678,22 +792,41 @@ impl ConsumerProgress {
         self.queues.read().len() as u64
     }
 
-    pub(crate) fn snapshot(&self, stall_after: Duration) -> ProgressSnapshot {
+    pub(crate) fn snapshot(&self, stall_after: Duration, pull_deadline: Duration) -> ProgressSnapshot {
         let now_ms = get_current_millis();
         let queues = self.queues.read();
         let stall = u64::try_from(stall_after.as_millis()).unwrap_or(u64::MAX);
+        let grace = u64::try_from(pull_deadline.as_millis()).unwrap_or(u64::MAX);
         let mut stalled_queues = 0u64;
         let mut lost_pull_queues = 0u64;
         let mut leased_queues = 0u64;
+        let mut waiting_queues = 0u64;
+        let mut route_miss_queues = 0u64;
+        let mut rpc_timeout_queues = 0u64;
         for entry in queues.values() {
-            let silent = now_ms.saturating_sub(entry.last_progress_ms) >= stall;
+            let standing = entry.standing(now_ms, stall, grace);
+            if standing.waiting {
+                waiting_queues += 1;
+            }
             if entry.pull_leased {
                 leased_queues += 1;
-            } else if silent {
+            }
+            if standing.is_lost() {
                 lost_pull_queues += 1;
             }
-            if silent {
+            if standing.silent && !standing.waiting {
                 stalled_queues += 1;
+            }
+            // A failure is current evidence only while nothing has completed since it (plan 49c
+            // C2). `>=` on purpose: a failure stamped in the same millisecond as the
+            // last completion is ambiguous, and guessing "fine" would drop a live fault
+            // for a whole tick.
+            if entry.failure_ms >= entry.last_progress_ms {
+                match entry.failure_kind {
+                    PullFailureKind::RouteOrBrokerMiss => route_miss_queues += 1,
+                    PullFailureKind::RpcTimeout => rpc_timeout_queues += 1,
+                    PullFailureKind::Other => {}
+                }
             }
         }
         ProgressSnapshot {
@@ -723,8 +856,15 @@ impl ConsumerProgress {
             last_assignment_ms: self.last_assignment_ms.load(Ordering::Relaxed),
             last_offset_ms: self.last_offset_ms.load(Ordering::Relaxed),
             allocations: self.allocation_records(),
+            waiting_queues,
+            route_miss_queues,
+            rpc_timeout_queues,
+            oldest_callback_ms: self.callback_started_at.lock().values().copied().min().unwrap_or(0),
             last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
             last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
+            last_pull_ok_ms: self.last_pull_ok_ms.load(Ordering::Relaxed),
+            pull_route_miss_ms: self.pull_route_miss_ms.load(Ordering::Relaxed),
+            pull_rpc_timeout_ms: self.pull_rpc_timeout_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -796,6 +936,7 @@ pub(crate) struct DeliveryGuard {
     queue: MessageQueue,
     messages: u64,
     listener_started: bool,
+    callback_id: u64,
 }
 
 impl DeliveryGuard {
@@ -805,14 +946,16 @@ impl DeliveryGuard {
             queue: queue.clone(),
             messages: u64::try_from(messages).unwrap_or(0),
             listener_started: false,
+            callback_id: 0,
         }
     }
 
-    /// Marks the entry into the application listener; only then is a callback "active".
+    /// Marks the entry into the application listener; only then is a callback "active", and it is
+    /// registered individually so no other callback's completion can retire it (plan 49c C2).
     pub(crate) fn enter_listener(&mut self) {
         if !self.listener_started {
             self.listener_started = true;
-            self.progress.note_callback_started(self.messages);
+            self.callback_id = self.progress.note_callback_started(self.messages);
         }
     }
 }
@@ -820,7 +963,7 @@ impl DeliveryGuard {
 impl Drop for DeliveryGuard {
     fn drop(&mut self) {
         if self.listener_started {
-            self.progress.note_callback_finished(self.messages);
+            self.progress.note_callback_finished(self.callback_id, self.messages);
         } else {
             self.progress.note_delivery_dropped(self.messages);
         }
@@ -1004,17 +1147,16 @@ impl RecoveryMachine {
     pub(crate) fn on_tick(
         &mut self,
         snapshot: &ProgressSnapshot,
-        previous: Option<&ProgressSnapshot>,
         pull_deadline: Duration,
         unit: f64,
     ) -> (MachineState, Vec<Effect>) {
         if self.stop_requested || self.cleanup_unproved {
             return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
-        let progressed = previous.is_none_or(|before| snapshot.progressed_since(before));
-        if progressed {
-            self.stalled_repairs = 0;
-        }
+        // Nothing here asks whether unrelated counters moved since the last tick. A fault is a
+        // fault while its own evidence stands, and progress somewhere else neither creates
+        // nor retires it; the repair budget is cleared only by a conclusion that found
+        // nothing wrong (plan 49c C2).
 
         // Healthy idle: explicit zero assignment in CLUSTERING, or successful empty pulls.
         if snapshot.assigned_queues == 0 && !snapshot.has_pending_work() {
@@ -1047,6 +1189,7 @@ impl RecoveryMachine {
                     ],
                 );
             }
+            self.stalled_repairs = 0;
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1058,20 +1201,24 @@ impl RecoveryMachine {
         // a live long poll on one queue cannot hide a stalled callback or a lost pull loop
         // on another (plan 49a F4 section 4.3 item 4).
 
-        // Pending messages whose callbacks do not advance.
+        // Pending messages whose callbacks do not advance. Each running listener call is judged by
+        // its own elapsed time: other callbacks starting and finishing, pulls returning or offsets
+        // persisting cannot retire an over-budget call, because that call still owns the batch and
+        // nothing else can hand it back (plan 49c C2).
         if snapshot.has_pending_work() {
-            let silent = snapshot.age_ms(snapshot.last_callback_progress_ms);
-            if silent >= self.policy.pending_delivery_warn && !progressed {
-                if snapshot.active_callbacks > 0 {
-                    // A synchronous listener is still running: it stays owned and blocked, we
-                    // never cancel it, replace the incarnation or ask the app to restart.
-                    self.state = MachineState {
-                        phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                        health: crate::consumer::managed_consumer::ConsumerHealth::Blocked,
-                        reason: Reason::ListenerActiveOverBudget,
-                    };
-                    return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-                }
+            if snapshot.active_callbacks > 0
+                && snapshot.age_ms(snapshot.oldest_callback_ms) >= self.policy.pending_delivery_warn
+            {
+                // A synchronous listener is still running: it stays owned and blocked, we never
+                // cancel it, replace the incarnation or ask the app to restart.
+                self.state = MachineState {
+                    phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                    health: crate::consumer::managed_consumer::ConsumerHealth::Blocked,
+                    reason: Reason::ListenerActiveOverBudget,
+                };
+                return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
+            }
+            if snapshot.age_ms(snapshot.last_callback_progress_ms) >= self.policy.pending_delivery_warn {
                 self.state = MachineState {
                     phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
                     health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
@@ -1081,11 +1228,12 @@ impl RecoveryMachine {
             }
         }
 
-        // A queue this incarnation owns whose pull loop is neither running nor advancing. Judged
-        // per queue and by current state rather than by lifetime counters, so one busy
-        // queue cannot excuse an idle neighbour and a healthy past cannot excuse a stopped
-        // present (plan 49a F4 section 4.3 item 5).
-        if snapshot.lost_pull_queues > 0 && !progressed {
+        // A queue this incarnation owns whose own expectation has failed - no request in flight,
+        // nothing scheduled and no completed work for the stall window; or a lease whose RPC
+        // deadline passed without an answer. Judged per queue, so one busy queue cannot
+        // excuse an idle neighbour and a healthy past cannot excuse a stopped present (plan
+        // 49a F4 section 4.3 item 5, plan 49c C2).
+        if snapshot.lost_pull_queues > 0 {
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Degraded,
@@ -1133,6 +1281,7 @@ impl RecoveryMachine {
 
         // Expected waits: successful empty pulls, or an outstanding long poll inside its deadline.
         if snapshot.pulls_empty > 0 && !snapshot.has_pending_work() && snapshot.stalled_queues == 0 {
+            self.stalled_repairs = 0;
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1141,6 +1290,7 @@ impl RecoveryMachine {
             return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
         if snapshot.pull_within_deadline(pull_deadline) {
+            self.stalled_repairs = 0;
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1151,6 +1301,7 @@ impl RecoveryMachine {
 
         // Pending work that is advancing: busy rather than blocked.
         if snapshot.has_pending_work() {
+            self.stalled_repairs = 0;
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1159,16 +1310,19 @@ impl RecoveryMachine {
             return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
 
-        // Transport/route problems with no pending work: repair in place first.
-        let transport_reason = if snapshot.route_misses > 0 && !progressed {
-            Some(Reason::RouteOrBrokerMiss)
-        } else if snapshot.rpc_timeouts > 0 && !progressed {
-            Some(Reason::RpcTimeout)
-        } else if snapshot.revocations > 0 && snapshot.assigned_queues == 0 && !progressed {
-            Some(Reason::AssignmentRefreshFailed)
-        } else {
-            None
-        };
+        // Transport and route faults come from what each acquisition's newest outcome was, or - for
+        // a queue we do not track - from the newest failure anywhere measured against the
+        // newest completed pull. Lifetime tallies are not evidence: a consumer that
+        // recovered a second ago must not stay faulty, and one unrelated counter moving
+        // must not hide a fault that is still standing (plan 49c C2).
+        let transport_reason =
+            if snapshot.route_miss_queues > 0 || snapshot.pull_route_miss_ms > snapshot.last_pull_ok_ms {
+                Some(Reason::RouteOrBrokerMiss)
+            } else if snapshot.rpc_timeout_queues > 0 || snapshot.pull_rpc_timeout_ms > snapshot.last_pull_ok_ms {
+                Some(Reason::RpcTimeout)
+            } else {
+                None
+            };
         if let Some(reason) = transport_reason {
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Recovering,
@@ -1193,7 +1347,11 @@ impl RecoveryMachine {
             );
         }
 
-        if snapshot.flow_controls > 0 && !progressed {
+        // A queue sitting in a scheduled retry or a deliberate flow control wait is healthy while
+        // that wait still holds; once it lapses without work being admitted, the queue's own
+        // expectation has failed and the lost-pull branch above handles it (plan 49c C2).
+        if snapshot.waiting_queues > 0 {
+            self.stalled_repairs = 0;
             self.state = MachineState {
                 phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
                 health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1202,6 +1360,7 @@ impl RecoveryMachine {
             return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
 
+        self.stalled_repairs = 0;
         self.state = MachineState {
             phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
             health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
@@ -1225,7 +1384,15 @@ mod tests {
     }
 
     fn snapshot(progress: &ConsumerProgress) -> ProgressSnapshot {
-        progress.snapshot(Duration::from_secs(5))
+        progress.snapshot(Duration::from_secs(5), Duration::from_secs(30))
+    }
+
+    /// A queue that went quiet `age` ago with no request in flight and nothing scheduled: the shape
+    /// of a lost pull loop.
+    fn silent_queue(progress: &ConsumerProgress, mq: &MessageQueue, age: Duration) {
+        progress.note_queue_installed(mq);
+        let stamp = get_current_millis().saturating_sub(u64::try_from(age.as_millis()).unwrap_or(0));
+        progress.queues.write().get_mut(mq).unwrap().last_progress_ms = stamp;
     }
 
     #[test]
@@ -1329,7 +1496,7 @@ mod tests {
     fn zero_assignment_in_clustering_is_healthy_idle_not_a_restart() {
         let progress = ConsumerProgress::new();
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(
             (state.phase, state.health, state.reason),
             (
@@ -1350,7 +1517,7 @@ mod tests {
             progress.note_pull_completed(&queue("T", id), false);
         }
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
         assert_eq!(state.reason, Reason::IdleNoMessages);
         assert_eq!(effects.len(), 1);
@@ -1366,7 +1533,7 @@ mod tests {
             progress.note_pull_started(&q);
         }
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, _) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, _) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::LongPollPending);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
     }
@@ -1378,7 +1545,7 @@ mod tests {
         progress.note_assignment(&many);
         // A single queue makes progress; the rest stay silent.
         progress.note_pull_completed(&queue("T", 0), true);
-        let snap = progress.snapshot(Duration::from_millis(1));
+        let snap = progress.snapshot(Duration::from_millis(1), Duration::from_secs(30));
         assert_eq!(snap.assigned_queues, 5_408);
         assert_eq!(snap.stalled_queues, 5_407);
     }
@@ -1393,7 +1560,7 @@ mod tests {
         let (started, _) = machine.on_start_result(true, true, false, 0.5);
         assert_eq!(started.phase, crate::consumer::managed_consumer::ConsumerPhase::Running);
         let snap = snapshot(&progress);
-        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(
             state.phase,
             crate::consumer::managed_consumer::ConsumerPhase::Recovering
@@ -1415,7 +1582,7 @@ mod tests {
         let mut machine = RecoveryMachine::new(policy, 1);
         machine.on_start_result(true, true, false, 0.5);
         let snap = snapshot(&progress);
-        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.phase, crate::consumer::managed_consumer::ConsumerPhase::Running);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
         assert_eq!(state.reason, Reason::WaitingForAssignment);
@@ -1433,7 +1600,7 @@ mod tests {
         machine.on_start_result(true, true, false, 0.5);
         let snap = snapshot(&progress);
         for _ in 0..policy.max_repairs_before_replace + 8 {
-            let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+            let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
             assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
             assert!(
                 !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
@@ -1451,7 +1618,7 @@ mod tests {
         }
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
         let snap = snapshot(&progress);
-        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::RouteOrBrokerMiss);
         assert_eq!(
             state.phase,
@@ -1474,7 +1641,7 @@ mod tests {
         progress.note_delivery_pending(4);
         let mut machine = RecoveryMachine::new(policy, 1);
         let snap = snapshot(&progress);
-        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::CallbacksStalled);
         assert!(matches!(effects.first(), Some(Effect::Repair(_))));
     }
@@ -1491,7 +1658,7 @@ mod tests {
         progress.note_callback_started(4);
         let mut machine = RecoveryMachine::new(policy, 1);
         let snap = snapshot(&progress);
-        let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Blocked);
         assert_eq!(state.reason, Reason::ListenerActiveOverBudget);
         // Only an idle tick: the listener stays owned until it returns.
@@ -1547,7 +1714,7 @@ mod tests {
         let progress = ConsumerProgress::new();
         assigned(&progress, 1);
         let snap = snapshot(&progress);
-        let (_, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+        let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(effects, vec![Effect::Idle(LifecyclePolicy::default().progress_check)]);
 
         let done = machine.on_cleanup_complete();
@@ -1681,7 +1848,7 @@ mod tests {
         progress.note_allocation_pass("TopicA", AllocationOutcome::ExplicitZero);
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::WaitingForAssignment);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
         assert!(matches!(effects.first(), Some(Effect::Idle(_))));
@@ -1697,7 +1864,7 @@ mod tests {
         progress.note_allocation_pass("TopicA", AllocationOutcome::LookupFailed);
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::AssignmentRefreshFailed);
         assert!(matches!(effects.first(), Some(Effect::Repair(RepairKind::Assignment))));
     }
@@ -1722,7 +1889,7 @@ mod tests {
             }
 
             let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-            let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+            let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
             assert_eq!(
                 state.reason,
                 Reason::AssignmentRefreshFailed,
@@ -1743,7 +1910,7 @@ mod tests {
 
         progress.note_allocation_pass("TopicA", AllocationOutcome::ExplicitZero);
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, _) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, _) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(
             state.reason,
             Reason::AssignmentRefreshFailed,
@@ -1751,7 +1918,7 @@ mod tests {
         );
 
         progress.note_allocation_pass("TopicB", AllocationOutcome::ExplicitZero);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::WaitingForAssignment);
         assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Healthy);
         assert!(matches!(effects.first(), Some(Effect::Idle(_))));
@@ -1767,7 +1934,7 @@ mod tests {
         progress.note_allocation_pass("TopicB", AllocationOutcome::OffsetPreparationFailed);
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, effects) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(
             state.reason,
             Reason::AssignmentRefreshFailed,
@@ -1792,7 +1959,7 @@ mod tests {
         );
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, _) = machine.on_tick(&snapshot(&progress), None, Duration::from_secs(30), 0.5);
+        let (state, _) = machine.on_tick(&snapshot(&progress), Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::WaitingForAssignment);
     }
 
@@ -1861,8 +2028,8 @@ mod tests {
         // them apart is that one still has its request in flight. Ageing only moves one
         // way, so the expectation cannot depend on how long the scheduler takes.
         std::thread::sleep(Duration::from_millis(5));
-        let before = progress.snapshot(Duration::from_millis(1));
-        let snap = progress.snapshot(Duration::from_millis(1));
+        let before = progress.snapshot(Duration::from_millis(1), Duration::from_secs(30));
+        let snap = progress.snapshot(Duration::from_millis(1), Duration::from_secs(30));
         assert_eq!(snap.leased_queues, 1, "one queue is actively pulling");
         assert_eq!(snap.lost_pull_queues, 1, "the other queue lost its pull loop");
 
@@ -1870,7 +2037,7 @@ mod tests {
         // Two passes with identical counters: nothing moved between them, so silence here is
         // evidence rather than the absence of an observation.
         assert!(!snap.progressed_since(&before));
-        let (state, effects) = machine.on_tick(&snap, Some(&before), Duration::from_secs(30), 0.5);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::ExpectedPullMissing);
         assert_eq!(
             state.health,
@@ -1894,12 +2061,12 @@ mod tests {
         // Let the silence window pass while the request stays in flight: what keeps this queue from
         // being called lost is the held lease and nothing else.
         std::thread::sleep(Duration::from_millis(5));
-        let snap = progress.snapshot(Duration::from_millis(1));
+        let snap = progress.snapshot(Duration::from_millis(1), Duration::from_secs(30));
         assert_eq!(snap.stalled_queues, 1, "it has been silent for a while");
         assert_eq!(snap.lost_pull_queues, 0, "but the request is still in flight");
 
         let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
-        let (state, _) = machine.on_tick(&snap, None, Duration::from_secs(30), 0.5);
+        let (state, _) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
         assert_eq!(state.reason, Reason::LongPollPending);
     }
 
@@ -1974,12 +2141,111 @@ mod tests {
         }
     }
 
+    /// Plan 49c C2: progress somewhere else must not excuse a queue whose own expectation failed.
+    /// One queue lost its pull loop while a sibling keeps completing pulls and offsets keep
+    /// persisting; the old aggregate "nothing moved" prerequisite reported that as healthy
+    /// idleness.
+    #[test]
+    fn unrelated_pull_progress_does_not_hide_a_lost_queue() {
+        let progress = ConsumerProgress::new();
+        let busy = queue("T", 0);
+        let lost = queue("T", 1);
+        progress.note_queue_installed(&busy);
+        silent_queue(&progress, &lost, Duration::from_secs(60));
+
+        // The sibling is doing real work at this very moment.
+        progress.note_pull_completed(&busy, true);
+        progress.note_offset_persisted();
+
+        let snap = snapshot(&progress);
+        assert_eq!(
+            snap.lost_pull_queues, 1,
+            "one queue has no request in flight and nothing scheduled"
+        );
+        assert_eq!(snap.pulls_completed, 1, "and the other one is advancing");
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+        assert_eq!(
+            state.reason,
+            Reason::ExpectedPullMissing,
+            "sibling progress cannot make a lost queue healthy"
+        );
+        assert!(
+            matches!(effects.first(), Some(Effect::Repair(RepairKind::LostPull))),
+            "the affected queue is repaired, not the whole consumer: {effects:?}"
+        );
+    }
+
+    /// Plan 49c C2: one listener call over its budget stays blocked while other callbacks start and
+    /// finish and pulls keep returning - that churn is exactly what used to hide it.
+    #[test]
+    fn unrelated_progress_does_not_hide_a_blocked_listener_call() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_queue_installed(&mq);
+
+        // A batch enters a listener that never returns, and that call is aged past the budget by
+        // moving only its own start time.
+        progress.note_delivery_pending(4);
+        let stuck = progress.note_callback_started(4);
+        {
+            let mut active = progress.callback_started_at.lock();
+            let started = active.get_mut(&stuck).unwrap();
+            *started = started.saturating_sub(policy.pending_delivery_warn.as_millis() as u64 + 1);
+        }
+
+        // Everything else advances: another callback runs to completion, a pull comes back with
+        // work, so the aggregate "callback progress" timestamp is fresh.
+        progress.note_delivery_pending(3);
+        let other = progress.note_callback_started(3);
+        progress.note_callback_finished(other, 3);
+        progress.note_pull_completed(&mq, true);
+
+        let snap = snapshot(&progress);
+        assert_eq!(snap.active_callbacks, 1, "only the stuck call is still running");
+        assert!(
+            snap.age_ms(snap.last_callback_progress_ms) < policy.pending_delivery_warn,
+            "callback bookkeeping as a whole looks like it just progressed"
+        );
+
+        let mut machine = RecoveryMachine::new(policy, 1);
+        let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+        assert_eq!(state.health, crate::consumer::managed_consumer::ConsumerHealth::Blocked);
+        assert_eq!(state.reason, Reason::ListenerActiveOverBudget);
+        assert!(
+            !matches!(effects.first(), Some(Effect::Stop { .. })),
+            "a blocked listener never asks for replacement or restart: {effects:?}"
+        );
+    }
+
+    /// A deliberate wait is healthy until its own expectation fails, and becomes repairable once it
+    /// lapses (plan 49c C2).
+    #[test]
+    fn a_wait_that_has_not_lapsed_is_healthy_and_a_lapsed_one_is_repairable() {
+        let progress = ConsumerProgress::new();
+        let waiting = queue("T", 0);
+        let lapsed = queue("T", 1);
+        progress.note_queue_installed(&waiting);
+        silent_queue(&progress, &lapsed, Duration::from_secs(60));
+        progress.note_queue_wait(&waiting, Duration::from_secs(5));
+        progress.note_queue_wait(&lapsed, Duration::ZERO);
+
+        let snap = snapshot(&progress);
+        assert_eq!(snap.waiting_queues, 1, "one queue is waiting on purpose");
+        assert_eq!(
+            snap.lost_pull_queues, 1,
+            "the queue whose wait already lapsed with no work has failed its own expectation"
+        );
+    }
+
     #[test]
     fn callback_bookkeeping_never_underflows_pending_counts() {
         let progress = ConsumerProgress::new();
         progress.note_delivery_pending(2);
-        progress.note_callback_started(2);
-        progress.note_callback_finished(2);
+        let id = progress.note_callback_started(2);
+        progress.note_callback_finished(id, 2);
         let snap = snapshot(&progress);
         assert_eq!(snap.pending_delivery_msgs, 0);
         assert_eq!(snap.active_callbacks, 0);
@@ -2081,7 +2347,7 @@ mod tests {
                 progress.note_pull_failed(&mq, PullFailureKind::RouteOrBrokerMiss);
             }
             let snap = snapshot(&progress);
-            let (state, effects) = machine.on_tick(&snap, Some(&snap), Duration::from_secs(30), 0.5);
+            let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
             assert_eq!(
                 state.phase,
                 crate::consumer::managed_consumer::ConsumerPhase::Recovering,

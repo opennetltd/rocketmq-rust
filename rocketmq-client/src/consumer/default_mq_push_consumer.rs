@@ -671,16 +671,28 @@ impl DefaultMQPushConsumer {
     /// In-place repair used by the recovery controller: refresh the route of every subscribed
     /// topic through the normal publish path, reconcile broker state, then wake this client's own
     /// rebalance so each queue gets at most one new pull request. Never registers a second client.
-    pub(crate) async fn repair_routes_and_rebalance(&mut self) {
-        let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() else {
-            return;
-        };
-        let topics: Vec<cheetah_string::CheetahString> = impl_.consumer_config.subscription.keys().cloned().collect();
-        let Some(instance) = impl_.client_instance.clone() else {
-            return;
-        };
+    ///
+    /// The pass is resumable (plan 49c C2): it starts after `after` in sorted topic order and stops
+    /// at its time slice between topics, returning the topic to continue from so the next round
+    /// carries on instead of repeating what already succeeded. An in-flight bounded route wait
+    /// is never cut short.
+    pub(crate) async fn repair_routes_and_rebalance(
+        &mut self,
+        after: Option<&cheetah_string::CheetahString>,
+        slice: std::time::Duration,
+    ) -> Option<cheetah_string::CheetahString> {
+        let impl_ = self.default_mqpush_consumer_impl.as_ref()?;
+        let mut topics: Vec<cheetah_string::CheetahString> =
+            impl_.consumer_config.subscription.keys().cloned().collect();
+        topics.sort();
+        let instance = impl_.client_instance.clone()?;
         let mut instance = instance;
-        for topic in &topics {
+        let started = std::time::Instant::now();
+        let pending: Vec<_> = topics
+            .into_iter()
+            .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
+            .collect();
+        for (index, topic) in pending.iter().enumerate() {
             let refreshed = instance
                 .as_mut()
                 .repair_route_after_broker_miss(topic, Duration::from_millis(500))
@@ -688,18 +700,32 @@ impl DefaultMQPushConsumer {
             if !refreshed {
                 tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
             }
+            if index + 1 < pending.len() && started.elapsed() >= slice {
+                instance.re_balance_immediately();
+                tracing::debug!(
+                    topic = %topic,
+                    "route repair reached its time slice, continuing with the remaining topics on the next status round"
+                );
+                return Some(topic.clone());
+            }
         }
         instance.re_balance_immediately();
+        None
     }
 
     /// Re-dispatch the pulls that were lost, if any (plan 49a F4 section 4.3 item 5). Used by the
     /// recovery controller when a queue this consumer owns stopped having a pull request in
     /// flight.
-    pub(crate) async fn repair_lost_pulls(&mut self, stall_after: std::time::Duration) {
+    pub(crate) async fn repair_lost_pulls(
+        &mut self,
+        stall_after: std::time::Duration,
+        pull_deadline: std::time::Duration,
+        slice: std::time::Duration,
+    ) -> bool {
         let Some(impl_) = self.default_mqpush_consumer_impl.as_mut() else {
-            return;
+            return true;
         };
-        impl_.repair_lost_pulls(stall_after).await;
+        impl_.repair_lost_pulls(stall_after, pull_deadline, slice).await
     }
 
     /// Where this consumer's single cleanup session stands, or `None` while no stop has been

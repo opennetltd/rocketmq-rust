@@ -1274,11 +1274,32 @@ impl DefaultMQPushConsumerImpl {
     /// cannot be determined is left stalled rather than pulled from an invalid position:
     /// leaving it untouched keeps the fault visible, and the next bounded repair pass tries
     /// again.
-    pub(crate) async fn repair_lost_pulls(&mut self, stall_after: std::time::Duration) {
-        let lost = self.progress.lost_pulls(stall_after);
+    /// Re-dispatch the pulls this consumer lost, spending at most `slice` of wall time (plan 49c
+    /// C2). Returns whether the pass finished; when it did not, the caller keeps the repair as
+    /// a cursor and calls again, and the queues still behind are picked up then. Only whole
+    /// queue steps are cut - never an in-flight offset read - and everything prepared before
+    /// stopping is dispatched.
+    pub(crate) async fn repair_lost_pulls(
+        &mut self,
+        stall_after: std::time::Duration,
+        pull_deadline: std::time::Duration,
+        slice: std::time::Duration,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        let mut lost = self.progress.lost_pulls(stall_after, pull_deadline);
         if lost.is_empty() {
-            return;
+            return true;
         }
+        // Deterministic order: a pass that stops at its time slice must move forward through the
+        // same sequence next round instead of re-picking whichever queue the map happens to
+        // yield first.
+        lost.sort_by(|a, b| {
+            (a.get_topic(), a.get_broker_name(), a.get_queue_id()).cmp(&(
+                b.get_topic(),
+                b.get_broker_name(),
+                b.get_queue_id(),
+            ))
+        });
         // Snapshot the owned queues first and release the table before any I/O: holding that read
         // guard across a broker round trip would block rebalance from updating the same table.
         let owned: Vec<_> = {
@@ -1296,7 +1317,16 @@ impl DefaultMQPushConsumerImpl {
                 .collect()
         };
         let mut requests = Vec::new();
-        for (mq, pq) in owned {
+        let mut unfinished = false;
+        let mut remaining = 0usize;
+        let owned_len = owned.len();
+        for (index, (mq, pq)) in owned.into_iter().enumerate() {
+            if index > 0 && started.elapsed() >= slice {
+                // Stop between queues; what was already prepared is still dispatched below.
+                unfinished = true;
+                remaining = owned_len - index;
+                break;
+            }
             // One repair per acquisition at a time: whoever holds the queue's lease already owns
             // its next pull, and this repair has nothing to add.
             let Some(lease) = self.progress.acquire_pull_lease(&mq) else {
@@ -1348,13 +1378,19 @@ impl DefaultMQPushConsumerImpl {
             request.hold_lease(lease);
             requests.push(request);
         }
-        if requests.is_empty() || self.client_instance.is_none() {
-            return;
+        if !requests.is_empty() && self.client_instance.is_some() {
+            debug!("re-dispatching {} queue(s) whose pull loop was lost", requests.len());
+            for request in requests {
+                self.execute_pull_request_immediately(request).await;
+            }
         }
-        debug!("re-dispatching {} queue(s) whose pull loop was lost", requests.len());
-        for request in requests {
-            self.execute_pull_request_immediately(request).await;
+        if unfinished {
+            debug!(
+                remaining,
+                "lost-pull repair reached its time slice, continuing on the next status round"
+            );
         }
+        !unfinished
     }
 
     pub(crate) async fn pull_message(&mut self, mut pull_request: PullRequest) {
