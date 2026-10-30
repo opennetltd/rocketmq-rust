@@ -128,6 +128,12 @@ impl PullCallback for DefaultPullCallback {
         let subscription_data = self.subscription_data.take().unwrap();
         let mut pull_request = self.pull_request.take().unwrap();
 
+        // Plan 49d R1: the RPC answered, so this attempt is over no matter what happens to the
+        // answer below (expired acquisition, decode failure, immediate continuation).
+        // Retiring it here keeps a completed loop from carrying an outstanding-RPC
+        // deadline, while the lease stays held by the loop that owns the queue.
+        push_consumer_impl.finish_pull_attempt(&pull_request);
+
         // Plan 49a F4 section 4.3 item 2: an answer can arrive after its acquisition moved on - the
         // queue was revoked, or revoked and assigned again. The lease epoch names the
         // acquisition that issued the request, so publishing now would put messages under a
@@ -276,6 +282,9 @@ impl PullCallback for DefaultPullCallback {
         self.push_consumer_impl
             .progress
             .note_pull_failed(&message_queue_inner, classify_pull_failure(err.as_ref()));
+        // A failed attempt is finished work too: it must not stay outstanding while the retry timer
+        // runs, and an expired acquisition below has no callback left to retire it (plan 49d R1).
+        self.push_consumer_impl.finish_pull_attempt(&pull_request);
         if !self
             .push_consumer_impl
             .holds_acquisition(&message_queue_inner, pull_request.lease_epoch())

@@ -307,12 +307,20 @@ struct QueueProgress {
     /// When this acquisition last **completed** work. Only completion refreshes it, so a queue that
     /// keeps launching retries or waiting on flow control still reads as silent (plan 49c C2).
     last_progress_ms: u64,
-    /// Whether a pull loop currently holds this queue's single in-flight lease.
+    /// Whether a pull loop currently holds this queue's single in-flight lease. The lease belongs
+    /// to the **whole loop** - it survives successful answers and delayed continuations - so it
+    /// says nothing by itself about whether an RPC is outstanding (plan 49d R1).
     pull_leased: bool,
-    /// When the admitted pull RPC was handed over, `0` while no loop is in flight. An outstanding
-    /// long poll inside its own deadline is an expected wait; one past it means the answer never
-    /// came back and the loop is gone even though a lease is still held.
-    rpc_started_ms: u64,
+    /// Identity of the pull attempt currently handed to the transport, `0` while the loop owns the
+    /// queue with no RPC in flight. Kept apart from the lease so completing a pull can retire its
+    /// own attempt without touching loop ownership, and so a late answer for an older attempt
+    /// cannot finish the one now running.
+    attempt_id: u64,
+    /// When **this attempt** was handed over and when its own answer is due, `0`/`0` while none is
+    /// in flight. An outstanding long poll inside its own deadline is an expected wait; only
+    /// that deadline passing means the answer is never coming (plan 49d R1).
+    attempt_started_ms: u64,
+    attempt_deadline_ms: u64,
     /// Not before this instant may the next attempt run: a scheduled retry or a deliberate flow
     /// control wait. Waiting is healthy until its own expectation fails (plan 49c C2).
     wait_until_ms: u64,
@@ -453,6 +461,9 @@ pub(crate) struct ConsumerProgress {
     /// completion captured under the old assignment would be accepted by the new one (plan 49a
     /// F4).
     next_epoch: AtomicU64,
+    /// Identity source for pull attempts. Identities are never reused within an incarnation so a
+    /// callback can only ever retire the attempt it answered (plan 49d R1).
+    next_attempt_id: AtomicU64,
     queues: parking_lot::RwLock<HashMap<MessageQueue, QueueProgress>>,
 }
 
@@ -462,27 +473,43 @@ struct QueueStanding {
     silent: bool,
     waiting: bool,
     leased: bool,
-    /// An admitted RPC whose own deadline passed without an answer.
+    /// An admitted RPC whose **own** deadline passed without an answer.
     overdue: bool,
+    /// The loop still holds the queue's lease while nothing is admitted and no continuation is due:
+    /// work stopped without ending the loop, which stays diagnosable instead of looking healthy
+    /// forever (plan 49d R1).
+    idle_lease: bool,
 }
 
 impl QueueStanding {
-    /// A queue with a request in flight is not lost however old its last answer looks - only its
-    /// own expired RPC deadline says the answer is never coming (plan 49c C2).
+    /// A queue with a request in flight inside its own deadline, or with a continuation still due
+    /// in the future, is not lost however old its last answer looks - only an expired attempt
+    /// deadline or a failed wait expectation says the work is gone (plan 49c C2, plan 49d R1).
     fn is_lost(&self) -> bool {
-        self.overdue || (!self.leased && !self.waiting && self.silent)
+        self.overdue || self.idle_lease || (!self.leased && !self.waiting && self.silent)
     }
 }
 
 impl QueueProgress {
     fn standing(&self, now_ms: u64, stall: u64, rpc_grace: u64) -> QueueStanding {
+        let silent = now_ms.saturating_sub(self.last_progress_ms) >= stall;
+        let waiting = self.wait_until_ms > now_ms;
+        // Judged from the attempt's own record: a loop that keeps completing pulls reopens it per
+        // attempt, so a lease held for hours never ages into a fault on its own (plan 49d R1). The
+        // caller's allowance is only a fallback for an attempt that recorded no window of its own.
+        let overdue = self.attempt_id != 0
+            && now_ms
+                >= if self.attempt_deadline_ms > 0 {
+                    self.attempt_deadline_ms
+                } else {
+                    self.attempt_started_ms.saturating_add(rpc_grace)
+                };
         QueueStanding {
-            silent: now_ms.saturating_sub(self.last_progress_ms) >= stall,
-            waiting: self.wait_until_ms > now_ms,
+            silent,
+            waiting,
             leased: self.pull_leased,
-            overdue: self.pull_leased
-                && self.rpc_started_ms > 0
-                && now_ms.saturating_sub(self.rpc_started_ms) >= rpc_grace,
+            overdue,
+            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && silent,
         }
     }
 }
@@ -523,10 +550,51 @@ impl ConsumerProgress {
             return None;
         }
         entry.pull_leased = true;
-        // The RPC's own lifetime starts at admission, not at some later dispatch attempt.
-        entry.rpc_started_ms = get_current_millis();
+        // Taking the lease says one loop owns this queue; it starts no RPC timer. The attempt that
+        // actually reaches the transport records its own window (plan 49d R1), and a wait scheduled
+        // before the claim is no longer an expectation anyone owes.
         entry.wait_until_ms = 0;
         Some(entry.epoch)
+    }
+
+    /// Records that **this** pull attempt reached the transport, with the answer window the request
+    /// was issued under. Returns the attempt identity its callback must hand back to
+    /// [`Self::finish_pull_attempt`], or `None` when this queue is no longer owned under `epoch`
+    /// (revoked, or assigned again under a newer epoch) - in which case the caller must not treat
+    /// what it issued as owned work.
+    ///
+    /// The loop lease is untouched: an attempt is a phase inside that lease, never the lease
+    /// itself.
+    pub(crate) fn begin_pull_attempt(&self, queue: &MessageQueue, epoch: u64, window: Duration) -> Option<u64> {
+        let mut queues = self.queues.write();
+        let entry = queues.get_mut(queue)?;
+        if entry.epoch != epoch || !entry.pull_leased {
+            return None;
+        }
+        let now = get_current_millis();
+        // Identities are offset by one because `0` means "no attempt in flight", which keeps a
+        // freshly defaulted counter from handing out the sentinel.
+        let attempt_id = self.next_attempt_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        entry.attempt_id = attempt_id;
+        entry.attempt_started_ms = now;
+        entry.attempt_deadline_ms = now.saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+        // An admitted RPC supersedes any wait expectation recorded for this queue.
+        entry.wait_until_ms = 0;
+        Some(attempt_id)
+    }
+
+    /// Ends one pull attempt - answered, failed or cancelled - and leaves the loop lease alone.
+    /// Only the currently recorded attempt can end itself, so a late callback for an older
+    /// attempt cannot retire work a newer one owns (plan 49d R1).
+    pub(crate) fn finish_pull_attempt(&self, queue: &MessageQueue, epoch: u64, attempt_id: u64) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            if entry.epoch == epoch && entry.attempt_id == attempt_id {
+                entry.attempt_id = 0;
+                entry.attempt_started_ms = 0;
+                entry.attempt_deadline_ms = 0;
+            }
+        }
     }
 
     /// The epoch this incarnation's current acquisition of `queue` carries, if it owns the queue at
@@ -559,7 +627,9 @@ impl ConsumerProgress {
         if let Some(entry) = queues.get_mut(queue) {
             if entry.epoch == epoch {
                 entry.pull_leased = false;
-                entry.rpc_started_ms = 0;
+                entry.attempt_id = 0;
+                entry.attempt_started_ms = 0;
+                entry.attempt_deadline_ms = 0;
             }
         }
     }
@@ -621,6 +691,12 @@ impl ConsumerProgress {
         let wait_until = get_current_millis().saturating_add(delay.as_millis() as u64);
         if let Some(entry) = self.queues.write().get_mut(queue) {
             entry.wait_until_ms = entry.wait_until_ms.max(wait_until);
+            // A scheduled continuation is the loop saying what it expects to happen next; nothing
+            // is in flight while that timer runs, so no attempt may be judged
+            // outstanding (plan 49d R1).
+            entry.attempt_id = 0;
+            entry.attempt_started_ms = 0;
+            entry.attempt_deadline_ms = 0;
         }
     }
 
@@ -726,7 +802,9 @@ impl ConsumerProgress {
                         epoch,
                         last_progress_ms: now,
                         pull_leased: false,
-                        rpc_started_ms: 0,
+                        attempt_id: 0,
+                        attempt_started_ms: 0,
+                        attempt_deadline_ms: 0,
                         wait_until_ms: 0,
                         failure_ms: 0,
                         failure_kind: PullFailureKind::Other,
@@ -2187,8 +2265,11 @@ mod tests {
         // Queue 0 holds an outstanding long poll; queue 1 has no request in flight and is not
         // advancing.
         let live = queue("T", 0);
-        assert!(progress.claim_pull(&live).is_some());
+        let epoch = progress.claim_pull(&live).expect("assigned queue");
         progress.note_pull_started(&live);
+        progress
+            .begin_pull_attempt(&live, epoch, Duration::from_secs(30))
+            .expect("the admitted attempt belongs to this acquisition");
 
         // Let a one-millisecond silence window pass: both queues are now silent, and what tells
         // them apart is that one still has its request in flight. Ageing only moves one
@@ -2222,10 +2303,13 @@ mod tests {
         let progress = ConsumerProgress::new();
         assigned(&progress, 1);
         let q = queue("T", 0);
-        assert!(progress.claim_pull(&q).is_some());
+        let epoch = progress.claim_pull(&q).expect("assigned queue");
         progress.note_pull_started(&q);
+        progress
+            .begin_pull_attempt(&q, epoch, Duration::from_secs(30))
+            .expect("the attempt was admitted under this acquisition");
         // Let the silence window pass while the request stays in flight: what keeps this queue from
-        // being called lost is the held lease and nothing else.
+        // being called lost is its own unexpired answer deadline and nothing else.
         std::thread::sleep(Duration::from_millis(5));
         let snap = progress.snapshot(Duration::from_millis(1), Duration::from_secs(30));
         assert_eq!(snap.stalled_queues, 1, "it has been silent for a while");
@@ -2693,6 +2777,141 @@ mod tests {
             default.cleanup_session_ceiling(),
             default.cleanup_budget * 3,
             "the ceiling must exceed the local quiescence target so remote steps keep an opportunity"
+        );
+    }
+
+    /// Plan 49d R1: a pull loop keeps one lease across successful answers and delayed
+    /// continuations, so owning that lease may never be read as "one RPC has been outstanding
+    /// since the loop started". A healthy queue reaching the answer deadline used to declare
+    /// every retained lease lost, which no repair could claim back, and escalated a working
+    /// consumer into replacement.
+    #[test]
+    fn healthy_continuations_do_not_expire_the_loop_lease() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_queue_installed(&mq);
+        let _lease = progress
+            .acquire_pull_lease(&mq)
+            .expect("an installed queue is owned by this incarnation");
+        // One long poll completes and the same loop admits the next attempt, far past the answer
+        // window of any single RPC.
+        std::thread::sleep(Duration::from_millis(25));
+        progress.note_pull_completed(&mq, false);
+        let epoch = progress.current_epoch(&mq).expect("still owned");
+        assert!(progress
+            .begin_pull_attempt(&mq, epoch, Duration::from_secs(30))
+            .is_some());
+
+        let snap = progress.snapshot(Duration::from_secs(30), Duration::from_millis(10));
+        assert_eq!(
+            snap.lost_pull_queues, 0,
+            "the lease belongs to the whole loop, not one RPC"
+        );
+        assert_eq!(snap.leased_queues, 1);
+
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let mut replacement = false;
+        for _ in 0..4 {
+            let (_, effects) = machine.on_tick(&snap, Duration::from_millis(10), 0.5);
+            replacement |= effects.iter().any(|effect| matches!(effect, Effect::Stop { .. }));
+        }
+        assert!(
+            !replacement,
+            "a loop that keeps completing pulls must not spend replacement allowance"
+        );
+    }
+
+    /// Plan 49d R1: a deliberately scheduled wait - suspension, flow control, a retry backoff - is
+    /// the queue's own expectation. While it lies in the future the queue is waiting on purpose
+    /// and is not
+    // an outstanding RPC, whatever its lease age looks like.
+    #[test]
+    fn an_explicit_wait_is_not_an_outstanding_rpc() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_queue_installed(&mq);
+        let _lease = progress
+            .acquire_pull_lease(&mq)
+            .expect("an installed queue is owned by this incarnation");
+        std::thread::sleep(Duration::from_millis(25));
+        progress.note_pull_completed(&mq, true);
+        progress.note_queue_wait(&mq, Duration::from_secs(5));
+
+        let snap = progress.snapshot(Duration::from_secs(30), Duration::from_millis(10));
+        assert_eq!(snap.waiting_queues, 1, "the scheduled wait is visible");
+        assert_eq!(
+            snap.lost_pull_queues, 0,
+            "an intentional wait is not an outstanding RPC"
+        );
+    }
+
+    /// Plan 49d R1: attempt identity is what makes the record safe. Only the attempt that is
+    /// currently recorded may retire it, so a late answer for an older attempt cannot make a
+    /// newer one look finished - and cannot make a genuinely unanswered one look healthy.
+    #[test]
+    fn only_the_live_attempt_can_end_its_own_window() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_queue_installed(&mq);
+        let _lease = progress
+            .acquire_pull_lease(&mq)
+            .expect("an installed queue is owned by this incarnation");
+        let epoch = progress.current_epoch(&mq).expect("still owned");
+        let first = progress
+            .begin_pull_attempt(&mq, epoch, Duration::from_secs(30))
+            .expect("the attempt belongs to this acquisition");
+        // The loop reopens its record: the second attempt is now the live work.
+        let second = progress
+            .begin_pull_attempt(&mq, epoch, Duration::from_millis(10))
+            .expect("the same loop may admit its next attempt");
+        assert_ne!(first, second, "attempt identities are never reused");
+
+        // A callback for the first attempt must leave the second one's window standing.
+        progress.finish_pull_attempt(&mq, epoch, first);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            progress
+                .lost_pulls(Duration::from_secs(30), Duration::from_secs(30))
+                .len(),
+            1,
+            "the live attempt's own window passed and a stale answer cannot retire it"
+        );
+
+        progress.finish_pull_attempt(&mq, epoch, second);
+        assert_eq!(
+            progress
+                .lost_pulls(Duration::from_secs(30), Duration::from_secs(30))
+                .len(),
+            0,
+            "the attempt that was actually admitted can end its own window"
+        );
+    }
+
+    /// Plan 49d R1: taking the lease starts no RPC timer, so a loop that holds its queue while
+    /// admitting nothing and scheduling no continuation stays diagnosable instead of reading as
+    /// an eternally healthy long poll. Repair still may not take that lease away.
+    #[test]
+    fn a_leased_queue_with_no_live_attempt_or_wait_stays_diagnosable() {
+        let progress = ConsumerProgress::new();
+        let mq = queue("T", 0);
+        progress.note_queue_installed(&mq);
+        let _lease = progress
+            .acquire_pull_lease(&mq)
+            .expect("an installed queue is owned by this incarnation");
+        // Age the acquisition: nothing has completed for a while, and no attempt or wait was
+        // recorded.
+        silent_queue(&progress, &mq, Duration::from_millis(25));
+
+        let snap = progress.snapshot(Duration::from_millis(5), Duration::from_secs(30));
+        assert_eq!(snap.leased_queues, 1, "the loop still owns the queue");
+        assert_eq!(
+            snap.lost_pull_queues, 1,
+            "a lease with no live attempt and no scheduled wait is a lost pull"
+        );
+        assert!(
+            progress.acquire_pull_lease(&mq).is_none(),
+            "health never releases a live loop's lease to allow a duplicate pull"
         );
     }
 }

@@ -105,6 +105,11 @@ pub(crate) const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL: u64 = 20;
 const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
 const BROKER_SUSPEND_MAX_TIME_MILLIS: u64 = 1000 * 15;
 const CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: u64 = 1000 * 30;
+/// Room beyond a pull's own response timeout before an **admitted attempt** counts as unanswered
+/// (plan 49d R1). Covers dispatch and decoding, not a hung RPC; the managed controller's pull
+/// deadline is this same total, so health and repair judge one attempt exactly like the loop that
+/// issued it.
+const PULL_ANSWER_ALLOWANCE_MILLIS: u64 = 5_000;
 const MAX_POP_INVISIBLE_TIME: u64 = 300000;
 const MIN_POP_INVISIBLE_TIME: u64 = 5000;
 const ASYNC_TIMEOUT: u64 = 3000;
@@ -1276,6 +1281,10 @@ impl DefaultMQPushConsumerImpl {
         Ok(())
     }
 
+    /// Hand a continuation straight to the shared pull service. An immediate continuation records
+    /// no wait expectation (plan 49d R1): its next attempt should be admitted on the service's
+    /// own tick, so if that never happens the queue stays diagnosable as an idle lease instead
+    /// of being declared healthy by a timer nobody owes.
     pub async fn execute_pull_request_immediately(&mut self, pull_request: PullRequest) {
         if self.work.is_closed() {
             return;
@@ -1292,6 +1301,14 @@ impl DefaultMQPushConsumerImpl {
             return;
         }
         self.progress.note_retry_scheduled();
+        // The delay this schedules **is** the queue's own expectation (plan 49d R1 item 3):
+        // suspension, flow control, broker-busy and error continuations all arrive here, so
+        // the controller sees a deliberate wait that is healthy until its own due time
+        // passes instead of an RPC that never finished.
+        self.progress.note_queue_wait(
+            pull_request.get_message_queue(),
+            std::time::Duration::from_millis(time_delay),
+        );
         // A delayed retry is dispatched by the shared pull service, so its timer belongs to the
         // client instance's runtime rather than to whichever task happened to schedule it (F2).
         let Some(client_instance) = self.client_instance.as_ref() else {
@@ -1454,6 +1471,22 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
+    /// Ends the RPC attempt one request admitted, if it recorded one (plan 49d R1). Called by every
+    /// path that owns an issued attempt without a callback answering it - issuance failure above
+    /// all - and by the pull callback on answer, failure and cancellation. Ownership identity
+    /// is checked in [`ConsumerProgress::finish_pull_attempt`], so this can never retire a
+    /// newer attempt.
+    pub(crate) fn finish_pull_attempt(&self, pull_request: &PullRequest) {
+        let attempt_id = pull_request.attempt_id();
+        if attempt_id == 0 {
+            return;
+        }
+        if let Some(epoch) = pull_request.lease_epoch() {
+            self.progress
+                .finish_pull_attempt(pull_request.get_message_queue(), epoch, attempt_id);
+        }
+    }
+
     /// Whether work issued under `epoch` may still touch `queue` (plan 49a F4 section 4.3 item 2).
     /// An answer or retry that outlived its acquisition must not publish into the queue a later
     /// owner holds.
@@ -1474,6 +1507,12 @@ impl DefaultMQPushConsumerImpl {
     /// position. Queues no longer owned here are skipped: assignment belongs to rebalance,
     /// which will place them again.
     ///
+    /// Re-dispatch the pulls this consumer lost, spending at most `slice` of wall time (plan 49c
+    /// C2). Returns whether the pass finished; when it did not, the caller keeps the repair as
+    /// a cursor and calls again, and the queues still behind are picked up then. Only whole
+    /// queue steps are cut - never an in-flight offset read - and everything prepared before
+    /// stopping is dispatched.
+    ///
     /// The lease is claimed *before* the offset is prepared and revalidated afterwards, so that one
     /// lost queue cannot accumulate queued repairs while its preparation waits on an offset store
     /// or a broker, and so that a repair whose acquisition disappeared during preparation -
@@ -1482,11 +1521,12 @@ impl DefaultMQPushConsumerImpl {
     /// cannot be determined is left stalled rather than pulled from an invalid position:
     /// leaving it untouched keeps the fault visible, and the next bounded repair pass tries
     /// again.
-    /// Re-dispatch the pulls this consumer lost, spending at most `slice` of wall time (plan 49c
-    /// C2). Returns whether the pass finished; when it did not, the caller keeps the repair as
-    /// a cursor and calls again, and the queues still behind are picked up then. Only whole
-    /// queue steps are cut - never an in-flight offset read - and everything prepared before
-    /// stopping is dispatched.
+    ///
+    /// A queue whose lease is held by a loop whose own attempt deadline expired is **not** stolen:
+    /// this path skips it because that loop still owns its next pull (plan 49d R1). Such an RPC
+    /// is drained or cancelled by the ownership rules that already apply to it, and if it never
+    /// answers the controller escalates through replacement, which stops the incarnation
+    /// instead of stacking a second pull on the same queue.
     pub(crate) async fn repair_lost_pulls(
         &mut self,
         stall_after: std::time::Duration,
@@ -1832,6 +1872,26 @@ impl DefaultMQPushConsumerImpl {
         let subscription_data = subscription_data.unwrap();
         let this = self.default_mqpush_consumer_impl.clone().unwrap();
         let Some(work) = self.work.enter() else { return };
+        // Plan 49d R1: **this** is where an attempt reaches the transport, after state, pause and
+        // every flow-control check, so its answer window starts here and nowhere earlier.
+        // Loop ownership (the lease) is untouched; a completed pull retires only its own
+        // attempt.
+        if let Some(epoch) = pull_request.lease_epoch() {
+            match self.progress.begin_pull_attempt(
+                &message_queue,
+                epoch,
+                std::time::Duration::from_millis(CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND + PULL_ANSWER_ALLOWANCE_MILLIS),
+            ) {
+                Some(attempt_id) => pull_request.set_attempt_id(attempt_id),
+                None => {
+                    debug!(
+                        queue = %message_queue,
+                        "this queue's acquisition ended before its pull was admitted, dropping the request"
+                    );
+                    return;
+                }
+            }
+        }
         let result = self
             .pull_api_wrapper
             .as_mut()
@@ -1866,6 +1926,10 @@ impl DefaultMQPushConsumerImpl {
                 begin_timestamp.elapsed().as_millis(),
                 e
             );
+            // The attempt was never handed to anyone who could answer it, so this issuance path
+            // ends it; leaving it open would show an outstanding RPC that no callback
+            // can retire (plan 49d R1).
+            self.finish_pull_attempt(&pull_request);
             self.execute_pull_request_later(pull_request, self.pull_time_delay_mills_when_exception);
         }
     }

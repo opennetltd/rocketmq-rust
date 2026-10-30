@@ -35,6 +35,9 @@ pub(crate) struct PullRequest {
     /// so that a clone handed to the callback cannot release the lease before the loop itself
     /// ends.
     pub(crate) lease: Option<Arc<PullLease>>,
+    /// Identity of the RPC attempt this request admitted, `0` when it issued none (plan 49d R1).
+    /// The callback hands it back so only its own attempt is retired, never a newer one.
+    pub(crate) attempt_id: u64,
 }
 
 impl PullRequest {
@@ -51,6 +54,7 @@ impl PullRequest {
             next_offset,
             previously_locked: false,
             lease: None,
+            attempt_id: 0,
         }
     }
 
@@ -61,6 +65,15 @@ impl PullRequest {
 
     pub(crate) fn hold_lease(&mut self, lease: Arc<PullLease>) {
         self.lease = Some(lease);
+    }
+
+    /// The attempt this request admitted, `0` when it issued no RPC.
+    pub(crate) fn attempt_id(&self) -> u64 {
+        self.attempt_id
+    }
+
+    pub(crate) fn set_attempt_id(&mut self, attempt_id: u64) {
+        self.attempt_id = attempt_id;
     }
 
     pub fn is_previously_locked(&self) -> bool {
