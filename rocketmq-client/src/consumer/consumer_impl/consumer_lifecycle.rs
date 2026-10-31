@@ -3085,6 +3085,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 mod review49e {
     use super::*;
     #[test]

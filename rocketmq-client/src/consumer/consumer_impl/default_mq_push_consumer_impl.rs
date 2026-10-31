@@ -185,6 +185,48 @@ impl Drop for CleanupReport {
 /// budget a managed stop targets, times the remote allowance beside it.
 const DEFAULT_CLEANUP_CEILING: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// One queue's whole remote offset-preparation allowance during a lost-pull repair (plan 49e E4):
+/// the same budget as an offset query, covering its locks, nameserver lookup, broker query and
+/// admin fallback rather than only the final RPC.
+pub(crate) const LOST_PULL_PREP_ALLOWANCE: std::time::Duration =
+    std::time::Duration::from_millis(crate::consumer::store::offset_store::OFFSET_WRITE_TIMEOUT_MILLIS);
+
+/// The least wall time a lost-pull preparation step after the first may take before its round hands
+/// off (plan 49e E4). A slice that has already run out must not hand the next queue a zero-length
+/// step; because a step that cannot answer ends the round, at most one step overruns by more.
+const LOST_PULL_STEP_MINIMUM: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The order `repair_lost_pulls` walks lost queues in, as one comparable key (plan 49e E3). Sorting
+/// and cursoring read the same encoding, so a resumed round cannot land between two keys it never
+/// actually passed.
+fn lost_pull_cursor_key(mq: &MessageQueue) -> CheetahString {
+    CheetahString::from_string(format!(
+        "{}\u{1}{}\u{1}{:010}",
+        mq.get_topic(),
+        mq.get_broker_name(),
+        mq.get_queue_id()
+    ))
+}
+
+/// What one bounded lost-pull round reports to the controller (plan 49e E3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LostPullRound {
+    /// Every queue this round was told about was reached. Zero dispatches with a completed sweep is
+    /// how a fruitless attempt reaches the replacement budget - an empty slice is never reported as
+    /// completion when a real lookup was still owed.
+    Complete { dispatched: usize },
+    /// The round exhausted its budget or one step did not answer inside it. The next round
+    /// continues strictly after this queue in the same deterministic order.
+    Incomplete { after: CheetahString },
+}
+
+impl LostPullRound {
+    /// Whether this kind is finished and the controller should re-evaluate.
+    pub(crate) fn finished(&self) -> bool {
+        matches!(self, LostPullRound::Complete { .. })
+    }
+}
+
 /// Remote opportunity bulk offset persistence gets when no lifecycle policy said otherwise - the
 /// same allowance one best-effort offset write may take, times a small window of them (plan 49c
 /// C5).
@@ -1530,10 +1572,20 @@ impl DefaultMQPushConsumerImpl {
     /// which will place them again.
     ///
     /// Re-dispatch the pulls this consumer lost, spending at most `slice` of wall time (plan 49c
-    /// C2). Returns whether the pass finished; when it did not, the caller keeps the repair as
-    /// a cursor and calls again, and the queues still behind are picked up then. Only whole
-    /// queue steps are cut - never an in-flight offset read - and everything prepared before
-    /// stopping is dispatched.
+    /// C2, plan 49e E4). A round that ran out of budget reports where it stopped and the next one
+    /// continues strictly after that queue, so neither a slow first queue nor an exhausted slice
+    /// repeats. Every examined queue advances the position - preparation failure and already-owned
+    /// skips included - and each prepared request is dispatched as soon as it is revalidated, so a
+    /// later queue's I/O cannot strand earlier work.
+    ///
+    /// Each queue's step carries one absolute deadline covering its locks, nameserver lookup,
+    /// broker query and admin fallback: a step that cannot answer inside it leaves the queue
+    /// exactly as lost as it was and ends the round, instead of waiting indefinitely or
+    /// spending every later slice on one stalled broker. Preparation is read-only - no local
+    /// write owns anything here - so ending a step early neither loses nor proves local
+    /// persistence. `prep_allowance` is that whole-step budget, the same allowance as an offset
+    /// query: the first examined queue may use all of it even when the slice has run out, so a
+    /// slow but live broker can still answer; later queues get what is left.
     ///
     /// The lease is claimed *before* the offset is prepared and revalidated afterwards, so that one
     /// lost queue cannot accumulate queued repairs while its preparation waits on an offset store
@@ -1551,25 +1603,42 @@ impl DefaultMQPushConsumerImpl {
     /// instead of stacking a second pull on the same queue.
     pub(crate) async fn repair_lost_pulls(
         &mut self,
+        after: Option<CheetahString>,
         stall_after: std::time::Duration,
         pull_deadline: std::time::Duration,
+        prep_allowance: std::time::Duration,
         slice: std::time::Duration,
-    ) -> bool {
+    ) -> LostPullRound {
         let started = std::time::Instant::now();
-        let mut lost = self.progress.lost_pulls(stall_after, pull_deadline);
+        // Deterministic order, and the same key names where an unfinished round stopped (plan 49e
+        // E3): continuing strictly after that queue is what keeps one slow or broken broker from
+        // spending every slice while the queues behind it never get a step.
+        let mut lost: Vec<(CheetahString, MessageQueue)> = self
+            .progress
+            .lost_pulls(stall_after, pull_deadline)
+            .into_iter()
+            .map(|mq| (lost_pull_cursor_key(&mq), mq))
+            .collect();
         if lost.is_empty() {
-            return true;
+            return LostPullRound::Complete { dispatched: 0 };
         }
-        // Deterministic order: a pass that stops at its time slice must move forward through the
-        // same sequence next round instead of re-picking whichever queue the map happens to
-        // yield first.
-        lost.sort_by(|a, b| {
-            (a.get_topic(), a.get_broker_name(), a.get_queue_id()).cmp(&(
-                b.get_topic(),
-                b.get_broker_name(),
-                b.get_queue_id(),
-            ))
-        });
+        lost.sort_by(|left, right| left.0.cmp(&right.0));
+        // A resumed round works from a fresh fault list: queues repaired or revoked since are
+        // simply gone, and anything that appeared at or before the cursor waits for the
+        // next request.
+        let pending: Vec<(CheetahString, MessageQueue)> = match after.as_ref() {
+            Some(done) => lost
+                .into_iter()
+                .filter(|(key, _)| key.as_str() > done.as_str())
+                .collect(),
+            None => lost,
+        };
+        if pending.is_empty() {
+            // Nothing remains behind the cursor. Reporting completion is what lets the controller
+            // re-evaluate fresh evidence - and charge a fruitless attempt - instead of spinning
+            // inside this kind; a new repair request starts again from the beginning.
+            return LostPullRound::Complete { dispatched: 0 };
+        }
         // Snapshot the owned queues first and release the table before any I/O: holding that read
         // guard across a broker round trip would block rebalance from updating the same table.
         let owned: Vec<_> = {
@@ -1579,24 +1648,31 @@ impl DefaultMQPushConsumerImpl {
                 .process_queue_table
                 .read()
                 .await;
-            lost.into_iter()
-                .filter_map(|mq| {
+            pending
+                .into_iter()
+                .filter_map(|(key, mq)| {
                     let pq = table.get(&mq)?.clone();
-                    (!pq.is_dropped()).then_some((mq, pq))
+                    (!pq.is_dropped()).then_some((key, mq, pq))
                 })
                 .collect()
         };
-        let mut requests = Vec::new();
+        if owned.is_empty() {
+            return LostPullRound::Complete { dispatched: 0 };
+        }
+        // The last queue this round examined. The next one continues strictly after it, which is
+        // how a queue whose own step timed out gets skipped instead of repeating every
+        // slice. Every examined queue advances it - preparation failure and already-owned
+        // skips included.
+        let mut cursor: Option<CheetahString> = None;
         let mut unfinished = false;
-        let mut remaining = 0usize;
-        let owned_len = owned.len();
-        for (index, (mq, pq)) in owned.into_iter().enumerate() {
+        let mut dispatched = 0usize;
+        for (index, (key, mq, pq)) in owned.into_iter().enumerate() {
             if index > 0 && started.elapsed() >= slice {
-                // Stop between queues; what was already prepared is still dispatched below.
+                // Stop between queues rather than start another lookup on an exhausted round.
                 unfinished = true;
-                remaining = owned_len - index;
                 break;
             }
+            cursor = Some(key);
             // One repair per acquisition at a time: whoever holds the queue's lease already owns
             // its next pull, and this repair has nothing to add.
             let Some(lease) = self.progress.acquire_pull_lease(&mq) else {
@@ -1607,16 +1683,27 @@ impl DefaultMQPushConsumerImpl {
                 continue;
             };
             let epoch = lease.epoch();
-            let commit_offset = match &mut self.offset_store {
-                Some(store) => store.read_offset(&mq, ReadOffsetType::MemoryFirstThenStore).await,
-                None => -1,
-            };
-            // Nothing committed and nothing consumed yet: start where this consumer would have
-            // started on first assignment rather than from an offset nobody has agreed on.
-            let next_offset = if commit_offset >= 0 {
-                commit_offset
+            // Every part of this queue's step - the offset read and the consumption-point lookup
+            // both wait on the nameserver - carries an absolute deadline (plan 49e E3). A queue
+            // that cannot answer inside its step is left lost and handed to a later
+            // round *after* it, so one stalled broker neither spends the rest of this
+            // slice nor starves what is behind it. The first queue may use its whole preparation
+            // allowance; later ones get what is left of the slice.
+            let remaining = slice.saturating_sub(started.elapsed());
+            let budget = if index == 0 {
+                remaining.max(prep_allowance)
             } else {
-                Rebalance::compute_pull_from_where(self.rebalance_impl.as_mut(), &mq).await
+                remaining.max(LOST_PULL_STEP_MINIMUM)
+            };
+            let prepared = tokio::time::timeout(budget, self.prepare_repair_offset(&mq)).await;
+            let Ok(next_offset) = prepared else {
+                warn!(
+                    queue = %mq,
+                    "this queue's offset preparation did not answer inside its step, leaving it lost and continuing with the queues behind it"
+                );
+                unfinished = true;
+                // Dropping the lease leaves this queue exactly as lost as it was.
+                break;
             };
             // Preparation awaited on other tasks: the acquisition may have ended, and the table may
             // hold a different process queue under this key.
@@ -1644,23 +1731,43 @@ impl DefaultMQPushConsumerImpl {
                 );
                 continue;
             }
-            let mut request = PullRequest::new(self.consumer_config.consumer_group.clone(), mq, pq, next_offset);
-            request.hold_lease(lease);
-            requests.push(request);
-        }
-        if !requests.is_empty() && self.client_instance.is_some() {
-            debug!("re-dispatching {} queue(s) whose pull loop was lost", requests.len());
-            for request in requests {
+            // Dispatched as soon as it is prepared and revalidated, so a later queue's I/O can
+            // never strand work this round already earned. The lease travels with the
+            // request and whichever path finishes that pull releases it.
+            if self.client_instance.is_some() {
+                let mut request = PullRequest::new(self.consumer_config.consumer_group.clone(), mq, pq, next_offset);
+                request.hold_lease(lease);
+                debug!("re-dispatching a queue whose pull loop was lost");
                 self.execute_pull_request_immediately(request).await;
+                dispatched += 1;
             }
         }
         if unfinished {
             debug!(
-                remaining,
-                "lost-pull repair reached its time slice, continuing on the next status round"
+                ?cursor,
+                "lost-pull repair reached its step budget, continuing after this queue on the next status round"
             );
+            if let Some(after) = cursor {
+                return LostPullRound::Incomplete { after };
+            }
         }
-        !unfinished
+        LostPullRound::Complete { dispatched }
+    }
+
+    /// Where a lost pull resumes from: the offset this consumer has committed, or - when nothing is
+    /// committed - the configured consumption point. Both lookups can wait on the nameserver, so
+    /// this is one step its caller bounds rather than an open-ended await (plan 49e E3).
+    async fn prepare_repair_offset(&mut self, mq: &MessageQueue) -> i64 {
+        let commit_offset = match &mut self.offset_store {
+            Some(store) => store.read_offset(mq, ReadOffsetType::MemoryFirstThenStore).await,
+            None => -1,
+        };
+        // Nothing committed and nothing consumed yet: start where this consumer would have started
+        // on first assignment rather than from an offset nobody has agreed on.
+        if commit_offset >= 0 {
+            return commit_offset;
+        }
+        Rebalance::compute_pull_from_where(self.rebalance_impl.as_mut(), mq).await
     }
 
     pub(crate) async fn pull_message(&mut self, mut pull_request: PullRequest) {
@@ -3118,5 +3225,414 @@ mod review49e {
         assert_eq!(after.route_miss_queues, before.route_miss_queues);
         assert_eq!(after.rpc_timeout_queues, 0);
         assert_eq!(after.waiting_queues, 0);
+    }
+}
+
+/// Plan 49e E4: each queue's offset preparation is one bounded step, and an unfinished round names
+/// the queue it reached instead of repeating a slow first broker forever.
+#[cfg(test)]
+mod review49e_steps {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::consumer::consumer_impl::message_request::MessageRequest;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        capture: tokio::sync::mpsc::Receiver<Box<dyn MessageRequest + Send + 'static>>,
+    }
+
+    /// Installed lost queues in the given order. A queue with an offset already in memory can
+    /// resume without asking anybody; one without it has to resolve a route and so waits on the
+    /// nameserver.
+    async fn queues(brokers: &[(&str, Option<i64>)]) -> Fixture {
+        let mut cc = ClientConfig::default();
+        cc.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let group = CheetahString::from_string(format!(
+            "review49e-steps-{}",
+            brokers
+                .iter()
+                .map(|(broker, _)| broker.chars().next().unwrap_or('x'))
+                .collect::<String>()
+        ));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49e-steps-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_remote(RemoteBrokerOffsetStore::new(
+            client.clone(),
+            group,
+        ))));
+        for (index, (broker, offset)) in brokers.iter().enumerate() {
+            let mq = MessageQueue::from_parts("T", *broker, index as i32);
+            push.progress.note_queue_installed(&mq);
+            push.rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await
+                .insert(mq.clone(), Arc::new(ProcessQueue::new()));
+            if let Some(offset) = offset {
+                push.offset_store
+                    .as_ref()
+                    .unwrap()
+                    .update_offset(&mq, *offset, false)
+                    .await;
+            }
+        }
+        Fixture { push, client, capture }
+    }
+
+    /// Queues whose pull loop is gone right now, judged the way the repair itself judges them.
+    fn lost(progress: &ConsumerProgress) -> usize {
+        progress.lost_pulls(Duration::ZERO, Duration::from_secs(35)).len()
+    }
+
+    /// What the repair dispatched, in order, as (queue, resume offset).
+    fn dispatched(
+        capture: &mut tokio::sync::mpsc::Receiver<Box<dyn MessageRequest + Send + 'static>>,
+    ) -> Vec<(MessageQueue, i64)> {
+        let mut out = Vec::new();
+        while let Ok(request) = capture.try_recv() {
+            if let Some(pull) = request.as_any().downcast_ref::<PullRequest>() {
+                out.push((pull.get_message_queue().clone(), pull.get_next_offset()));
+            }
+        }
+        out
+    }
+
+    /// An offset lookup that never answers may not keep the round open: it ends on its own step and
+    /// says which queue it stopped at.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_offset_lookup_ends_the_round_on_its_own_step() {
+        let mut fixture = queues(&[("a-broken", None), ("b-ready", Some(7))]).await;
+        let first = MessageQueue::from_parts("T", "a-broken", 0);
+        assert_eq!(lost(&fixture.push.progress), 2);
+        let lock = fixture.client.nameserver_lock();
+        let guard = lock.lock().await;
+        let started = std::time::Instant::now();
+        let round = tokio::time::timeout(
+            Duration::from_secs(3),
+            fixture.push.repair_lost_pulls(
+                None,
+                Duration::ZERO,
+                Duration::from_secs(35),
+                // The same allowance production derives from the offset-query timeout; a test uses a
+                // short one so that what is under test is the bound and not real network latency.
+                Duration::from_millis(250),
+                Duration::from_millis(10),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop(guard);
+        let round = match round {
+            Ok(round) => round,
+            Err(_) => panic!(
+                "the offset lookup was still waiting after 3s: an unbounded wait inside one queue spent the whole \
+                 repair"
+            ),
+        };
+        eprintln!("stalled lookup: {round:?} after {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the round did not end on its own step: {elapsed:?}"
+        );
+        match round {
+            LostPullRound::Incomplete { after } => assert_eq!(after, lost_pull_cursor_key(&first)),
+            LostPullRound::Complete { dispatched } => {
+                panic!("a queue still owed a lookup was reported finished (dispatched={dispatched})")
+            }
+        }
+        // The queue whose step timed out is still lost: nothing was faked about it.
+        assert_eq!(lost(&fixture.push.progress), 2);
+        fixture.client.shutdown().await;
+    }
+
+    /// Three rounds, each with a first queue that cannot answer inside its step: the cursor has to
+    /// move past it so the ready queue is reached rather than every slice repeating the same
+    /// failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_first_queue_cannot_starve_the_repair_cursor() {
+        let mut fixture = queues(&[("a-broken", None), ("b-ready", Some(7))]).await;
+        let first = MessageQueue::from_parts("T", "a-broken", 0);
+        let later = MessageQueue::from_parts("T", "b-ready", 1);
+        let lock = fixture.client.nameserver_lock();
+        let guard = lock.lock().await;
+        let mut after = None;
+        let mut total = 0usize;
+        for round in 0..3 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.push.repair_lost_pulls(
+                    after.clone(),
+                    Duration::ZERO,
+                    Duration::from_secs(35),
+                    Duration::from_millis(20),
+                    // The reviewer's fixture: a slice so short that only the cursor makes progress.
+                    Duration::from_millis(1),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("repair round {round} never ended"));
+            eprintln!("repair round {round}: {result:?}");
+            match result {
+                LostPullRound::Incomplete { after: next } => {
+                    assert_eq!(next, lost_pull_cursor_key(&first));
+                    after = Some(next);
+                }
+                LostPullRound::Complete { dispatched: count } => total += count,
+            }
+        }
+        drop(guard);
+        let reached = dispatched(&mut fixture.capture);
+        eprintln!("total={total} reached={reached:?}");
+        assert!(
+            total >= 1 && reached.iter().any(|(mq, _)| mq.get_broker_name() == "b-ready"),
+            "every round repeated its slow first queue and never reached the ready one"
+        );
+
+        // Positive control: the same production logic from scratch with a usable slice reaches and
+        // dispatches the ready queue, resuming exactly at its committed offset.
+        let mut control = queues(&[("a-broken", None), ("b-ready", Some(7))]).await;
+        let round = control
+            .push
+            .repair_lost_pulls(
+                None,
+                Duration::ZERO,
+                Duration::from_secs(35),
+                Duration::from_millis(20),
+                Duration::from_millis(1_000),
+            )
+            .await;
+        assert!(round.finished(), "control round: {round:?}");
+        let ready = dispatched(&mut control.capture);
+        // The stalled first queue is skipped for this round, so only the ready one may be pulled -
+        // never twice, never from a negative position.
+        let ready_only: Vec<_> = ready
+            .into_iter()
+            .filter(|(mq, _)| mq.get_broker_name() == "b-ready")
+            .collect();
+        assert_eq!(ready_only, vec![(later.clone(), 7)], "one pull at the known offset");
+        control.client.shutdown().await;
+
+        fixture.client.shutdown().await;
+    }
+
+    /// A round with nothing left behind its cursor is a completed sweep, not an incomplete one:
+    /// that is what lets the controller charge a fruitless attempt instead of spinning inside
+    /// the kind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_sweep_completes_instead_of_spinning() {
+        let mut fixture = queues(&[("a-broken", None)]).await;
+        let first = MessageQueue::from_parts("T", "a-broken", 0);
+        // Nothing is lost behind the cursor: no lookup, complete.
+        let round = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.push.repair_lost_pulls(
+                Some(lost_pull_cursor_key(&first)),
+                Duration::from_secs(3600),
+                Duration::from_secs(35),
+                Duration::from_millis(250),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("a repair with no lost queue waited on something");
+        assert_eq!(round, LostPullRound::Complete { dispatched: 0 });
+        fixture.client.shutdown().await;
+    }
+
+    /// A sweep in which every examined queue fails still advances past each of them and settles, so
+    /// the controller judges one unsuccessful sweep instead of repeating the first failure forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unsuccessful_sweep_advances_and_settles() {
+        let mut fixture = queues(&[("a-broken", None), ("b-broken", None)]).await;
+        let lock = fixture.client.nameserver_lock();
+        let guard = lock.lock().await;
+        let mut after = None;
+        for round_no in 0..2 {
+            let round = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.push.repair_lost_pulls(
+                    after.clone(),
+                    Duration::ZERO,
+                    Duration::from_secs(35),
+                    Duration::from_millis(20),
+                    Duration::from_millis(1_000),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round_no} never ended"));
+            match round {
+                LostPullRound::Incomplete { after: stop } => after = Some(stop),
+                other => panic!("each broken queue ends its own round: {other:?}"),
+            }
+        }
+        let settled = fixture
+            .push
+            .repair_lost_pulls(
+                after,
+                Duration::ZERO,
+                Duration::from_secs(35),
+                Duration::from_millis(20),
+                Duration::from_millis(1_000),
+            )
+            .await;
+        drop(guard);
+        assert!(
+            matches!(settled, LostPullRound::Complete { dispatched: 0 }),
+            "the sweep never settled: {settled:?}"
+        );
+        fixture.client.shutdown().await;
+    }
+
+    /// Work prepared before a later queue stalls is dispatched anyway - at this consumer's
+    /// committed offset - and the stalled queue keeps its fault instead of being reported
+    /// repaired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_work_is_dispatched_before_a_later_queue_stalls() {
+        let mut fixture = queues(&[("a-ready", Some(7)), ("b-broken", None)]).await;
+        let ready = MessageQueue::from_parts("T", "a-ready", 0);
+        let broken = MessageQueue::from_parts("T", "b-broken", 1);
+        let lock = fixture.client.nameserver_lock();
+        let guard = lock.lock().await;
+        let started = std::time::Instant::now();
+        let round = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.push.repair_lost_pulls(
+                None,
+                Duration::ZERO,
+                Duration::from_secs(35),
+                Duration::from_millis(200),
+                Duration::from_millis(1_000),
+            ),
+        )
+        .await
+        .expect("the round ended on its own step");
+        drop(guard);
+        assert!(
+            matches!(round, LostPullRound::Incomplete { .. }),
+            "the stalled queue leaves the round unfinished: {round:?}"
+        );
+        // Checked before the capture is drained: reading what was dispatched drops those requests,
+        // and a finished pull releases its queue's lease.
+        assert!(
+            fixture.push.progress.acquire_pull_lease(&ready).is_none(),
+            "the dispatched pull no longer owns its queue"
+        );
+        let sent = dispatched(&mut fixture.capture);
+        assert_eq!(
+            sent,
+            vec![(ready.clone(), 7)],
+            "prepared work was stranded by the stall"
+        );
+        assert!(
+            fixture.push.progress.acquire_pull_lease(&broken).is_some(),
+            "the stalled queue's lease was not released, so it cannot be repaired again"
+        );
+        assert!(!fixture.push.progress.is_current(&broken, 0));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        fixture.client.shutdown().await;
+    }
+
+    /// An acquisition that ended while its offset was prepared must not dispatch: the process queue
+    /// was removed, so this repair no longer owns that work even though its preparation finished.
+    #[tokio::test(flavor = "current_thread")]
+    async fn revocation_during_preparation_dispatches_nothing() {
+        let mut fixture = queues(&[("a-broken", None)]).await;
+        let queue = MessageQueue::from_parts("T", "a-broken", 0);
+        let lock = fixture.client.nameserver_lock();
+        let blocker = lock.lock().await;
+
+        // Preparation waits on route resolution; assignment takes the queue away while it waits,
+        // and then the lookup is allowed to answer (and fail) against nothing.
+        let late = fixture.push.clone();
+        let target = queue.clone();
+        let revoke = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            late.rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await
+                .remove(&target);
+            late.progress.note_queue_revoked(&target);
+        };
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            drop(blocker);
+        };
+        let repair = async {
+            fixture
+                .push
+                .repair_lost_pulls(
+                    None,
+                    Duration::ZERO,
+                    Duration::from_secs(35),
+                    Duration::from_millis(2_000),
+                    Duration::from_millis(1_000),
+                )
+                .await
+        };
+        let (round, (), ()) = tokio::join!(repair, revoke, release);
+
+        assert_eq!(round, LostPullRound::Complete { dispatched: 0 }, "{round:?}");
+        assert!(
+            dispatched(&mut fixture.capture).is_empty(),
+            "a repair whose acquisition disappeared dispatched a pull anyway"
+        );
+        assert!(
+            fixture.push.progress.acquire_pull_lease(&queue).is_none(),
+            "the dropped repair must not keep the queue's lease once revoked"
+        );
+        fixture.client.shutdown().await;
+    }
+
+    /// The cursor and the walk share one ordering, so a resumed round really continues after the
+    /// queue it stopped at - including several queues on the same broker.
+    #[test]
+    fn the_cursor_orders_the_same_way_the_repair_walks() {
+        let mut queues = Vec::from([
+            MessageQueue::from_parts("T", "b-ready", 0),
+            MessageQueue::from_parts("T", "a-broken", 11),
+            MessageQueue::from_parts("A", "z", 3),
+            MessageQueue::from_parts("T", "a-broken", 2),
+        ]);
+        let mut keys: Vec<_> = queues.iter().map(lost_pull_cursor_key).collect();
+        keys.sort();
+        queues.sort_by_key(lost_pull_cursor_key);
+        assert_eq!(
+            keys,
+            queues.iter().map(lost_pull_cursor_key).collect::<Vec<_>>(),
+            "sorting and cursoring must agree"
+        );
+        // Strictly-after filtering picks up exactly the queues behind the cursor.
+        let cursor = lost_pull_cursor_key(&MessageQueue::from_parts("T", "a-broken", 2));
+        let behind: Vec<_> = keys
+            .iter()
+            .filter(|key| key.as_str() > cursor.as_str())
+            .map(|key| key.to_string())
+            .collect();
+        // Everything strictly behind the cursor: the higher queue on the same broker and the next
+        // broker, but never the queue the round stopped at or anything before it.
+        assert_eq!(
+            behind,
+            vec![
+                lost_pull_cursor_key(&MessageQueue::from_parts("T", "a-broken", 11)).to_string(),
+                lost_pull_cursor_key(&MessageQueue::from_parts("T", "b-ready", 0)).to_string(),
+            ]
+        );
     }
 }

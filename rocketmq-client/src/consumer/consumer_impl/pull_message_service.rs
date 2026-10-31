@@ -157,3 +157,16 @@ impl PullMessageService {
         }
     }
 }
+
+#[cfg(test)]
+impl PullMessageService {
+    /// Test seam (plan 49e E3): capture what a caller dispatches instead of running it, so a test
+    /// can see which queues a bounded repair reached. Never compiled into anything that ships.
+    pub(crate) fn review49e_capture(
+        &mut self,
+    ) -> tokio::sync::mpsc::Receiver<Box<dyn MessageRequest + Send + 'static>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        self.tx = Some(tx);
+        rx
+    }
+}

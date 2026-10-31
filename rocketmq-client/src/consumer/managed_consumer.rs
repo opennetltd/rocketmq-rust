@@ -52,6 +52,7 @@ use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_consume
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::check_subscription;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::validate_consumer_config;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::ListenerPresence;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound as RepairRound;
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer::LostPullRepairPass;
 use crate::consumer::default_mq_push_consumer::RouteRepairPass;
@@ -1031,10 +1032,14 @@ async fn run_incarnation(
         //    the operation stays alive beside later status work.
         if pending.is_none() {
             match repair.take() {
-                Some(RepairCursor::LostPull { .. }) => {
+                Some(RepairCursor::LostPull { after }) => {
                     pending = Some(PendingRepair::LostPull(consumer.lost_pull_repair_pass(
+                        after,
                         stall_after(),
                         pull_deadline(),
+                        // One queue's whole remote preparation gets the offset-query allowance, so a
+                        // slow but live broker can still answer inside its own step.
+                        crate::consumer::consumer_impl::default_mq_push_consumer_impl::LOST_PULL_PREP_ALLOWANCE,
                         policy.progress_check / 2,
                     )));
                 }
@@ -1112,9 +1117,15 @@ async fn run_incarnation(
                         machine.note_repair_settled(route_repair_resolved(&snapshot));
                     }
                 }
-                RepairOutcome::LostPull(finished) => {
-                    repair = (!finished).then_some(RepairCursor::LostPull { after: None });
-                    if finished {
+                RepairOutcome::LostPull(round) => {
+                    // A round that ran out of budget names the queue it reached, and the next one
+                    // continues after it; only a sweep that finished reports to the budget,
+                    // including a completed sweep that dispatched nothing (plan 49e E3).
+                    repair = match round {
+                        RepairRound::Incomplete { after } => Some(RepairCursor::LostPull { after: Some(after) }),
+                        RepairRound::Complete { .. } => None,
+                    };
+                    if repair.is_none() {
                         machine.note_repair_settled(snapshot.lost_pull_queues == 0);
                     }
                 }
@@ -1137,9 +1148,10 @@ async fn run_incarnation(
 /// succeeded is repeated and no future has to borrow the consumer across status ticks.
 #[derive(Clone, Debug)]
 enum RepairCursor {
-    /// Re-dispatch lost pulls. Queues already repaired leave the lost set, so the next slice picks
-    /// up what is still behind; `after` records the last queue reached for logging and forward
-    /// proof.
+    /// Re-dispatch lost pulls, continuing strictly after this queue in the repair's own
+    /// deterministic order. Queues already repaired leave the lost set; `after` is what stops a
+    /// slow or broken first queue from being re-attempted by every slice while the queues
+    /// behind it never get a step (plan 49e E3).
     LostPull {
         after: Option<cheetah_string::CheetahString>,
     },
@@ -1176,8 +1188,9 @@ enum RepairOutcome {
     /// The route pass ended; `Some(topic)` means its slice ran out and the next pass continues
     /// there.
     Routes(Option<cheetah_string::CheetahString>),
-    /// The lost-pull pass ended; `true` once nothing more is queued for re-dispatch.
-    LostPull(bool),
+    /// The lost-pull pass ended, reporting either a finished sweep or the queue the next round
+    /// continues after.
+    LostPull(RepairRound),
 }
 
 /// Whether a finished route repair cleared the faults it addresses (a failed allocation, a queue

@@ -653,7 +653,8 @@ pub enum ConsumerCleanup {
 pub(crate) type RouteRepairPass = Pin<Box<dyn Future<Output = Option<CheetahString>> + Send>>;
 
 /// One bounded lost-pull repair pass. Resolves to whether anything is still lost.
-pub(crate) type LostPullRepairPass = Pin<Box<dyn Future<Output = bool> + Send>>;
+pub(crate) type LostPullRepairPass =
+    Pin<Box<dyn Future<Output = crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound> + Send>>;
 
 impl DefaultMQPushConsumer {
     /// The SDK-owned progress bus of this instance. Shared with the recovery controller so it can
@@ -714,12 +715,25 @@ impl DefaultMQPushConsumer {
                 keys
             };
             let started = std::time::Instant::now();
+            let resume = after.clone();
             let after = after.as_ref();
             let pending: Vec<_> = topics
                 .into_iter()
                 .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
                 .collect();
+            // The last topic whose route was actually asked for. A round that runs out of budget
+            // hands off at a step boundary and names what it reached, rather than starting another
+            // bounded lookup on an exhausted round or claiming work it never did (plan 49e E3).
+            let mut reached: Option<cheetah_string::CheetahString> = None;
             for (index, topic) in pending.iter().enumerate() {
+                if index > 0 && started.elapsed() >= slice {
+                    instance.re_balance_immediately();
+                    tracing::debug!(
+                        topic = %topic,
+                        "route repair reached its time slice, continuing with the remaining topics on the next status round"
+                    );
+                    return reached.or_else(|| resume.clone());
+                }
                 // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must
                 // not get route work for a subscription this consumer no longer holds.
                 if !subscriptions.read().await.contains_key(topic) {
@@ -733,16 +747,9 @@ impl DefaultMQPushConsumer {
                     .as_mut()
                     .repair_route_after_broker_miss(topic, Duration::from_millis(500))
                     .await;
+                reached = Some(topic.clone());
                 if !refreshed {
                     tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
-                }
-                if index + 1 < pending.len() && started.elapsed() >= slice {
-                    instance.re_balance_immediately();
-                    tracing::debug!(
-                        topic = %topic,
-                        "route repair reached its time slice, continuing with the remaining topics on the next status round"
-                    );
-                    return Some(topic.clone());
                 }
             }
             instance.re_balance_immediately();
@@ -758,14 +765,22 @@ impl DefaultMQPushConsumer {
     /// repair.
     pub(crate) fn lost_pull_repair_pass(
         &mut self,
+        after: Option<cheetah_string::CheetahString>,
         stall_after: std::time::Duration,
         pull_deadline: std::time::Duration,
+        prep_allowance: std::time::Duration,
         slice: std::time::Duration,
     ) -> LostPullRepairPass {
         let Some(mut impl_) = self.default_mqpush_consumer_impl.as_mut().cloned() else {
-            return Box::pin(async { true });
+            return Box::pin(async {
+                crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound::Complete { dispatched: 0 }
+            });
         };
-        Box::pin(async move { impl_.repair_lost_pulls(stall_after, pull_deadline, slice).await })
+        Box::pin(async move {
+            impl_
+                .repair_lost_pulls(after, stall_after, pull_deadline, prep_allowance, slice)
+                .await
+        })
     }
 
     /// Where this consumer's single cleanup session stands, or `None` while no stop has been
