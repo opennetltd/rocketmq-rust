@@ -277,18 +277,29 @@ impl PullCallback for DefaultPullCallback {
         };
         let message_queue_inner = self.message_queue_inner.take().unwrap();
         let pull_request = self.pull_request.take().unwrap();
-        // Classifying the failure keeps recovery proportional: a route or broker miss is repaired
-        // in place, an RPC timeout is only watched, and neither is reported as a bare count.
-        self.push_consumer_impl
-            .progress
-            .note_pull_failed(&message_queue_inner, classify_pull_failure(err.as_ref()));
         // A failed attempt is finished work too: it must not stay outstanding while the retry timer
         // runs, and an expired acquisition below has no callback left to retire it (plan 49d R1).
         self.push_consumer_impl.finish_pull_attempt(&pull_request);
-        if !self
+        let current = self
             .push_consumer_impl
-            .holds_acquisition(&message_queue_inner, pull_request.lease_epoch())
-        {
+            .holds_acquisition(&message_queue_inner, pull_request.lease_epoch());
+        // Classifying the failure keeps recovery proportional: a route or broker miss is repaired
+        // in place, an RPC timeout is only watched, and neither is reported as a bare count.
+        // Plan 49e E1: identity is checked first, because a failure of an **expired** acquisition
+        // is history - counting it as this queue's newest outcome would fault the owner
+        // that replaced it with work it never ran. Its tallies still remember it.
+        let recorded = self.push_consumer_impl.progress.note_pull_failed_for(
+            &message_queue_inner,
+            pull_request.lease_epoch(),
+            classify_pull_failure(err.as_ref()),
+        );
+        if !recorded && current {
+            debug!(
+                "a pull failure could not be attributed to a tracked acquisition of this queue, mq={}",
+                message_queue_inner
+            );
+        }
+        if !current {
             // A failure of an expired acquisition must not schedule a retry against it; dropping
             // the request here releases its lease (plan 49a F4 section 4.3 item 2).
             debug!(
@@ -345,5 +356,56 @@ impl PullCallback for DefaultPullCallback {
 
         self.push_consumer_impl
             .execute_pull_request_later(pull_request, time_delay);
+    }
+}
+
+#[cfg(test)]
+mod review49e {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use cheetah_string::CheetahString;
+    #[test]
+    fn a_stale_failure_must_not_publish_into_the_new_acquisition() {
+        let push = ArcMut::new(DefaultMQPushConsumerImpl::new(
+            ClientConfig::default(),
+            ArcMut::new(ConsumerConfig::default()),
+            None,
+        ));
+        push.mark_managed_lifecycle();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        push.progress.note_queue_installed(&q);
+        let old = push.progress.acquire_pull_lease(&q).unwrap();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49e"),
+            q.clone(),
+            Arc::new(ProcessQueue::new()),
+            0,
+        );
+        request.hold_lease(old);
+        push.progress.note_queue_revoked(&q);
+        push.progress.note_queue_installed(&q);
+        push.progress.note_pull_completed(&q, false);
+        let token = push.work.enter().unwrap();
+        let mut callback = DefaultPullCallback {
+            push_consumer_impl: push.clone(),
+            message_queue_inner: Some(q),
+            subscription_data: None,
+            pull_request: Some(request),
+            work: token,
+        };
+        PullCallback::on_exception(&mut callback, Box::new(std::io::Error::other("no broker route")));
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        eprintln!(
+            "stale callback: route_miss_queues={} pull_failures={}",
+            s.route_miss_queues, s.pull_failures
+        );
+        assert_eq!(
+            s.route_miss_queues, 0,
+            "an expired acquisition poisoned its replacement's evidence"
+        );
     }
 }

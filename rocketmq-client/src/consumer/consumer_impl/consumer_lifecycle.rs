@@ -467,6 +467,17 @@ pub(crate) struct ConsumerProgress {
     queues: parking_lot::RwLock<HashMap<MessageQueue, QueueProgress>>,
 }
 
+/// Whether a report about `queue` may become the evidence health reads for it (plan 49e E1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueEvidence {
+    /// The reporting request belongs to the acquisition this incarnation holds now.
+    Current,
+    /// Nothing tracks this queue, so only the aggregate fallback can describe it.
+    Untracked,
+    /// The reporting request outlived its acquisition: history, never current evidence.
+    Expired,
+}
+
 /// One queue's standing right now, judged from that queue alone (plan 49c C2).
 #[derive(Clone, Copy, Debug)]
 struct QueueStanding {
@@ -664,22 +675,63 @@ impl ConsumerProgress {
     }
 
     pub(crate) fn note_pull_failed(&self, queue: &MessageQueue, kind: PullFailureKind) {
-        self.bump(&self.pull_failures);
+        self.record_pull_failure(queue, None, kind);
+    }
+
+    /// Record a pull failure **for the acquisition that issued it** (plan 49e E1). The epoch is
+    /// checked while holding the same queue-map write lock that mutates the evidence, so an answer
+    /// for an expired acquisition cannot stamp the queue its current owner holds. Returns whether
+    /// this queue's newest outcome was recorded.
+    /// `None` means the reporter carries no acquisition identity (a legacy consumer that does not
+    /// use SDK-owned assignment); such a report is recorded as before rather than refused.
+    pub(crate) fn note_pull_failed_for(&self, queue: &MessageQueue, epoch: Option<u64>, kind: PullFailureKind) -> bool {
+        self.record_pull_failure(queue, epoch, kind)
+    }
+
+    fn record_pull_failure(&self, queue: &MessageQueue, epoch: Option<u64>, kind: PullFailureKind) -> bool {
         let now = get_current_millis();
+        // Identity is decided **inside** the write lock that mutates the evidence. A pre-check with
+        // a separate mutation would let a revoke and reinstall land between them, which is
+        // the race plan 49e E1 exists to close.
+        let evidence = {
+            let mut queues = self.queues.write();
+            match queues.get_mut(queue) {
+                // The acquisition that asked is still the current one: this becomes the queue's
+                // newest outcome and the aggregate fallback for untracked queues.
+                Some(entry) if epoch.is_none_or(|epoch| entry.epoch == epoch) => {
+                    entry.failure_ms = now;
+                    entry.failure_kind = kind;
+                    QueueEvidence::Current
+                }
+                Some(_) => QueueEvidence::Expired,
+                // Nothing tracks this queue, so only the aggregate fallback can describe it.
+                None => QueueEvidence::Untracked,
+            }
+        };
+        // Work issued under an expired acquisition may still be counted as history, but it can
+        // neither stamp this queue's evidence nor renew the aggregate fault timestamp health reads
+        // for queues nobody tracks (plan 49e E1).
+        self.record_failure_tally(kind, !matches!(evidence, QueueEvidence::Expired));
+        matches!(evidence, QueueEvidence::Current)
+    }
+
+    fn record_failure_tally(&self, kind: PullFailureKind, stamp_aggregate: bool) {
+        let now = get_current_millis();
+        self.bump(&self.pull_failures);
         match kind {
             PullFailureKind::RouteOrBrokerMiss => {
                 self.bump(&self.route_misses);
-                self.pull_route_miss_ms.store(now, Ordering::Relaxed);
+                if stamp_aggregate {
+                    self.stamp(&self.pull_route_miss_ms);
+                }
             }
             PullFailureKind::RpcTimeout => {
                 self.bump(&self.rpc_timeouts);
-                self.pull_rpc_timeout_ms.store(now, Ordering::Relaxed);
+                if stamp_aggregate {
+                    self.stamp(&self.pull_rpc_timeout_ms);
+                }
             }
             PullFailureKind::Other => {}
-        }
-        if let Some(entry) = self.queues.write().get_mut(queue) {
-            entry.failure_ms = now;
-            entry.failure_kind = kind;
         }
     }
 
@@ -688,16 +740,37 @@ impl ConsumerProgress {
     /// no work admitted, the queue's own expectation has failed and it becomes repairable
     /// (plan 49c C2).
     pub(crate) fn note_queue_wait(&self, queue: &MessageQueue, delay: Duration) {
+        self.record_queue_wait(queue, None, delay);
+    }
+
+    /// Schedule a wait **for the acquisition that owns the request** (plan 49e E1). Returns whether
+    /// it was recorded; `false` means this continuation belongs to an expired acquisition and must
+    /// not replace the current owner's expectation.
+    /// `None` means the continuation carries no acquisition identity (legacy path): recorded as
+    /// before rather than refused.
+    pub(crate) fn note_queue_wait_for(&self, queue: &MessageQueue, epoch: Option<u64>, delay: Duration) -> bool {
+        self.record_queue_wait(queue, epoch, delay)
+    }
+
+    fn record_queue_wait(&self, queue: &MessageQueue, epoch: Option<u64>, delay: Duration) -> bool {
         let wait_until = get_current_millis().saturating_add(delay.as_millis() as u64);
-        if let Some(entry) = self.queues.write().get_mut(queue) {
-            entry.wait_until_ms = entry.wait_until_ms.max(wait_until);
-            // A scheduled continuation is the loop saying what it expects to happen next; nothing
-            // is in flight while that timer runs, so no attempt may be judged
-            // outstanding (plan 49d R1).
-            entry.attempt_id = 0;
-            entry.attempt_started_ms = 0;
-            entry.attempt_deadline_ms = 0;
+        // Same rule as a failure: identity and mutation share one write lock, so an expired
+        // continuation can never replace the current owner's expectation (plan 49e E1).
+        let mut queues = self.queues.write();
+        let Some(entry) = queues.get_mut(queue) else {
+            return false;
+        };
+        if !epoch.is_none_or(|epoch| entry.epoch == epoch) {
+            return false;
         }
+        entry.wait_until_ms = entry.wait_until_ms.max(wait_until);
+        // A scheduled continuation is the loop saying what it expects to happen next; nothing
+        // is in flight while that timer runs, so no attempt may be judged
+        // outstanding (plan 49d R1).
+        entry.attempt_id = 0;
+        entry.attempt_started_ms = 0;
+        entry.attempt_deadline_ms = 0;
+        true
     }
 
     pub(crate) fn note_retry_scheduled(&self) {
@@ -2993,5 +3066,70 @@ mod tests {
             progress.acquire_pull_lease(&mq).is_none(),
             "health never releases a live loop's lease to allow a duplicate pull"
         );
+    }
+}
+
+/// Plan 49e E1: whose evidence a report may become is decided under the same lock that writes it,
+/// so no interleaving between a revoke and a reinstall can let retired work stamp the replacement.
+#[cfg(test)]
+mod review49e_acquisition {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn a_stale_report_cannot_interleave_with_reacquisition() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        progress.note_queue_installed(&q);
+        // The identity an in-flight request would carry, plus the lease that request holds.
+        let stale_epoch = progress.current_epoch(&q).unwrap();
+        let _stale_lease = progress.acquire_pull_lease(&q).expect("leased once");
+
+        let barrier = Arc::new(Barrier::new(5));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let progress = Arc::clone(&progress);
+                let q = q.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..500 {
+                        progress.note_pull_failed_for(&q, Some(stale_epoch), PullFailureKind::RouteOrBrokerMiss);
+                        progress.note_queue_wait_for(&q, Some(stale_epoch), Duration::from_secs(5));
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        // The acquisition is replaced while those reports are in flight.
+        progress.note_queue_revoked(&q);
+        progress.note_queue_installed(&q);
+        for worker in workers {
+            let _ = worker.join();
+        }
+
+        let s = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "stale reports against a replacement: route_miss={} waiting={} assigned={}",
+            s.route_miss_queues, s.waiting_queues, s.assigned_queues
+        );
+        assert_eq!(s.assigned_queues, 1);
+        assert_eq!(
+            s.route_miss_queues, 0,
+            "a report for a retired epoch stamped the acquisition that replaced it"
+        );
+        assert_eq!(
+            s.waiting_queues, 0,
+            "a report for a retired epoch scheduled work for the acquisition that replaced it"
+        );
+        // The replacement is left exactly as its owner installed it: leasable, and only once.
+        let lease = progress
+            .acquire_pull_lease(&q)
+            .expect("the current acquisition takes its single lease");
+        assert!(
+            progress.acquire_pull_lease(&q).is_none(),
+            "exactly one pull loop may hold this queue"
+        );
+        drop(lease);
     }
 }

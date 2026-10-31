@@ -1308,13 +1308,27 @@ impl DefaultMQPushConsumerImpl {
         if self.work.is_closed() {
             return;
         }
+        // Plan 49e E1: a continuation is owed by the acquisition that issued it. A request whose
+        // lease outlived its acquisition must not schedule a wait for - or clear the outstanding
+        // attempt of - the queue's current owner, so it is dropped here instead. Dropping releases
+        // its lease, and release is epoch-checked too, so the current owner keeps its own.
+        if let Some(epoch) = pull_request.lease_epoch() {
+            if !self.progress.is_current(pull_request.get_message_queue(), epoch) {
+                debug!(
+                    queue = %pull_request.get_message_queue(),
+                    "this pull continuation belongs to an expired acquisition, dropping it instead of rescheduling work the current owner already holds"
+                );
+                return;
+            }
+        }
         self.progress.note_retry_scheduled();
         // The delay this schedules **is** the queue's own expectation (plan 49d R1 item 3):
         // suspension, flow control, broker-busy and error continuations all arrive here, so
         // the controller sees a deliberate wait that is healthy until its own due time
         // passes instead of an RPC that never finished.
-        self.progress.note_queue_wait(
+        self.progress.note_queue_wait_for(
             pull_request.get_message_queue(),
+            pull_request.lease_epoch(),
             std::time::Duration::from_millis(time_delay),
         );
         // A delayed retry is dispatched by the shared pull service, so its timer belongs to the
@@ -2992,5 +3006,117 @@ mod tests {
         );
         let again = consumer.cleanup_progress().expect("session still there");
         assert_eq!(again.phase, after.phase, "no second pass rewrote the outcome");
+    }
+}
+
+#[cfg(test)]
+mod review49e {
+    use super::*;
+    use crate::consumer::consumer_impl::consumer_lifecycle::PullFailureKind;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use std::time::Duration;
+
+    fn request_for(queue: &MessageQueue) -> PullRequest {
+        PullRequest::new(
+            CheetahString::from_static_str("review49e"),
+            queue.clone(),
+            Arc::new(ProcessQueue::new()),
+            0,
+        )
+    }
+
+    /// Plan 49e E1: a continuation of an **expired** acquisition must not touch the evidence of the
+    /// acquisition that replaced it. The old request's lease is retired by revocation, so
+    /// scheduling it may neither record a wait nor clear the newer attempt's answer window -
+    /// and the later admission check cannot undo state written before it.
+    #[test]
+    fn a_stale_retry_must_not_erase_the_current_attempt() {
+        let mut push =
+            DefaultMQPushConsumerImpl::new(ClientConfig::default(), ArcMut::new(ConsumerConfig::default()), None);
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        push.progress.note_queue_installed(&q);
+        let old = push.progress.acquire_pull_lease(&q).unwrap();
+        let mut request = request_for(&q);
+        request.hold_lease(old);
+        // The queue is taken away and handed out again while the old request is still queued.
+        push.progress.note_queue_revoked(&q);
+        push.progress.note_queue_installed(&q);
+        let current = push.progress.acquire_pull_lease(&q).unwrap();
+        push.progress
+            .begin_pull_attempt(&q, current.epoch(), Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            push.progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1,
+            "the newer attempt's expired answer window is a lost pull"
+        );
+
+        push.execute_pull_request_later(request, 3000);
+
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!("stale retry: lost={} waiting={}", s.lost_pull_queues, s.waiting_queues);
+        assert_eq!(
+            s.lost_pull_queues, 1,
+            "the old retry cleared a newer attempt's deadline"
+        );
+        assert_eq!(
+            s.waiting_queues, 0,
+            "an expired request scheduled a wait for the new owner"
+        );
+        assert_eq!(s.retries_scheduled, 0);
+    }
+
+    /// Positive control on the same production path: the continuation of the **current**
+    /// acquisition still records its wait, keeps exactly one loop lease, and its failure is
+    /// still attributed.
+    #[test]
+    fn a_current_continuation_still_records_its_wait_and_failure() {
+        let mut push =
+            DefaultMQPushConsumerImpl::new(ClientConfig::default(), ArcMut::new(ConsumerConfig::default()), None);
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        push.progress.note_queue_installed(&q);
+        let lease = push.progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+        // The loop holds the queue's single lease while its continuation is scheduled.
+        assert!(
+            push.progress.acquire_pull_lease(&q).is_none(),
+            "a second pull loop may not stack onto a leased queue"
+        );
+        let mut request = request_for(&q);
+        request.hold_lease(lease);
+        push.progress.begin_pull_attempt(&q, epoch, Duration::ZERO).unwrap();
+
+        push.execute_pull_request_later(request, 3000);
+
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "current retry: lost={} waiting={} retries={}",
+            s.lost_pull_queues, s.waiting_queues, s.retries_scheduled
+        );
+        assert_eq!(s.waiting_queues, 1, "the current owner's wait was not recorded");
+        assert_eq!(s.lost_pull_queues, 0);
+        assert_eq!(s.retries_scheduled, 1);
+
+        // A failure of the same (current) acquisition is still attributed to it.
+        push.progress
+            .note_pull_failed_for(&q, Some(epoch), PullFailureKind::RouteOrBrokerMiss);
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(s.route_miss_queues, 1);
+
+        // And a revoked queue takes neither a failure nor a wait from work still in flight on it.
+        push.progress.note_queue_revoked(&q);
+        let before = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert!(!push
+            .progress
+            .note_pull_failed_for(&q, Some(epoch), PullFailureKind::RpcTimeout));
+        assert!(!push
+            .progress
+            .note_queue_wait_for(&q, Some(epoch), Duration::from_millis(10)));
+        let after = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(after.route_miss_queues, before.route_miss_queues);
+        assert_eq!(after.rpc_timeout_queues, 0);
+        assert_eq!(after.waiting_queues, 0);
     }
 }
