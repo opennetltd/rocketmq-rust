@@ -31,21 +31,62 @@ use crate::consumer::consumer_impl::pull_request_ext::PullResultExt;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::consumer::pull_status::PullStatus;
 
+/// What a **typed** response code says about the smallest repair that can help (plan 49f F3).
+///
+/// Judged from the code itself. A broker remark is presentation: its wording, language and
+/// wrapping decide whether a substring match fires, so classifying by text could turn one fault
+/// into whichever family its message happened to mention.
+fn classify_response_code(code: ResponseCode) -> Option<PullFailureKind> {
+    match code {
+        // The address we hold for this queue is stale or the service behind it is not there: a
+        // coalesced route refresh is the repair that can fix it.
+        ResponseCode::TopicNotExist
+        | ResponseCode::ServiceNotAvailable
+        | ResponseCode::BrokerNotExist
+        | ResponseCode::SlaveNotAvailable
+        | ResponseCode::BrokerDispatchNotComplete
+        | ResponseCode::NotLeaderForQueue => Some(PullFailureKind::RouteOrBrokerMiss),
+        // The RPC did not answer inside its own window.
+        ResponseCode::RpcTimeOut | ResponseCode::PollingTimeout => Some(PullFailureKind::RpcTimeout),
+        _ => None,
+    }
+}
+
 /// Maps a pull failure onto the smallest repair that can help (plan 49 section 4.2). Route and
 /// broker misses are addressable by a coalesced route refresh; timeouts are expected while a
 /// broker is slow and must not escalate on their own.
+///
+/// Typed codes and error variants are consulted first, display text only when the failure carries
+/// no code with a family of its own (plan 49f F3).
 fn classify_pull_failure(err: &(dyn std::error::Error + Send + 'static)) -> PullFailureKind {
     if let Some(error) = err.downcast_ref::<RocketmqError>() {
         match error {
             RocketmqError::RemotingTimeoutError(_, _) => return PullFailureKind::RpcTimeout,
+            RocketmqError::RequestTimeoutError(_) => return PullFailureKind::RpcTimeout,
+            // A channel that could not carry the request at all: the address book is what a route
+            // refresh repairs, and none of these need their message read.
+            RocketmqError::RemotingConnectError(_)
+            | RocketmqError::ConnectionInvalid(_)
+            | RocketmqError::ChannelSendRequestFailed(_)
+            | RocketmqError::RemotingSendRequestError(_) => return PullFailureKind::RouteOrBrokerMiss,
             RocketmqError::MQClientBrokerError(broker_error) => {
-                return match ResponseCode::from(broker_error.response_code()) {
-                    // Both mean the address book is stale; a coalesced route refresh can fix it.
-                    ResponseCode::TopicNotExist | ResponseCode::ServiceNotAvailable => {
-                        PullFailureKind::RouteOrBrokerMiss
+                let code = ResponseCode::from(broker_error.response_code());
+                return classify_response_code(code).unwrap_or_else(|| match code {
+                    // An unrecognised code carries no typed meaning, so the remark is all there is.
+                    ResponseCode::SystemError => {
+                        classify_text(broker_error.error_message().map_or("", |text| text.as_str()))
                     }
-                    _ => classify_text(broker_error.error_message().map_or("", |text| text.as_str())),
-                };
+                    _ => PullFailureKind::Other,
+                });
+            }
+            // `MQBrokerError` carries (code, message, broker address); only the message can say more
+            // than the code does.
+            RocketmqError::MQBrokerError(code, remark, _) | RocketmqError::RpcError(code, remark) => {
+                let code = ResponseCode::from(*code);
+                return classify_response_code(code).unwrap_or_else(|| match code {
+                    ResponseCode::SystemError => classify_text(remark),
+                    _ => PullFailureKind::Other,
+                });
             }
             _ => {}
         }
@@ -93,6 +134,24 @@ pub(crate) struct DefaultPullCallback {
     pub(crate) work: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 
+impl DefaultPullCallback {
+    /// Whether the answer this callback holds still belongs to the acquisition that issued it
+    /// (plan 49f F3).
+    ///
+    /// Every callback path asks this **before** any shared effect, because an answer whose
+    /// acquisition ended is history: notifying the application, retiring another attempt,
+    /// publishing messages or scheduling a retry would all act on a queue its replacement owns.
+    fn holds_this_acquisition(&self) -> bool {
+        match self.pull_request.as_ref() {
+            Some(request) => self
+                .push_consumer_impl
+                .holds_acquisition(request.get_message_queue(), request.lease_epoch()),
+            // Nothing names an acquisition, so nothing of ours may be touched on its behalf.
+            None => false,
+        }
+    }
+}
+
 impl PullCallback for DefaultPullCallback {
     fn cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
         Some(self.push_consumer_impl.work.cancellation())
@@ -107,6 +166,15 @@ impl PullCallback for DefaultPullCallback {
             .as_ref()
             .is_none_or(|request| request.process_queue.is_dropped())
         {
+            return;
+        }
+        // Plan 49f F3: an answer whose acquisition has ended is history, and being history it may
+        // not touch anything shared - not the progress listener, not the attempt record, not the
+        // process queue or delivery accounting below. Revocation ends an acquisition, so a late
+        // success for a revoked queue used to notify the application and publish into whatever
+        // process queue now answers under that key.
+        if !self.holds_this_acquisition() {
+            debug!("a pull answer arrived after its acquisition ended, dropping it before any shared state",);
             return;
         }
         if matches!(
@@ -134,25 +202,25 @@ impl PullCallback for DefaultPullCallback {
         // deadline, while the lease stays held by the loop that owns the queue.
         push_consumer_impl.finish_pull_attempt(&pull_request);
 
-        // Plan 49a F4 section 4.3 item 2: an answer can arrive after its acquisition moved on - the
-        // queue was revoked, or revoked and assigned again. The lease epoch names the
-        // acquisition that issued the request, so publishing now would put messages under a
-        // process queue this consumer no longer owns and advance offsets nobody read. Drop
-        // the answer only; bookkeeping owned elsewhere is untouched and the current owner
-        // pulls for itself.
-        if !push_consumer_impl.holds_acquisition(&message_queue_inner, pull_request.lease_epoch()) {
-            debug!(
-                "pull answer belongs to an expired acquisition, dropping it without publishing, mq={}",
-                message_queue_inner
-            );
-            return;
-        }
-
         push_consumer_impl
             .pull_api_wrapper
             .as_mut()
             .unwrap()
             .process_pull_result(&message_queue_inner, &mut pull_result_ext, &subscription_data);
+
+        // Plan 49a F4 section 4.3 item 2, plan 49f F3: attribution is asked again **after** the
+        // answer has been decoded and its filter hooks have run, because that is the last point
+        // before anything of this consumer's is touched. A success published after its acquisition
+        // ended would land under a process queue this consumer no longer owns, advance offsets
+        // nobody read, and - recorded as progress - clear the fault the queue's current owner has.
+        // The current owner pulls for itself.
+        if !push_consumer_impl.holds_acquisition(&message_queue_inner, pull_request.lease_epoch()) {
+            debug!(
+                "pull answer lost its acquisition while it was decoded, dropping it without publishing, mq={}",
+                message_queue_inner
+            );
+            return;
+        }
 
         // SDK-owned progress observation (plan 49 section 4.2, plan 49a F5 section 4.4 item 1): a
         // response for an owned queue is progress whether or not it carried messages.
@@ -276,13 +344,29 @@ impl PullCallback for DefaultPullCallback {
             return;
         };
         let message_queue_inner = self.message_queue_inner.take().unwrap();
+        // Plan 49f F3: the same gate as a successful answer. A failure whose acquisition ended is
+        // history, and history may not retire another attempt, warn as current work, or schedule a
+        // retry for whoever owns the queue now. It still counts in the lifetime tallies (plan 49e
+        // E1 kept those honest about what happened), which is all this records before
+        // returning.
+        if !self.holds_this_acquisition() {
+            if let Some(request) = self.pull_request.take() {
+                self.push_consumer_impl.progress.note_pull_failed_for(
+                    request.get_message_queue(),
+                    request.lease_epoch(),
+                    classify_pull_failure(err.as_ref()),
+                );
+                debug!(
+                    "a pull failure arrived after its acquisition ended, counted as history and dropped without \
+                     touching the queue's current owner",
+                );
+            }
+            return;
+        }
         let pull_request = self.pull_request.take().unwrap();
         // A failed attempt is finished work too: it must not stay outstanding while the retry timer
-        // runs, and an expired acquisition below has no callback left to retire it (plan 49d R1).
+        // runs (plan 49d R1).
         self.push_consumer_impl.finish_pull_attempt(&pull_request);
-        let current = self
-            .push_consumer_impl
-            .holds_acquisition(&message_queue_inner, pull_request.lease_epoch());
         // Classifying the failure keeps recovery proportional: a route or broker miss is repaired
         // in place, an RPC timeout is only watched, and neither is reported as a bare count.
         // Plan 49e E1: identity is checked first, because a failure of an **expired** acquisition
@@ -293,20 +377,13 @@ impl PullCallback for DefaultPullCallback {
             pull_request.lease_epoch(),
             classify_pull_failure(err.as_ref()),
         );
-        if !recorded && current {
+        if !recorded {
+            // The acquisition is current yet reported no acquisition of its own: worth knowing, but
+            // the queue stays owned and keeps pulling.
             debug!(
                 "a pull failure could not be attributed to a tracked acquisition of this queue, mq={}",
                 message_queue_inner
             );
-        }
-        if !current {
-            // A failure of an expired acquisition must not schedule a retry against it; dropping
-            // the request here releases its lease (plan 49a F4 section 4.3 item 2).
-            debug!(
-                "pull failure belongs to an expired acquisition, not scheduling a retry, mq={}",
-                message_queue_inner
-            );
-            return;
         }
         let topic = message_queue_inner.get_topic();
         if !topic.starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
@@ -406,6 +483,156 @@ mod review49e {
         assert_eq!(
             s.route_miss_queues, 0,
             "an expired acquisition poisoned its replacement's evidence"
+        );
+    }
+}
+
+/// Plan 49f F3: an answer whose acquisition ended reaches nothing shared.
+#[cfg(test)]
+mod review49f {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
+    use crate::consumer::consumer_impl::consumer_lifecycle::LifecyclePolicy;
+    use crate::consumer::consumer_impl::consumer_lifecycle::Reason;
+    use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::pull_result::PullResult;
+    use crate::factory::mq_client_instance::MQClientInstance;
+    use crate::hook::filter_message_context::FilterMessageContext;
+    use crate::hook::filter_message_hook::FilterMessageHook;
+    use cheetah_string::CheetahString;
+    struct ReacquireInFilter {
+        progress: Arc<ConsumerProgress>,
+        queue: MessageQueue,
+    }
+    impl FilterMessageHook for ReacquireInFilter {
+        fn hook_name(&self) -> &str {
+            "review49f-reacquire"
+        }
+        fn filter_message(&self, _: &FilterMessageContext<'_>) {
+            self.progress.note_queue_revoked(&self.queue);
+            self.progress.note_queue_installed(&self.queue);
+            self.progress.note_pull_failed_for(
+                &self.queue,
+                self.progress.current_epoch(&self.queue),
+                PullFailureKind::RouteOrBrokerMiss,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn success_after_reacquisition_must_not_clear_the_new_owners_failure() {
+        let cc = ClientConfig::default();
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig::default()),
+            None,
+        ));
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49f-success-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        push.progress.note_queue_installed(&q);
+        let old = push.progress.acquire_pull_lease(&q).unwrap();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49f"),
+            q.clone(),
+            Arc::new(ProcessQueue::new()),
+            0,
+        );
+        request.hold_lease(old);
+        let mut wrapper = PullAPIWrapper::new(client.clone(), CheetahString::from_static_str("review49f"), false);
+        wrapper.register_filter_message_hook(vec![Arc::new(Box::new(ReacquireInFilter {
+            progress: push.progress.clone(),
+            queue: q.clone(),
+        }))]);
+        push.pull_api_wrapper = Some(ArcMut::new(wrapper));
+        let token = push.work.enter().unwrap();
+        let mut callback = DefaultPullCallback {
+            push_consumer_impl: push.clone(),
+            message_queue_inner: Some(q),
+            subscription_data: Some(SubscriptionData::default()),
+            pull_request: Some(request),
+            work: token,
+        };
+        let result = PullResultExt {
+            pull_result: PullResult::new(PullStatus::Found, 0, 0, 0, None),
+            suggest_which_broker_id: 0,
+            message_binary: None,
+            offset_delta: None,
+        };
+        PullCallback::on_success(&mut callback, result).await;
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        eprintln!(
+            "late success: current_route_faults={} completed={} queued_stale={}",
+            s.route_miss_queues,
+            s.pulls_completed,
+            capture.len()
+        );
+        client.shutdown().await;
+        assert_eq!(
+            s.route_miss_queues, 1,
+            "success attribution was checked before decoding, then wrote a replacement acquisition"
+        );
+        assert_eq!(
+            capture.len(),
+            0,
+            "an expired success must not enqueue another continuation"
+        );
+    }
+    #[test]
+    fn a_revoked_queues_failure_must_not_fault_the_remaining_assignment() {
+        let push = ArcMut::new(DefaultMQPushConsumerImpl::new(
+            ClientConfig::default(),
+            ArcMut::new(ConsumerConfig::default()),
+            None,
+        ));
+        push.mark_managed_lifecycle();
+        let old_q = MessageQueue::from_parts("T", "old", 0);
+        let good = MessageQueue::from_parts("T", "good", 0);
+        push.progress.note_queue_installed(&old_q);
+        let old = push.progress.acquire_pull_lease(&old_q).unwrap();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49f"),
+            old_q.clone(),
+            Arc::new(ProcessQueue::new()),
+            0,
+        );
+        request.hold_lease(old);
+        push.progress.note_queue_revoked(&old_q);
+        push.progress.note_queue_installed(&good);
+        push.progress.note_pull_completed(&good, false);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let token = push.work.enter().unwrap();
+        let mut callback = DefaultPullCallback {
+            push_consumer_impl: push.clone(),
+            message_queue_inner: Some(old_q),
+            subscription_data: None,
+            pull_request: Some(request),
+            work: token,
+        };
+        PullCallback::on_exception(&mut callback, Box::new(std::io::Error::other("no broker route")));
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let (state, _) = machine.on_tick(&s, std::time::Duration::from_secs(35), 0.5);
+        eprintln!(
+            "removed queue failure: tracked_faults={} aggregate_miss={} last_ok={} state={state:?}",
+            s.route_miss_queues, s.pull_route_miss_ms, s.last_pull_ok_ms
+        );
+        assert_eq!(s.route_miss_queues, 0);
+        assert_eq!(
+            state.reason,
+            Reason::IdleNoMessages,
+            "an expired tracked request became fallback evidence for an untracked queue"
         );
     }
 }
