@@ -1162,7 +1162,9 @@ async fn run_incarnation(
                     // A round that ran out of budget names the queue it reached and owes the rest;
                     // only a sweep that finished judges the fault itself (plan 49e E3, plan 49f F1).
                     RepairRound::Incomplete { after } => {
-                        repair = Some(RepairCursor::LostPull { after: Some(after) });
+                        // The cursor is whatever this round reached, including nothing at all; the
+                        // evidence it collected stays with the sweep that owns it (plan 49f F1).
+                        repair = Some(RepairCursor::LostPull { after });
                         SweepVerdict::Deferred
                     }
                     RepairRound::Complete { .. } => sweep_verdict(false, repair_is_settled(&snapshot)),

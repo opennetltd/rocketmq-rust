@@ -225,9 +225,12 @@ pub(crate) enum LostPullRound {
     /// how a fruitless attempt reaches the replacement budget - an empty slice is never reported as
     /// completion when a real lookup was still owed.
     Complete { dispatched: usize },
-    /// The round exhausted its budget or one step did not answer inside it. The next round
-    /// continues strictly after this queue in the same deterministic order.
-    Incomplete { after: CheetahString },
+    /// The round exhausted its budget, or a step did not answer inside it. The next round continues
+    /// strictly after the named queue in the same deterministic order; `after: None` means **no
+    /// queue was reached at all** - even the pass-level process-queue table did not answer
+    /// inside this round - so a later round starts where this one would have (plan 49f F4 item
+    /// 1).
+    Incomplete { after: Option<CheetahString> },
 }
 
 impl LostPullRound {
@@ -1780,8 +1783,10 @@ impl DefaultMQPushConsumerImpl {
             return LostPullRound::Complete { dispatched: 0 };
         }
         // Snapshot the owned queues first and release the table before any I/O: holding that read
-        // guard across a broker round trip would block rebalance from updating the same table.
-        let owned: Vec<_> = {
+        // guard across a broker round trip would block rebalance from updating the same table. The
+        // read is itself a step of this round - a held write lock may not turn the round into an
+        // unbounded wait, and nothing examined means nothing to advance past (plan 49f F4 item 1).
+        let looked_up = tokio::time::timeout(slice.saturating_sub(started.elapsed()), async {
             let table = self
                 .rebalance_impl
                 .rebalance_impl_inner
@@ -1789,12 +1794,19 @@ impl DefaultMQPushConsumerImpl {
                 .read()
                 .await;
             pending
-                .into_iter()
+                .iter()
                 .filter_map(|(key, mq)| {
-                    let pq = table.get(&mq)?.clone();
-                    (!pq.is_dropped()).then_some((key, mq, pq))
+                    let pq = table.get(mq)?.clone();
+                    (!pq.is_dropped()).then(|| (key.clone(), mq.clone(), pq))
                 })
-                .collect()
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let Ok(owned) = looked_up else {
+            warn!(
+                "the process-queue table did not answer this repair round, leaving every lost queue for the next one"
+            );
+            return LostPullRound::Incomplete { after };
         };
         if owned.is_empty() {
             return LostPullRound::Complete { dispatched: 0 };
@@ -1846,16 +1858,31 @@ impl DefaultMQPushConsumerImpl {
                 break;
             };
             // Preparation awaited on other tasks: the acquisition may have ended, and the table may
-            // hold a different process queue under this key.
-            let still_ours = self.progress.is_current(&mq, epoch) && {
-                let table = self
-                    .rebalance_impl
-                    .rebalance_impl_inner
-                    .process_queue_table
-                    .read()
-                    .await;
-                matches!(table.get(&mq), Some(current) if Arc::ptr_eq(current, &pq))
+            // hold a different process queue under this key. Revalidating is part of **this queue's
+            // step**, so it waits only for what is left of that step rather than starting another
+            // unbounded stage after the lookup (plan 49f F4 item 1).
+            let revalidated = tokio::time::timeout(
+                slice.saturating_sub(started.elapsed()).max(LOST_PULL_STEP_MINIMUM),
+                async {
+                    let table = self
+                        .rebalance_impl
+                        .rebalance_impl_inner
+                        .process_queue_table
+                        .read()
+                        .await;
+                    matches!(table.get(&mq), Some(current) if Arc::ptr_eq(current, &pq))
+                },
+            )
+            .await;
+            let Ok(still_ours) = revalidated else {
+                warn!(
+                    queue = %mq,
+                    "the process-queue table did not answer this queue's revalidation step, leaving it lost"
+                );
+                unfinished = true;
+                break;
             };
+            let still_ours = still_ours && self.progress.is_current(&mq, epoch);
             if !still_ours {
                 debug!(
                     queue = %mq,
@@ -1931,9 +1958,9 @@ impl DefaultMQPushConsumerImpl {
                 ?cursor,
                 "lost-pull repair reached its step budget, continuing after this queue on the next status round"
             );
-            if let Some(after) = cursor {
-                return LostPullRound::Incomplete { after };
-            }
+            // Name what this round reached - which may be nothing at all, in which case the next
+            // one starts where this one would have.
+            return LostPullRound::Incomplete { after: cursor };
         }
         LostPullRound::Complete { dispatched }
     }
@@ -3534,7 +3561,9 @@ mod review49e_steps {
             "the round did not end on its own step: {elapsed:?}"
         );
         match round {
-            LostPullRound::Incomplete { after } => assert_eq!(after, lost_pull_cursor_key(&first)),
+            LostPullRound::Incomplete { after } => {
+                assert_eq!(after, Some(lost_pull_cursor_key(&first)))
+            }
             LostPullRound::Complete { dispatched } => {
                 panic!("a queue still owed a lookup was reported finished (dispatched={dispatched})")
             }
@@ -3573,8 +3602,8 @@ mod review49e_steps {
             eprintln!("repair round {round}: {result:?}");
             match result {
                 LostPullRound::Incomplete { after: next } => {
-                    assert_eq!(next, lost_pull_cursor_key(&first));
-                    after = Some(next);
+                    assert_eq!(next, Some(lost_pull_cursor_key(&first)));
+                    after = next;
                 }
                 LostPullRound::Complete { dispatched: count } => total += count,
             }
@@ -3660,7 +3689,7 @@ mod review49e_steps {
             .await
             .unwrap_or_else(|_| panic!("round {round_no} never ended"));
             match round {
-                LostPullRound::Incomplete { after: stop } => after = Some(stop),
+                LostPullRound::Incomplete { after: stop } => after = stop,
                 other => panic!("each broken queue ends its own round: {other:?}"),
             }
         }
@@ -4166,6 +4195,75 @@ mod review49f {
         assert!(
             result.is_ok(),
             "preparation ended but enqueue waited outside every repair-step deadline"
+        );
+    }
+
+    /// The pass-level process-queue table read is a step of the round too: a held write lock may
+    /// not turn the repair into an unbounded wait, and a round that reached no queue must not
+    /// claim to have advanced past one (plan 49f F4 item 1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_process_queue_table_ends_the_round_on_its_step() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49f-held-table");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        let client = MQClientInstance::new_arc(cc, 0, "review49f-held-client", None);
+        let q = MessageQueue::from_parts("T", "lost", 0);
+        push.progress.note_queue_installed(&q);
+        push.progress
+            .review49f_age_activity(&q, std::time::Duration::from_secs(31));
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), Arc::new(ProcessQueue::new()));
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let guard = table.write().await;
+
+        let started = std::time::Instant::now();
+        let round = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            push.repair_lost_pulls(
+                None,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(35),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop(guard);
+        let round = match round {
+            Ok(round) => round,
+            Err(_) => panic!("the repair waited on the process-queue table past any step"),
+        };
+        eprintln!("held table: {round:?} after {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_000),
+            "a held table read was not bounded by the round's slice: {elapsed:?}"
+        );
+        match round {
+            LostPullRound::Incomplete { after } => {
+                assert_eq!(after, None, "a round that reached no queue reported advancing past one")
+            }
+            LostPullRound::Complete { dispatched } => {
+                panic!("a repair that never saw a queue was reported finished (dispatched={dispatched})")
+            }
+        }
+        // Nothing about the queue changed: it stays lost and remains owed by the next round.
+        assert_eq!(
+            push.progress
+                .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35))
+                .lost_pull_queues,
+            1
         );
     }
 }

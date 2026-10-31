@@ -247,3 +247,157 @@ impl PullMessageService {
         rx
     }
 }
+
+#[cfg(test)]
+mod review49f {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use cheetah_string::CheetahString;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+
+    use super::*;
+    use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+
+    fn request(queue: MessageQueue) -> PullRequest {
+        PullRequest::new(
+            CheetahString::from_static_str("review49f-admission"),
+            queue,
+            Arc::new(ProcessQueue::new()),
+            0,
+        )
+    }
+
+    /// A service whose channel is full answers inside the caller's step instead of holding a task
+    /// that owns another queue's lease (plan 49f F4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_pull_service_answers_within_the_callers_step() {
+        let mut service = PullMessageService::new();
+        let capture = service.review49e_capture();
+        let dummy = MessageQueue::from_parts("T", "dummy", 0);
+        for _ in 0..32 {
+            service.execute_pull_request_immediately(request(dummy.clone())).await;
+        }
+        assert_eq!(capture.len(), 32, "the capture channel is full");
+
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        progress.note_queue_installed(&q);
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+
+        let started = tokio::time::Instant::now();
+        let outcome = service
+            .admit_pull_request(
+                request_with_lease(q.clone(), lease),
+                tokio::time::Instant::now() + Duration::from_millis(20),
+                None,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        eprintln!("full channel admission: {outcome:?} after {elapsed:?}");
+        assert_eq!(outcome, Admission::TimedOut);
+        assert!(elapsed < Duration::from_millis(100), "admission waited {elapsed:?}");
+
+        // Nothing was recorded for a request that never became visible, so the queue is still lost
+        // and remains repairable rather than looking cared for.
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.lost_pull_queues, 1);
+        assert_eq!(capture.len(), 32, "a refused request must not reach the receiver");
+    }
+
+    /// The consumer's own stop ends the wait for room at once (plan 49f F4 item 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_consumer_does_not_wait_for_room() {
+        let mut service = PullMessageService::new();
+        let _capture = service.review49e_capture();
+        for _ in 0..32 {
+            service
+                .execute_pull_request_immediately(request(MessageQueue::from_parts("T", "dummy", 0)))
+                .await;
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let started = tokio::time::Instant::now();
+        let outcome = service
+            .admit_pull_request(
+                request(MessageQueue::from_parts("T", "ready", 0)),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                Some(&token),
+            )
+            .await;
+        eprintln!("cancelled admission: {outcome:?} after {:?}", started.elapsed());
+        assert_eq!(outcome, Admission::Cancelled);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    /// A service that never ran - or already stopped - says so instead of swallowing the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_service_without_a_channel_reports_closure() {
+        let service = PullMessageService::new();
+        let outcome = service
+            .admit_pull_request(
+                request(MessageQueue::from_parts("T", "ready", 0)),
+                tokio::time::Instant::now() + Duration::from_millis(20),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, Admission::Closed);
+
+        let mut service = PullMessageService::new();
+        let capture = service.review49e_capture();
+        drop(capture); // The receiver is gone: the channel is closed.
+        let outcome = service
+            .admit_pull_request(
+                request(MessageQueue::from_parts("T", "ready", 0)),
+                tokio::time::Instant::now() + Duration::from_millis(20),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, Admission::Closed);
+    }
+
+    /// Acceptance and the queued expectation are one step: the receiver cannot see a request that
+    /// has not been recorded as owed an attempt (plan 49f F2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_accepted_request_owes_an_attempt_not_a_fault() {
+        let mut service = PullMessageService::new();
+        let capture = service.review49e_capture();
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        progress.note_queue_installed(&q);
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        // History says this queue went quiet a long time ago; only the admission may say otherwise.
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1,
+            "the fixture should start lost"
+        );
+
+        let outcome = service
+            .admit_pull_request(
+                request_with_lease(q.clone(), lease),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, Admission::Accepted);
+        assert_eq!(capture.len(), 1, "the receiver can see the request");
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.lost_pull_queues, 0, "queued work is not a lost pull");
+        assert_eq!(snapshot.leased_queues, 1);
+    }
+
+    fn request_with_lease(
+        queue: MessageQueue,
+        lease: Arc<crate::consumer::consumer_impl::consumer_lifecycle::PullLease>,
+    ) -> PullRequest {
+        let mut pull_request = request(queue);
+        pull_request.hold_lease(lease);
+        pull_request
+    }
+}
