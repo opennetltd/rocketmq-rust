@@ -3557,6 +3557,15 @@ impl ConsumerProgress {
             entry.last_pull_ok_ms = entry.last_pull_ok_ms.saturating_sub(age.as_millis() as u64);
         }
     }
+
+    /// Test seam (plan 49f F2): age a queued expectation on its own, so a test can watch the window
+    /// in which it was admitted expire without waiting for real.
+    pub(crate) fn review49f_age_queued(&self, queue: &MessageQueue, age: Duration) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            entry.queued_since_ms = entry.queued_since_ms.saturating_sub(age.as_millis() as u64);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3666,6 +3675,104 @@ mod review49f {
             state.reason,
             Reason::None,
             "revocation removed the queue fault but left it live in the aggregate fallback"
+        );
+    }
+
+    /// A queued expectation is owned by one acquisition: another generation's report may neither
+    /// open this queue's window nor close it (plan 49f F2 items 3 and 4).
+    #[test]
+    fn a_queued_expectation_belongs_to_one_acquisition() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        p.note_queue_installed(&q);
+        let lease = p.acquire_pull_lease(&q).unwrap();
+        p.review49f_age_activity(&q, Duration::from_secs(31));
+        let stall = Duration::from_secs(30);
+        assert_eq!(
+            p.snapshot(stall, Duration::from_secs(35)).lost_pull_queues,
+            1,
+            "the fixture should start with a lease held on a queue that went quiet"
+        );
+
+        // A report naming some other acquisition cannot make this queue look cared for.
+        let current = p.current_epoch(&q).unwrap();
+        assert!(
+            !p.note_pull_queued(&q, current + 1),
+            "a stale acquisition opened this queue's queued window"
+        );
+        assert_eq!(p.snapshot(stall, Duration::from_secs(35)).lost_pull_queues, 1);
+
+        // The owning acquisition's report is what says an attempt is owed.
+        assert!(p.note_pull_queued(&q, current));
+        let snapshot = p.snapshot(stall, Duration::from_secs(35));
+        assert_eq!(snapshot.lost_pull_queues, 0, "queued work counted as a lost pull");
+        assert_eq!(snapshot.leased_queues, 1);
+
+        // Taking the window back is likewise owned: a stale epoch leaves the current owner's
+        // expectation standing, and only its own report clears it.
+        p.forget_pull_queued(&q, current + 1);
+        assert_eq!(p.snapshot(stall, Duration::from_secs(35)).lost_pull_queues, 0);
+        p.forget_pull_queued(&q, current);
+        assert_eq!(
+            p.snapshot(stall, Duration::from_secs(35)).lost_pull_queues,
+            1,
+            "a withdrawn expectation left the queue looking cared for"
+        );
+        drop(lease);
+    }
+
+    /// A queued request that never reaches an attempt is not a permanent exemption: once its own
+    /// window passes it is lost again and the repair owes it another try (plan 49f F2 item 5).
+    #[test]
+    fn a_queued_window_expires_like_any_other_expectation() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        p.note_queue_installed(&q);
+        let lease = p.acquire_pull_lease(&q).unwrap();
+        p.review49f_age_activity(&q, Duration::from_secs(31));
+        let current = p.current_epoch(&q).unwrap();
+        assert!(p.note_pull_queued(&q, current));
+        let stall = Duration::from_secs(30);
+        assert_eq!(p.snapshot(stall, Duration::from_secs(35)).lost_pull_queues, 0);
+
+        p.review49f_age_queued(&q, Duration::from_millis(30_001));
+        let snapshot = p.snapshot(stall, Duration::from_secs(35));
+        eprintln!(
+            "expired queued window: lost={} leased={}",
+            snapshot.lost_pull_queues, snapshot.leased_queues
+        );
+        assert_eq!(
+            snapshot.lost_pull_queues, 1,
+            "a queued expectation that never became an attempt stopped being repairable work"
+        );
+        drop(lease);
+    }
+
+    /// Reacquisition starts a fresh expectation: the previous owner's queued window may not vouch
+    /// for the replacement, whose own silence is what matters (plan 49f F2 item 3).
+    #[test]
+    fn reacquiring_a_queue_does_not_inherit_a_queued_window() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        p.note_queue_installed(&q);
+        let lease = p.acquire_pull_lease(&q).unwrap();
+        let first = p.current_epoch(&q).unwrap();
+        assert!(p.note_pull_queued(&q, first));
+        drop(lease);
+        p.note_queue_revoked(&q);
+        p.note_queue_installed(&q);
+        p.review49f_age_activity(&q, Duration::from_secs(31));
+
+        let second = p.current_epoch(&q).unwrap();
+        assert_ne!(first, second);
+        let snapshot = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "reacquired queue: lost={} leased={}",
+            snapshot.lost_pull_queues, snapshot.leased_queues
+        );
+        assert_eq!(
+            snapshot.lost_pull_queues, 1,
+            "the new owner was vouched for by a queued window it never opened"
         );
     }
 }
