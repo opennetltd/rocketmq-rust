@@ -108,6 +108,17 @@ impl LocalFileOffsetStore {
     }
 }
 
+#[cfg(test)]
+impl LocalFileOffsetStore {
+    /// Redirect this store at a test-owned path and hand back the same file-I/O mutex its writer
+    /// takes, so a regression can hold that writer without adding a production lock-holding API
+    /// (plan 49e E5).
+    pub(crate) fn review49e_path_and_lock(&mut self, path: std::path::PathBuf) -> Arc<tokio::sync::Mutex<()>> {
+        self.store_path = CheetahString::from(path.to_string_lossy().to_string());
+        self.file_io.clone()
+    }
+}
+
 impl LocalFileOffsetStore {
     async fn read_local_offset(&self) -> rocketmq_error::RocketMQResult<Option<OffsetSerializeWrapper>> {
         let guard = self.file_io.clone().lock_owned().await;

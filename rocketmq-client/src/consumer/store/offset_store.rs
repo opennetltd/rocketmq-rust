@@ -106,32 +106,42 @@ impl OffsetStore {
         }
     }
 
-    /// Persist assigned offsets without exceeding `deadline`. The returned summary is the cleanup
-    /// session's evidence: a short budget leaves offsets recorded as skipped, never silently lost.
-    pub(crate) async fn persist_all_until(
+    /// Whether this store model keeps offsets in a local file. Cleanup persists that half
+    /// **first**, because its writer owns its guard until the write finishes and must not be
+    /// charged against the remote budget (plan 49e E5).
+    pub(crate) fn has_local(&self) -> bool {
+        self.local_file_offset_store.is_some()
+    }
+
+    /// Whether this store model writes offsets to brokers.
+    pub(crate) fn has_remote(&self) -> bool {
+        self.remote_broker_offset_store.is_some()
+    }
+
+    /// The local half of cleanup persistence, with no deadline: the whole-table file writer owns
+    /// its guard for the entire write and is never cancelled mid-write (plan 49a F10), so this
+    /// call simply waits for that writer. `None` when this store model has no local file.
+    pub(crate) async fn persist_local(&mut self, mqs: &HashSet<MessageQueue>) -> Option<PersistSummary> {
+        let store = self.local_file_offset_store.as_mut()?;
+        Some(store.persist_all(mqs, &|| false).await)
+    }
+
+    /// The remote half of cleanup persistence, bounded by `deadline`. The returned summary is the
+    /// cleanup session's evidence: a short budget leaves offsets recorded as skipped, never
+    /// silently lost. `None` when this store model has no broker writes.
+    pub(crate) async fn persist_remote_until(
         &mut self,
         mqs: &HashSet<MessageQueue>,
         deadline: TokioInstant,
-    ) -> PersistSummary {
-        let mut summary = PersistSummary::default();
-        if let Some(store) = self.remote_broker_offset_store.as_mut() {
-            let remote = store.persist_all_until(mqs, deadline).await;
-            summary.attempted += remote.attempted;
-            summary.succeeded += remote.succeeded;
-            summary.failed += remote.failed;
-            summary.skipped += remote.skipped;
-            summary.unproven += remote.unproven;
-        }
-        if let Some(store) = self.local_file_offset_store.as_mut() {
-            // The file writer owns its guard for the whole table: it is never cancelled mid-write
-            // and reports its own accounting (plan 49a F10).
-            let local = store.persist_all(mqs, &|| false).await;
-            summary.attempted += local.attempted;
-            summary.succeeded += local.succeeded;
-            summary.failed += local.failed;
-            summary.skipped += local.skipped;
-        }
-        summary
+    ) -> Option<PersistSummary> {
+        let store = self.remote_broker_offset_store.as_mut()?;
+        Some(store.persist_all_until(mqs, deadline).await)
+    }
+
+    /// Whether this store's own local writer has finished. `false` means an unfinished write is
+    /// still owned here, which is what makes it this phase's work rather than someone else's.
+    pub(crate) async fn local_writer_finished(&self) -> bool {
+        self.io_complete().await
     }
 
     pub(crate) async fn io_complete(&self) -> bool {

@@ -89,6 +89,7 @@ use crate::consumer::pull_callback::DefaultPullCallback;
 use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
 use crate::consumer::store::offset_store::OffsetStore;
 use crate::consumer::store::offset_store::PersistSummary;
+use crate::consumer::store::offset_store::OFFSET_WRITE_TIMEOUT_MILLIS;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
 use crate::factory::mq_client_instance::MQClientInstance;
@@ -274,19 +275,45 @@ pub(crate) trait PersistTarget {
     fn writer_finished(&mut self) -> impl Future<Output = bool>;
 }
 
-/// The consumer's offset store plus the queues one cleanup pass was assigned.
-struct StorePersist<'a> {
+/// The consumer's offset store plus the queues one cleanup pass was assigned. Cleanup runs this in
+/// two ordered phases rather than one call, because an `OffsetStore` can hold both halves and only
+/// the remote half may be bounded (plan 49e E5).
+struct LocalFilePersist<'a> {
     store: &'a mut OffsetStore,
     assigned: &'a HashSet<rocketmq_common::common::message::message_queue::MessageQueue>,
 }
 
-impl PersistTarget for StorePersist<'_> {
-    async fn persist(&mut self, deadline: TokioInstant) -> PersistSummary {
-        self.store.persist_all_until(self.assigned, deadline).await
+impl PersistTarget for LocalFilePersist<'_> {
+    /// No deadline: the whole-table file writer owns its guard until the write finishes and is
+    /// never cancelled mid-write (plan 49a F10). Waiting here is the point - what it must not
+    /// do is spend the remote budget, which this phase has not opened yet.
+    async fn persist(&mut self, _deadline: TokioInstant) -> PersistSummary {
+        self.store.persist_local(self.assigned).await.unwrap_or_default()
     }
 
     async fn writer_finished(&mut self) -> bool {
-        self.store.io_complete().await
+        self.store.local_writer_finished().await
+    }
+}
+
+/// The broker half of cleanup persistence. Every write shares the deadline this phase opened, and
+/// an unfinished step is reported rather than retried here: only a local writer can be owned while
+/// it finishes.
+struct RemoteBrokerPersist<'a> {
+    store: &'a mut OffsetStore,
+    assigned: &'a HashSet<rocketmq_common::common::message::message_queue::MessageQueue>,
+}
+
+impl PersistTarget for RemoteBrokerPersist<'_> {
+    async fn persist(&mut self, deadline: TokioInstant) -> PersistSummary {
+        self.store
+            .persist_remote_until(self.assigned, deadline)
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn writer_finished(&mut self) -> bool {
+        true
     }
 }
 
@@ -358,6 +385,18 @@ fn remote_step(
 ) -> std::time::Duration {
     let available = session_deadline.saturating_duration_since(now).saturating_sub(reserve);
     opportunity.min(available)
+}
+
+/// How long the local offset-file phase may retry an unfinished write, sized once at its entry from
+/// this phase's own policy (plan 49e E5): one write allowance plus the whole backoff schedule. It
+/// is deliberately not derived from a cleanup observation deadline - an observer that stopped
+/// waiting says nothing about whether this process still owns a file writer that has to finish.
+fn local_persist_window() -> std::time::Duration {
+    let mut window = std::time::Duration::from_millis(OFFSET_WRITE_TIMEOUT_MILLIS);
+    for attempt in 0..MAX_LOCAL_PERSIST_RETRIES {
+        window += local_persist_backoff(attempt);
+    }
+    window
 }
 
 fn remaining_millis(deadline: TokioInstant) -> u64 {
@@ -1128,73 +1167,105 @@ impl DefaultMQPushConsumerImpl {
             service.shutdown(remaining_millis(deadline)).await;
         }
         report.record("consume_service", started);
-        // The remote phase opens **here**, when required local release has finished, and is
-        // measured from this instant instead of from session creation (plan 49d R5). What a
-        // listener took to hand its batches back used to be subtracted from the broker's
-        // chance to take the offsets and this group's unregistration, so releasing late
-        // could leave both with nothing while still taking the finalization reserve with
-        // them. The envelope is the persist opportunity plus what finalization keeps back -
-        // a fast drain therefore gets no more than the configured remote budget - and every
-        // step inside it keeps an absolute deadline that neither a retry nor a re-observing
-        // caller can renew. An observer whose own wait expired is not part of any of this
-        // arithmetic: it stopped watching, it did not shorten this pass.
+        let queues = self
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .read()
+            .await;
+        let assigned: std::collections::HashSet<_> = queues.keys().cloned().collect();
+        drop(queues);
+
+        // **Local offsets first, and they belong to this pass rather than to the remote budget**
+        // (plan 49e E5). The whole-table file writer owns its guard until the write finishes and is
+        // never cancelled mid-write (plan 49a F10), so waiting for it is unavoidable; charging that
+        // elapsed time against unregistration - as one combined phase did - let a slow local disk
+        // spend the reserve before finalization ever saw it. The retry window is therefore sized
+        // once, at this phase's entry, from this phase's own policy rather than from an
+        // observation deadline that may already have expired, and an unfinished write stays
+        // owned here even if it outlives that window (plan 49c C6).
+        if let Some(store) = self.offset_store.as_mut() {
+            if store.has_local() {
+                driver.enter("local_offset_persist");
+                let started = TokioInstant::now();
+                let window = local_persist_window();
+                let phase = persist_offsets_with_phase_retry(
+                    &mut LocalFilePersist {
+                        store,
+                        assigned: &assigned,
+                    },
+                    started + window,
+                    window,
+                    std::time::Duration::ZERO,
+                    || {
+                        // Observers see each attempt happen: same session, same owner, real
+                        // progress.
+                        driver.retry("local_offset_persist_retry");
+                    },
+                )
+                .await;
+                let (summary, attempts) = match phase {
+                    PersistPhase::Finished { summary, attempts } => (summary, attempts),
+                    PersistPhase::Blocked { summary, attempts } => {
+                        report.detail(format!("local_offsets[{summary}] retries={attempts}"));
+                        report.block("offset_file_writer_busy");
+                        return false;
+                    }
+                };
+                report.record("local_offset_persist", started);
+                if attempts > 0 {
+                    report.detail(format!("local_offsets[{summary}] retries={attempts}"));
+                } else {
+                    report.detail(format!("local_offsets[{summary}]"));
+                }
+            }
+        }
+
+        // **The remote envelope opens here**, measured from this instant: local release *and* local
+        // persistence have finished, so what a listener took to hand its batches back and what the
+        // offset file took to land can no longer be subtracted from the broker's chance to take
+        // this group's offsets and unregistration (plan 49d R5, plan 49e E5). The envelope
+        // is the persist opportunity plus what finalization keeps back - a fast drain
+        // therefore gets no more than the configured remote budget - and every step inside
+        // it keeps an absolute deadline that neither a retry nor a re-observing caller can
+        // renew. An observer whose own wait expired stopped watching; it did not shorten
+        // this pass.
         let finalization_reserve = self.finalization_reserve();
         let persist_opportunity = self.remote_persist_opportunity();
         let remote_deadline = TokioInstant::now() + persist_opportunity + finalization_reserve;
         if let Some(store) = self.offset_store.as_mut() {
-            let queues = self
-                .rebalance_impl
-                .rebalance_impl_inner
-                .process_queue_table
-                .read()
+            if store.has_remote() {
+                // One bounded pass: broker lookup, route refresh and the send all share one
+                // deadline derived from this envelope, and anything the budget
+                // could not reach is reported, not hidden (plan 49c C5). Nothing
+                // here retries in place: a remote step has no local writer to wait
+                // for, so an unfinished one is evidence, not this phase's work.
+                driver.enter("remote_offset_persist");
+                let started = TokioInstant::now();
+                let phase = persist_offsets_with_phase_retry(
+                    &mut RemoteBrokerPersist {
+                        store,
+                        assigned: &assigned,
+                    },
+                    remote_deadline,
+                    persist_opportunity,
+                    finalization_reserve,
+                    || driver.retry("remote_offset_persist_retry"),
+                )
                 .await;
-            let assigned = queues.keys().cloned().collect();
-            drop(queues);
-            // One bounded pass: broker lookup, route refresh and the send all share the cleanup
-            // deadline, and anything the budget could not reach is reported, not hidden.
-            driver.enter("offset_persist");
-            let started = TokioInstant::now();
-            // A policy-sized remote opportunity that starts *here*, after the local drains, instead
-            // of sharing the session's elapsed time with them: slow local release used
-            // to be able to leave this step with a deadline already expired. It is
-            // capped by what remains once the reserve above is taken away, so
-            // persistence can never reach into finalization (plan 49c C5).
-            //
-            // An unfinished local write is retried inside this same phase instead of ending the
-            // pass (plan 49c C6): one owner and one writer repeat work that is safe to
-            // repeat, so storage that becomes available again lets cleanup prove itself
-            // rather than leave a consumer blocked on a fault that outlived its own
-            // deadline. Nothing else in this process could have made that write land -
-            // re-observing an ended pass from outside certainly cannot.
-            let phase = persist_offsets_with_phase_retry(
-                &mut StorePersist {
-                    store,
-                    assigned: &assigned,
-                },
-                remote_deadline,
-                persist_opportunity,
-                finalization_reserve,
-                || {
-                    // Observers see each attempt happen: same session, same owner, real progress.
-                    driver.retry("offset_persist_retry");
-                },
-            )
-            .await;
-            let (summary, attempts) = match phase {
-                PersistPhase::Finished { summary, attempts } => (summary, attempts),
-                PersistPhase::Blocked { summary, attempts } => {
-                    report.detail(format!("offsets[{summary}] retries={attempts}"));
-                    report.block("offset_file_writer_busy");
+                let PersistPhase::Finished { summary, attempts } = phase else {
+                    report.block("offset_store_writer_busy");
                     return false;
+                };
+                report.record("remote_offset_persist", started);
+                if attempts > 0 {
+                    report.detail(format!("offsets[{summary}] retries={attempts}"));
+                } else {
+                    report.detail(format!("offsets[{summary}]"));
                 }
-            };
-            report.record("offset_persist", started);
-            if attempts > 0 {
-                report.detail(format!("offsets[{summary}] retries={attempts}"));
-            } else {
-                report.detail(format!("offsets[{summary}]"));
             }
         }
+
         // No offset store means nothing was ever persisted, which is proved, not blocked.
         let queues = self
             .rebalance_impl
@@ -3633,6 +3704,286 @@ mod review49e_steps {
                 lost_pull_cursor_key(&MessageQueue::from_parts("T", "a-broken", 11)).to_string(),
                 lost_pull_cursor_key(&MessageQueue::from_parts("T", "b-ready", 0)).to_string(),
             ]
+        );
+    }
+}
+
+/// Plan 49e E5: a slow local offset file must not spend the reserve that unregistration and
+/// finalization were given. Local persistence runs in its own phase, before any remote budget is
+/// opened, and the envelope for brokers is measured from the moment that phase finished.
+#[cfg(test)]
+mod review49e_local {
+    use std::io::ErrorKind;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+
+    #[derive(Clone, Copy)]
+    enum Shape {
+        Local,
+        Remote,
+        Both,
+    }
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        path: std::path::PathBuf,
+        /// The same mutex the local offset writer takes. Holding it stalls that writer without
+        /// adding a production lock-holding API.
+        io: Arc<TokioMutex<()>>,
+        contacted: Arc<AtomicUsize>,
+        accepted: Arc<TokioMutex<Vec<Instant>>>,
+    }
+
+    /// A consumer with an offset store of the requested shape, one installed queue holding one
+    /// recorded offset and - when it has a remote half - one loopback broker target that answers
+    /// nothing but counts every connection.
+    async fn fixture(name: &str, shape: Shape) -> Fixture {
+        let mut cc = ClientConfig::default();
+        cc.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let group = CheetahString::from_string(format!("review49e-e5-{name}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        let instance_id = format!("review49e-e5-{name}");
+        let client = MQClientInstance::new_arc(cc, 0, instance_id.as_str(), None);
+        push.client_instance = Some(client.clone());
+
+        let dir = std::path::PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into()))
+            .join(format!("review49e-e5-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("offsets.json");
+        let _ = std::fs::remove_file(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group.clone());
+        let io = local.review49e_path_and_lock(path.clone());
+
+        // A loopback target that accepts and then says nothing: every attempt is contacted, no
+        // attempt is answered.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let contacted = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(TokioMutex::new(Vec::<Instant>::new()));
+        {
+            let contacted = contacted.clone();
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((mut socket, _)) => {
+                            contacted.fetch_add(1, Ordering::SeqCst);
+                            accepted.lock().await.push(Instant::now());
+                            tokio::spawn(async move {
+                                let mut buf = [0u8; 512];
+                                loop {
+                                    match tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(_) => {}
+                                    }
+                                }
+                            });
+                        }
+                        Err(err) if err.kind() == ErrorKind::ConnectionReset => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        let remote = match shape {
+            Shape::Local => None,
+            Shape::Remote | Shape::Both => Some(RemoteBrokerOffsetStore::new(client.clone(), group.clone())),
+        };
+        let local_store = match shape {
+            Shape::Remote => None,
+            Shape::Local | Shape::Both => Some(local),
+        };
+        push.offset_store = Some(ArcMut::new(OffsetStore::new(remote, local_store)));
+        if matches!(shape, Shape::Remote | Shape::Both) {
+            client.review49e_broker_target(&addr).await;
+        }
+
+        let mq = MessageQueue::from_parts("T", "broker-a", 0);
+        push.progress.note_queue_installed(&mq);
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(mq.clone(), Arc::new(ProcessQueue::new()));
+        push.offset_store.as_ref().unwrap().update_offset(&mq, 7, false).await;
+        Fixture {
+            push,
+            path,
+            io,
+            contacted,
+            accepted,
+        }
+    }
+
+    /// A local writer that takes 60 ms may not spend a 20 ms unregister reserve: the file lands
+    /// first and unregistration is still attempted inside its own envelope.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_local_writer_must_not_spend_the_unregister_reserve() {
+        let mut fixture = fixture("slow", Shape::Both).await;
+        fixture
+            .push
+            .set_remote_budgets(Duration::from_millis(10), Duration::from_millis(20));
+        fixture.push.registered = true;
+        // Own the file mutex now, release it 60 ms into the pass: what is under test is a local
+        // write that takes real time, not one that happens to lose a race.
+        let io = fixture.io.clone();
+        let guard = io.clone().lock_owned().await;
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(guard);
+        });
+        let started = Instant::now();
+        let proven = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture
+                .push
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("local completion happens before an unregister attempt");
+        tokio::time::timeout(Duration::from_millis(500), releaser)
+            .await
+            .expect("the file mutex is released")
+            .expect("the releasing task ran");
+        let progress = fixture
+            .push
+            .cleanup_progress()
+            .expect("the stop request started one session");
+        assert!(
+            proven,
+            "cleanup must prove local persistence and unregistration: {progress:?}"
+        );
+        assert!(fixture.path.exists(), "the local offset file was written");
+        assert!(fixture.contacted.load(Ordering::SeqCst) > 0, "unregister was attempted");
+        // And in that order: the first connection arrives only after the slow write finished.
+        let first = fixture
+            .accepted
+            .lock()
+            .await
+            .first()
+            .copied()
+            .expect("a connection was accepted")
+            .duration_since(started);
+        assert!(
+            first >= Duration::from_millis(50),
+            "unregistration was attempted {first:?} after the pass started, before the local writer finished"
+        );
+    }
+
+    /// Positive control: with an immediate file release the same fixture contacts that target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_immediate_local_writer_still_contacts_the_broker() {
+        let mut fixture = fixture("fast", Shape::Both).await;
+        fixture
+            .push
+            .set_remote_budgets(Duration::from_millis(10), Duration::from_millis(20));
+        fixture.push.registered = true;
+        let proven = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture
+                .push
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("cleanup ends on its own budget");
+        assert!(proven, "cleanup must prove local persistence and unregistration");
+        assert!(fixture.path.exists(), "the local offset file was written");
+        assert!(fixture.contacted.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A store model with only a local half proves its offsets without ever needing a broker, so
+    /// the ordering change cannot make local-only consumers wait for a remote envelope that
+    /// will not come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_local_only_store_proves_offsets_without_a_broker() {
+        let mut fixture = fixture("local-only", Shape::Local).await;
+        fixture
+            .push
+            .set_remote_budgets(Duration::from_millis(10), Duration::from_millis(20));
+        let proven = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture
+                .push
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("a local-only pass ends on its own budget");
+        assert!(proven, "local persistence alone is proof for this store model");
+        assert!(fixture.path.exists(), "the local offset file was written");
+        assert_eq!(
+            fixture.contacted.load(Ordering::SeqCst),
+            0,
+            "a consumer with no broker target must not be made to wait for one"
+        );
+    }
+
+    /// A store model with only a remote half keeps its existing bound: an unreachable broker ends
+    /// the pass inside its envelope rather than extending it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remote_only_store_keeps_its_own_bound() {
+        let mut fixture = fixture("remote-only", Shape::Remote).await;
+        fixture
+            .push
+            .set_remote_budgets(Duration::from_millis(30), Duration::from_millis(20));
+        fixture.push.registered = true;
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture
+                .push
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("a remote-only pass ends on its own budget");
+        assert!(!fixture.path.exists(), "this store model has no offset file");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_900),
+            "elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An unresponsive broker may delay finalization, never extend it: the pass ends within its own
+    /// envelope even though connections keep being accepted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unresponsive_broker_stays_inside_the_envelope() {
+        let mut fixture = fixture("unresponsive", Shape::Both).await;
+        fixture
+            .push
+            .set_remote_budgets(Duration::from_millis(30), Duration::from_millis(20));
+        fixture.push.registered = true;
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture
+                .push
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("an unanswered broker does not extend the pass");
+        assert!(fixture.contacted.load(Ordering::SeqCst) > 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_900),
+            "elapsed {:?}",
+            started.elapsed()
         );
     }
 }

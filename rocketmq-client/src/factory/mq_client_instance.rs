@@ -270,6 +270,16 @@ impl MQClientInstance {
         unimplemented!()
     }
 
+    /// Point this instance at one broker address so a cleanup pass has an unregister target without
+    /// running a nameserver (plan 49e E5).
+    #[cfg(test)]
+    pub(crate) async fn review49e_broker_target(&self, addr: &str) {
+        self.broker_addr_table
+            .write()
+            .await
+            .insert("review49e".into(), [(0u64, addr.into())].into_iter().collect());
+    }
+
     pub fn new_arc(
         client_config: ClientConfig,
         instance_index: i32,
