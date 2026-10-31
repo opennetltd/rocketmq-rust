@@ -67,6 +67,12 @@ impl PullRequest {
         self.lease = Some(lease);
     }
 
+    /// The acquisition this request carries, if any (plan 49f F2: admission is recorded through the
+    /// lease, so it can only ever describe the acquisition that issued the request).
+    pub(crate) fn lease(&self) -> Option<&Arc<PullLease>> {
+        self.lease.as_ref()
+    }
+
     /// The attempt this request admitted, `0` when it issued no RPC.
     pub(crate) fn attempt_id(&self) -> u64 {
         self.attempt_id

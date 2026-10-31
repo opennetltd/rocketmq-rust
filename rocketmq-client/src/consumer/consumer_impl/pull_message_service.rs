@@ -23,6 +23,23 @@ use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
 use crate::factory::mq_client_instance::MQClientInstance;
 
+/// Whether a request made it into the shared pull service (plan 49f F2 and F4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Admission {
+    /// Capacity was reserved, its queued expectation recorded, and the receiver can see it.
+    Accepted,
+    /// Room did not open inside the caller's step; the queue keeps its fault and its own lease is
+    /// released with the dropped request.
+    TimedOut,
+    /// The service or this consumer ended.
+    Closed,
+    /// The task that owned the request stopped first.
+    Cancelled,
+    /// Its acquisition ended while it waited for room; recording anything for the queue's current
+    /// owner would be wrong.
+    Superseded,
+}
+
 #[derive(Clone)]
 pub struct PullMessageService {
     tx: Option<tokio::sync::mpsc::Sender<Box<dyn MessageRequest + Send + 'static>>>,
@@ -124,6 +141,66 @@ impl PullMessageService {
     pub async fn execute_pull_request_immediately(&self, pull_request: PullRequest) {
         if let Err(e) = self.tx.as_ref().unwrap().send(Box::new(pull_request)).await {
             warn!("Failed to send pull request to pull_tx, error: {:?}", e);
+        }
+    }
+
+    /// Hand a request to the shared pull service **under a deadline and a cancellation token**
+    /// (plan 49f F2 and F4).
+    ///
+    /// Owning a queue's lease and finding room in this process-wide channel are separate facts, and
+    /// an unbounded `send` conflated them: the task holding one queue's lease waited behind
+    /// thousands of requests for other queues while health read the still-held lease as work in
+    /// progress. Room is reserved first, so the hand-off itself cannot wait:
+    ///
+    /// 1. reserve capacity, bounded by `deadline` and ended by `cancelled`;
+    /// 2. record this request's queued expectation while nothing can observe it yet;
+    /// 3. make it visible with no await in between.
+    ///
+    /// Anything other than [`Admission::Accepted`] drops the request, which releases only **its
+    /// own** lease: the queue stays lost and a later round owns it again (plan 49f F4).
+    pub(crate) async fn admit_pull_request(
+        &self,
+        pull_request: PullRequest,
+        deadline: tokio::time::Instant,
+        cancelled: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Admission {
+        let Some(tx) = self.tx.as_ref() else {
+            warn!("PullMessageService is not running; dropping a pull request that was never admitted");
+            return Admission::Closed;
+        };
+        if tx.is_closed() {
+            return Admission::Closed;
+        }
+        let stopping = cancelled.cloned();
+        let watching = stopping.is_some();
+        match tokio::select! {
+            biased;
+            _ = async {
+                match &stopping {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if watching => return Admission::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => return Admission::TimedOut,
+            reserved = tx.clone().reserve_owned() => reserved,
+        } {
+            Err(_) => Admission::Closed,
+            Ok(permit) => {
+                // Steps 2 and 3: the expectation belongs to the acquisition that issued the request
+                // and is recorded before its receiver can see it; `send` on a held permit never
+                // waits.
+                if let Some(lease) = pull_request.lease() {
+                    if !lease.note_queued() {
+                        // Its acquisition ended while this request waited for room: making it
+                        // visible would put work on the queue's current owner.
+                        return Admission::Superseded;
+                    }
+                }
+                // Infallible: the permit is the reserved capacity, and holding it means nothing
+                // between reservation and visibility can wait or fail.
+                permit.send(Box::new(pull_request));
+                Admission::Accepted
+            }
         }
     }
 

@@ -324,6 +324,11 @@ struct QueueProgress {
     /// Not before this instant may the next attempt run: a scheduled retry or a deliberate flow
     /// control wait. Waiting is healthy until its own expectation fails (plan 49c C2).
     wait_until_ms: u64,
+    /// When work for this acquisition was handed to the shared pull service and is owed an attempt.
+    /// Admission and RPC admission are different facts: a queued request owns no transport deadline
+    /// yet, so it gets the stall allowance measured from **admission** rather than looking like a
+    /// lost pull because its previous answer is old (plan 49f F2). `0` means nothing is queued.
+    queued_since_ms: u64,
     /// When this acquisition last **answered a pull successfully**. Kept apart from
     /// `last_progress_ms`, which any local activity refreshes, because only a newer successful pull
     /// says the route or transport that failed has recovered (plan 49e E2).
@@ -350,6 +355,18 @@ pub(crate) struct PullLease {
 impl PullLease {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Record that a request carrying this lease was admitted to the shared pull service, while the
+    /// request is still invisible to its receiver (plan 49f F2). False means the acquisition ended,
+    /// and the caller must not make the request visible.
+    pub(crate) fn note_queued(&self) -> bool {
+        self.progress.note_pull_queued(&self.queue, self.epoch)
+    }
+
+    /// Take back the queued expectation this lease recorded (plan 49f F2).
+    pub(crate) fn forget_queued(&self) {
+        self.progress.forget_pull_queued(&self.queue, self.epoch);
     }
 }
 
@@ -492,8 +509,12 @@ struct QueueStanding {
     overdue: bool,
     /// The loop still holds the queue's lease while nothing is admitted and no continuation is due:
     /// work stopped without ending the loop, which stays diagnosable instead of looking healthy
-    /// forever (plan 49d R1).
+    /// forever (plan 49d R1). Work that has been admitted to the shared pull service counts: it is
+    /// owed an attempt, not lost (plan 49f F2).
     idle_lease: bool,
+    /// Admitted to the shared pull service and waiting for its attempt inside the stall allowance
+    /// measured from admission (plan 49f F2).
+    queued: bool,
 }
 
 impl QueueStanding {
@@ -501,7 +522,7 @@ impl QueueStanding {
     /// in the future, is not lost however old its last answer looks - only an expired attempt
     /// deadline or a failed wait expectation says the work is gone (plan 49c C2, plan 49d R1).
     fn is_lost(&self) -> bool {
-        self.overdue || self.idle_lease || (!self.leased && !self.waiting && self.silent)
+        self.overdue || self.idle_lease || (!self.leased && !self.waiting && !self.queued && self.silent)
     }
 }
 
@@ -519,12 +540,17 @@ impl QueueProgress {
                 } else {
                     self.attempt_started_ms.saturating_add(rpc_grace)
                 };
+        // A request the service has accepted is expected to reach an attempt within the same
+        // allowance that says a queue has gone quiet; measuring it from the previous completion is
+        // what made a just-dispatched repair look like a lost pull (plan 49f F2).
+        let queued = self.queued_since_ms != 0 && now_ms.saturating_sub(self.queued_since_ms) < stall;
         QueueStanding {
             silent,
             waiting,
             leased: self.pull_leased,
             overdue,
-            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && silent,
+            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && !queued && silent,
+            queued,
         }
     }
 }
@@ -593,8 +619,11 @@ impl ConsumerProgress {
         entry.attempt_id = attempt_id;
         entry.attempt_started_ms = now;
         entry.attempt_deadline_ms = now.saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
-        // An admitted RPC supersedes any wait expectation recorded for this queue.
+        // An admitted RPC supersedes both the wait expectation and any queued-work expectation
+        // recorded for this queue: from here its own answer window is what health watches
+        // (plan 49f F2).
         entry.wait_until_ms = 0;
+        entry.queued_since_ms = 0;
         Some(attempt_id)
     }
 
@@ -746,6 +775,34 @@ impl ConsumerProgress {
     /// While that wait lies in the future the queue is waiting on purpose; once it has passed with
     /// no work admitted, the queue's own expectation has failed and it becomes repairable
     /// (plan 49c C2).
+    /// Record that a request for this acquisition has been **admitted to the shared pull service**
+    /// and is owed an attempt (plan 49f F2). Called while nothing can still observe the request, so
+    /// no window exists in which work is neither queued nor in flight.
+    ///
+    /// Returns whether it was recorded: a request whose acquisition ended while it waited for room
+    /// must not put an expectation on the queue its replacement now owns.
+    pub(crate) fn note_pull_queued(&self, queue: &MessageQueue, epoch: u64) -> bool {
+        let mut queues = self.queues.write();
+        match queues.get_mut(queue) {
+            Some(entry) if entry.epoch == epoch && entry.pull_leased => {
+                entry.queued_since_ms = get_current_millis();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take back a queued expectation that never became visible to the receiver (admission failed
+    /// after it was recorded). Only the acquisition that recorded it may clear it.
+    pub(crate) fn forget_pull_queued(&self, queue: &MessageQueue, epoch: u64) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            if entry.epoch == epoch {
+                entry.queued_since_ms = 0;
+            }
+        }
+    }
+
     pub(crate) fn note_queue_wait(&self, queue: &MessageQueue, delay: Duration) {
         self.record_queue_wait(queue, None, delay);
     }
@@ -887,6 +944,7 @@ impl ConsumerProgress {
                         attempt_started_ms: 0,
                         attempt_deadline_ms: 0,
                         wait_until_ms: 0,
+                        queued_since_ms: 0,
                         failure_ms: 0,
                         failure_kind: PullFailureKind::Other,
                     },
@@ -3439,6 +3497,20 @@ mod review49e_evidence {
 }
 
 /// Plan 49f F1: a fault that no tracked queue still holds must stop being evidence.
+#[cfg(test)]
+impl ConsumerProgress {
+    /// Test seam (plan 49f): make this queue's recorded completion older by `age`, so a test can
+    /// put a queue past its stall allowance without sleeping for it. Ownership, attempts and
+    /// waits are left exactly as they are - only the memory of the last completed pull moves.
+    pub(crate) fn review49f_age_activity(&self, queue: &MessageQueue, age: Duration) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            entry.last_progress_ms = entry.last_progress_ms.saturating_sub(age.as_millis() as u64);
+            entry.last_pull_ok_ms = entry.last_pull_ok_ms.saturating_sub(age.as_millis() as u64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod review49f {
     use super::*;

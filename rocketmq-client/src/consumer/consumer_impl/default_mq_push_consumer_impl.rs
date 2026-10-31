@@ -111,6 +111,15 @@ const CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: u64 = 1000 * 30;
 /// deadline is this same total, so health and repair judge one attempt exactly like the loop that
 /// issued it.
 const PULL_ANSWER_ALLOWANCE_MILLIS: u64 = 5_000;
+/// How long one queue's next pull may wait for room in the **process-wide** pull channel before
+/// this consumer stops treating the wait as progress and lets health re-dispatch it (plan 49f
+/// F2/F4).
+///
+/// The channel is shared by every consumer on the client instance, so an unbounded hand-off lets
+/// one queue's lease wait behind thousands of requests for other queues. Waiting briefly is
+/// legitimate backpressure; waiting indefinitely turns capacity pressure into a fault that looks
+/// like a stalled queue.
+pub(crate) const PULL_ADMISSION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_POP_INVISIBLE_TIME: u64 = 300000;
 const MIN_POP_INVISIBLE_TIME: u64 = 5000;
 const ASYNC_TIMEOUT: u64 = 3000;
@@ -1407,15 +1416,51 @@ impl DefaultMQPushConsumerImpl {
     /// own tick, so if that never happens the queue stays diagnosable as an idle lease instead
     /// of being declared healthy by a timer nobody owes.
     pub async fn execute_pull_request_immediately(&mut self, pull_request: PullRequest) {
-        if self.work.is_closed() {
-            return;
+        match self.dispatch_pull_request(pull_request, PULL_ADMISSION_ALLOWANCE).await {
+            crate::consumer::consumer_impl::pull_message_service::Admission::Accepted => {}
+            crate::consumer::consumer_impl::pull_message_service::Admission::TimedOut => warn!(
+                "the shared pull service had no room for this queue's next request inside its allowance, leaving the \
+                 queue to be re-dispatched"
+            ),
+            other => debug!(?other, "this pull request was not admitted to the shared pull service"),
         }
-        self.client_instance
-            .as_mut()
-            .unwrap()
-            .pull_message_service
-            .execute_pull_request_immediately(pull_request)
-            .await;
+    }
+
+    /// Hand one request to the shared pull service under this consumer's own bound (plan 49f
+    /// F2/F4).
+    ///
+    /// Queue ownership and channel capacity are separate conditions: the lease says who may run the
+    /// next pull, and finding room in a channel shared by every consumer on this client instance
+    /// says nothing about it. Admission is therefore bounded and cancellable, and an accepted
+    /// request records its queued expectation before anyone can observe it.
+    ///
+    /// Consumers that do not use SDK-owned assignment keep the unbounded hand-off: nothing tracks
+    /// their queues, so there is no expectation to record and no controller to re-dispatch a
+    /// dropped request.
+    async fn dispatch_pull_request(
+        &self,
+        pull_request: PullRequest,
+        budget: std::time::Duration,
+    ) -> crate::consumer::consumer_impl::pull_message_service::Admission {
+        use crate::consumer::consumer_impl::pull_message_service::Admission;
+        if self.work.is_closed() {
+            return Admission::Closed;
+        }
+        let Some(service) = self
+            .client_instance
+            .as_ref()
+            .map(|instance| instance.pull_message_service.clone())
+        else {
+            return Admission::Closed;
+        };
+        if !self.managed_lifecycle.load(Ordering::Acquire) {
+            service.execute_pull_request_immediately(pull_request).await;
+            return Admission::Accepted;
+        }
+        let cancellation = self.work.cancellation();
+        service
+            .admit_pull_request(pull_request, tokio::time::Instant::now() + budget, Some(&cancellation))
+            .await
     }
     pub fn execute_pull_request_later(&mut self, pull_request: PullRequest, time_delay: u64) {
         if self.work.is_closed() {
@@ -1451,9 +1496,32 @@ impl DefaultMQPushConsumerImpl {
         };
         let handle = client_instance.runtime_handle();
         let service = client_instance.pull_message_service.clone();
+        let work = self.work.clone();
+        // An expired retry timer is dispatched like any other request: once its delay has passed it
+        // needs room in the shared channel, and that wait is bounded and cancellable too
+        // (plan 49f F2 item 3).
+        let managed = self.managed_lifecycle.load(Ordering::Acquire);
         self.work.spawn(&handle, async move {
             tokio::time::sleep(std::time::Duration::from_millis(time_delay)).await;
-            service.execute_pull_request_immediately(pull_request).await;
+            if !managed {
+                service.execute_pull_request_immediately(pull_request).await;
+                return;
+            }
+            let cancellation = work.cancellation();
+            match service
+                .admit_pull_request(
+                    pull_request,
+                    tokio::time::Instant::now() + PULL_ADMISSION_ALLOWANCE,
+                    Some(&cancellation),
+                )
+                .await
+            {
+                crate::consumer::consumer_impl::pull_message_service::Admission::Accepted => {}
+                other => debug!(
+                    ?other,
+                    "a scheduled pull continuation was not admitted to the shared pull service",
+                ),
+            }
         });
     }
 
@@ -1680,6 +1748,7 @@ impl DefaultMQPushConsumerImpl {
         prep_allowance: std::time::Duration,
         slice: std::time::Duration,
     ) -> LostPullRound {
+        use crate::consumer::consumer_impl::pull_message_service::Admission;
         let started = std::time::Instant::now();
         // Deterministic order, and the same key names where an unfinished round stopped (plan 49e
         // E3): continuing strictly after that queue is what keeps one slow or broken broker from
@@ -1805,12 +1874,56 @@ impl DefaultMQPushConsumerImpl {
             // Dispatched as soon as it is prepared and revalidated, so a later queue's I/O can
             // never strand work this round already earned. The lease travels with the
             // request and whichever path finishes that pull releases it.
-            if self.client_instance.is_some() {
+            if let Some(service) = self
+                .client_instance
+                .as_ref()
+                .map(|instance| instance.pull_message_service.clone())
+            {
+                // Handing the request to the shared service is **not** part of owning this queue's
+                // lease (plan 49f F4): the channel belongs to every consumer on the client
+                // instance, so waiting for room may not spend the rest of this
+                // round. One step per queue, and a request that finds no room is
+                // dropped - which releases only its own lease and leaves
+                // the queue exactly as lost as it was.
+                let remaining = slice.saturating_sub(started.elapsed());
+                let admission_budget = if index == 0 {
+                    remaining.max(prep_allowance)
+                } else {
+                    remaining.max(LOST_PULL_STEP_MINIMUM)
+                };
+                // Kept for the logs below: the request takes ownership of the queue it resumes.
+                let repair_queue = mq.clone();
                 let mut request = PullRequest::new(self.consumer_config.consumer_group.clone(), mq, pq, next_offset);
                 request.hold_lease(lease);
                 debug!("re-dispatching a queue whose pull loop was lost");
-                self.execute_pull_request_immediately(request).await;
-                dispatched += 1;
+                let cancellation = self.work.cancellation();
+                match service
+                    .admit_pull_request(
+                        request,
+                        tokio::time::Instant::now() + admission_budget,
+                        Some(&cancellation),
+                    )
+                    .await
+                {
+                    Admission::Accepted => dispatched += 1,
+                    Admission::Superseded => debug!(
+                        queue = %repair_queue,
+                        "this queue's acquisition ended while its repair waited for pull-service room, dropping it"
+                    ),
+                    other => {
+                        // Room did not open in this queue's step, or the consumer/service ended.
+                        // Either way the round stops here as deferred:
+                        // continuing would spend later queues' steps on the
+                        // same exhausted capacity, and a fresh sweep reaches this one again.
+                        warn!(
+                            queue = %repair_queue,
+                            ?other,
+                            "this queue's repair was not admitted to the shared pull service inside its step, leaving it lost"
+                        );
+                        unfinished = true;
+                        break;
+                    }
+                }
             }
         }
         if unfinished {
@@ -3984,6 +4097,75 @@ mod review49e_local {
             started.elapsed() < Duration::from_millis(1_900),
             "elapsed {:?}",
             started.elapsed()
+        );
+    }
+}
+/// Plan 49f F4: handing a prepared repair to the shared pull service is its own bounded step. With
+/// the channel full, the round must end inside its requested budgets instead of waiting on capacity
+/// that belongs to every consumer on the client instance.
+#[cfg(test)]
+mod review49f {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_pull_channel_must_not_hold_the_repair_past_its_step() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49f-full-channel");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49f-full-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        let dummy = MessageQueue::from_parts("T", "dummy", 0);
+        for _ in 0..32 {
+            client
+                .pull_message_service
+                .execute_pull_request_immediately(PullRequest::new(
+                    group.clone(),
+                    dummy.clone(),
+                    Arc::new(ProcessQueue::new()),
+                    0,
+                ))
+                .await;
+        }
+        assert_eq!(capture.len(), 32);
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        push.progress.note_queue_installed(&q);
+        push.progress
+            .review49f_age_activity(&q, std::time::Duration::from_secs(31));
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), Arc::new(ProcessQueue::new()));
+        let store = OffsetStore::new_with_remote(RemoteBrokerOffsetStore::new(client.clone(), group));
+        store.update_offset(&q, 7, false).await;
+        push.offset_store = Some(ArcMut::new(store));
+        push.client_instance = Some(client.clone());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            push.repair_lost_pulls(
+                None,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(35),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await;
+        eprintln!("full pull channel: result={result:?} buffered={}", capture.len());
+        client.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "preparation ended but enqueue waited outside every repair-step deadline"
         );
     }
 }
