@@ -1107,18 +1107,23 @@ async fn run_incarnation(
         }
 
         // 4. An operation that finished is judged on its own evidence: the remaining cursor moves
-        //    forward, and only a pass that completed reports to the replacement budget.
+        //    forward, and the round reports a **typed verdict** (plan 49f F1). Whether it
+        //    dispatched anything is never part of that verdict - a queue can already be owned by a
+        //    loop whose deadline has not expired, or be waiting on admission for its next attempt.
         let snapshot = progress.snapshot(stall_after(), pull_deadline());
         if let Some(settled) = settled {
             pending = None;
-            match settled {
+            let verdict = match settled {
                 RepairOutcome::Routes(RouteRepairRound {
                     continuation,
                     terminal_attempts,
                     terminal_failures,
                 }) => {
+                    let unfinished = continuation.is_some();
                     repair = continuation.map(|topic| RepairCursor::Routes { after: Some(topic) });
-                    if repair.is_none() {
+                    match unfinished {
+                        // A bounded sweep that ran out of slice owes another round of the same work.
+                        true => SweepVerdict::Deferred,
                         // Only a completed attempt whose flight answered with failure speaks for
                         // the replacement allowance (plan 49e E3). A sweep
                         // can finish while every topic sat in a success
@@ -1128,32 +1133,36 @@ async fn run_incarnation(
                         // request. Equally, a fetch that succeeded but
                         // whose allocation/pull evidence has not caught up yet is not a
                         // failed fetch - the woken rebalance gets its own chance to apply it.
-                        match route_round_charge(route_repair_resolved(&snapshot), terminal_failures) {
-                            RoundCharge::Resolved => machine.note_repair_settled(true),
-                            RoundCharge::FailedFlight => machine.note_repair_settled(false),
+                        false => match route_round_charge(route_repair_resolved(&snapshot), terminal_failures) {
+                            RoundCharge::Resolved => SweepVerdict::Resolved,
+                            RoundCharge::FailedFlight => SweepVerdict::Unresolved,
                             RoundCharge::NoEvidence => {
                                 tracing::debug!(
                                     terminal_attempts,
                                     "route repair finished with no failed flight: the replacement allowance is \
                                      untouched"
                                 );
-                                machine.note_repair_deferred();
+                                SweepVerdict::Deferred
                             }
-                        }
+                        },
                     }
                 }
-                RepairOutcome::LostPull(round) => {
-                    // A round that ran out of budget names the queue it reached, and the next one
-                    // continues after it; only a sweep that finished reports to the budget,
-                    // including a completed sweep that dispatched nothing (plan 49e E3).
-                    repair = match round {
-                        RepairRound::Incomplete { after } => Some(RepairCursor::LostPull { after: Some(after) }),
-                        RepairRound::Complete { .. } => None,
-                    };
-                    if repair.is_none() {
-                        machine.note_repair_settled(snapshot.lost_pull_queues == 0);
+                RepairOutcome::LostPull(round) => match round {
+                    // A round that ran out of budget names the queue it reached and owes the rest;
+                    // only a sweep that finished judges the fault itself (plan 49e E3, plan 49f F1).
+                    RepairRound::Incomplete { after } => {
+                        repair = Some(RepairCursor::LostPull { after: Some(after) });
+                        SweepVerdict::Deferred
                     }
-                }
+                    RepairRound::Complete { .. } => sweep_verdict(false, repair_is_settled(&snapshot)),
+                },
+            };
+            match verdict {
+                SweepVerdict::Resolved => machine.note_repair_settled(true),
+                SweepVerdict::Unresolved => machine.note_repair_settled(false),
+                // Neither conclusion: the sweep is still owed work, so the replacement allowance
+                // stays exactly where it was.
+                SweepVerdict::Deferred => machine.note_repair_deferred(),
             }
         }
 
@@ -1166,6 +1175,43 @@ async fn run_incarnation(
             return IncarnationEnd::Replace;
         }
     }
+}
+
+/// What one finished repair round means for the replacement allowance (plan 49f F1).
+///
+/// The controller used to read "this round dispatched nothing and returned" as a conclusion. That
+/// conflated three different things: work that genuinely finished, a bounded step that ran out of
+/// time or channel capacity and still owes rounds, and a sweep that finished with the fault still
+/// standing. Only the last one may charge an attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SweepVerdict {
+    /// The work finished and its fault is gone.
+    Resolved,
+    /// A bounded step ran out of time or capacity; more rounds are owed for the same work, so
+    /// nothing is charged and nothing is resolved.
+    Deferred,
+    /// The sweep completed and a fault still stands (or a control-plane answer failed).
+    Unresolved,
+}
+
+/// The one rule by which a finished round becomes a verdict (plan 49f F1): a step that did not
+/// finish defers, and only a step that finished may resolve or charge. Live evidence decides the
+/// latter; how much work the round dispatched decides nothing.
+pub(crate) fn sweep_verdict(unfinished: bool, resolved: bool) -> SweepVerdict {
+    if unfinished {
+        SweepVerdict::Deferred
+    } else if resolved {
+        SweepVerdict::Resolved
+    } else {
+        SweepVerdict::Unresolved
+    }
+}
+
+/// Whether a finished lost-pull sweep leaves nothing lost. Queues whose next pull has been admitted
+/// and is queued, in flight or scheduled to continue count as settled (plan 49f F2); queues still
+/// without any expected work do not.
+pub(crate) fn repair_is_settled(snapshot: &ProgressSnapshot) -> bool {
+    snapshot.lost_pull_queues == 0
 }
 
 /// Where a retained repair continues from (plan 49c C2, plan 49d R3). Plain data on purpose: it
@@ -2421,5 +2467,33 @@ mod review49e_refresh {
         );
         assert_eq!(fix.client.route_refresh_guard.claimed_flights(), claimed + 1);
         fix.client.clone().shutdown().await;
+    }
+}
+
+/// Plan 49f F1 and F2: what a repair round is allowed to conclude.
+#[cfg(test)]
+mod review49f {
+    use super::*;
+
+    #[test]
+    fn controller_reports_a_slice_exhausted_round_as_deferred() {
+        assert_eq!(sweep_verdict(true, false), SweepVerdict::Deferred);
+        // A round that finished is judged by evidence alone...
+        assert_eq!(sweep_verdict(false, true), SweepVerdict::Resolved);
+        assert_eq!(sweep_verdict(false, false), SweepVerdict::Unresolved);
+    }
+
+    #[test]
+    fn a_round_that_dispatched_nothing_is_not_itself_a_conclusion() {
+        // The dispatched count is deliberately not an input to any verdict: a queue can already be
+        // owned by a live loop, or hold work that has just been admitted.
+        let mut snapshot = ProgressSnapshot::default();
+        assert!(repair_is_settled(&snapshot), "nothing lost is settled");
+        snapshot.lost_pull_queues = 1;
+        // Zero dispatches would have looked like progress; a queue without expected work has not
+        // been repaired.
+        assert!(!repair_is_settled(&snapshot));
+        snapshot.lost_pull_queues = 0;
+        assert!(repair_is_settled(&snapshot));
     }
 }

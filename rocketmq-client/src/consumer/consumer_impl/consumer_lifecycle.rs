@@ -1114,8 +1114,21 @@ impl ConsumerProgress {
             last_route_ok_ms: self.last_route_ok_ms.load(Ordering::Relaxed),
             last_route_miss_ms: self.last_route_miss_ms.load(Ordering::Relaxed),
             last_pull_ok_ms: self.last_pull_ok_ms.load(Ordering::Relaxed),
-            pull_route_miss_ms: self.pull_route_miss_ms.load(Ordering::Relaxed),
-            pull_rpc_timeout_ms: self.pull_rpc_timeout_ms.load(Ordering::Relaxed),
+            // The aggregate timestamps are the fallback for faults no tracked queue describes. Once
+            // every tracked queue that held one has gone - revoked, or reacquired under a new epoch -
+            // the timestamp is history and would keep escalating a replacement over work this
+            // incarnation no longer owns and cannot repair (plan 49f F1). The lifetime tallies above
+            // still report what happened.
+            pull_route_miss_ms: if route_miss_queues == 0 {
+                0
+            } else {
+                self.pull_route_miss_ms.load(Ordering::Relaxed)
+            },
+            pull_rpc_timeout_ms: if rpc_timeout_queues == 0 {
+                0
+            } else {
+                self.pull_rpc_timeout_ms.load(Ordering::Relaxed)
+            },
         }
     }
 }
@@ -3422,5 +3435,38 @@ mod review49e_evidence {
             crate::consumer::managed_consumer::ConsumerHealth::Degraded
         ));
         assert!(!effects.iter().any(|effect| matches!(effect, Effect::Repair(_))));
+    }
+}
+
+/// Plan 49f F1: a fault that no tracked queue still holds must stop being evidence.
+#[cfg(test)]
+mod review49f {
+    use super::*;
+
+    #[test]
+    fn revocation_must_retire_current_managed_failure_from_the_fallback() {
+        let p = ConsumerProgress::new();
+        let old = MessageQueue::from_parts("T", "old", 0);
+        let good = MessageQueue::from_parts("T", "good", 0);
+        p.note_queue_installed(&old);
+        let epoch = p.current_epoch(&old).unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(p.note_pull_failed_for(&old, Some(epoch), PullFailureKind::RouteOrBrokerMiss));
+        p.note_queue_revoked(&old);
+        p.note_queue_installed(&good);
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let (state, _) = machine.on_tick(&s, Duration::from_secs(35), 0.5);
+        eprintln!(
+            "revoked managed fault: tracked_faults={} aggregate_miss={} last_ok={} state={state:?}",
+            s.route_miss_queues, s.pull_route_miss_ms, s.last_pull_ok_ms
+        );
+        assert_eq!(s.route_miss_queues, 0);
+        assert_eq!(
+            state.reason,
+            Reason::None,
+            "revocation removed the queue fault but left it live in the aggregate fallback"
+        );
     }
 }
