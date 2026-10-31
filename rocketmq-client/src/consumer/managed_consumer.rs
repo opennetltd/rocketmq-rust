@@ -1027,6 +1027,11 @@ async fn run_incarnation(
     // it prepared.
     let mut repair: Option<RepairCursor> = None;
     let mut pending: Option<PendingRepair> = None;
+    // Terminal answers collected by the slices of the route sweep now in progress. Kept beside the
+    // cursor because a slice that ran out of time still owes topics, and its evidence belongs to
+    // the same sweep rather than to itself (plan 49f F1). It dies with this incarnation, so a
+    // cancelled sweep can never be carried into a replacement.
+    let mut route_evidence = SweepEvidence::default();
     loop {
         // 1. Start the next bounded pass only when none is in flight. Building a pass borrows the
         //    consumer for the length of this statement; what it returns holds cloned handles, so
@@ -1074,7 +1079,13 @@ async fn run_incarnation(
                     Effect::Repair(kind) => {
                         repair = Some(match kind {
                             RepairKind::LostPull => RepairCursor::LostPull { after: None },
-                            RepairKind::RouteAndPull | RepairKind::Assignment => RepairCursor::Routes { after: None },
+                            RepairKind::RouteAndPull | RepairKind::Assignment => {
+                                // A newly requested sweep starts from no evidence at all (plan 49f
+                                // F1 item 3): answers collected by
+                                // an earlier sweep belong to it alone.
+                                route_evidence = SweepEvidence::default();
+                                RepairCursor::Routes { after: None }
+                            }
                         });
                         break;
                     }
@@ -1119,33 +1130,33 @@ async fn run_incarnation(
                     terminal_attempts,
                     terminal_failures,
                 }) => {
+                    // This slice contributes to its sweep once and only once; the cursor still
+                    // names where the same sweep continues from (plan 49f F1
+                    // items 1 and 3).
+                    route_evidence.add(terminal_attempts, terminal_failures);
                     let unfinished = continuation.is_some();
                     repair = continuation.map(|topic| RepairCursor::Routes { after: Some(topic) });
-                    match unfinished {
-                        // A bounded sweep that ran out of slice owes another round of the same work.
-                        true => SweepVerdict::Deferred,
-                        // Only a completed attempt whose flight answered with failure speaks for
-                        // the replacement allowance (plan 49e E3). A sweep
-                        // can finish while every topic sat in a success
-                        // cooldown, behind a scheduled retry, or still joining one slow
-                        // owner's flight; charging those checks rolled an incarnation after four
-                        // rounds that had not issued a single nameserver
-                        // request. Equally, a fetch that succeeded but
-                        // whose allocation/pull evidence has not caught up yet is not a
-                        // failed fetch - the woken rebalance gets its own chance to apply it.
-                        false => match route_round_charge(route_repair_resolved(&snapshot), terminal_failures) {
-                            RoundCharge::Resolved => SweepVerdict::Resolved,
-                            RoundCharge::FailedFlight => SweepVerdict::Unresolved,
-                            RoundCharge::NoEvidence => {
-                                tracing::debug!(
-                                    terminal_attempts,
-                                    "route repair finished with no failed flight: the replacement allowance is \
-                                     untouched"
-                                );
-                                SweepVerdict::Deferred
-                            }
-                        },
+                    let verdict = route_sweep_verdict(
+                        unfinished,
+                        route_repair_resolved(&snapshot),
+                        route_evidence.terminal_failures,
+                    );
+                    if !unfinished {
+                        // The sweep is over: its conclusion has been reported, and the next one
+                        // starts from no evidence at all.
+                        route_evidence = SweepEvidence::default();
                     }
+                    if verdict == SweepVerdict::Deferred {
+                        // Nothing in this slice answered: every topic sat in a success cooldown,
+                        // behind a scheduled retry, or still joined one slow owner's flight.
+                        // Charging those rounds used to roll an incarnation after four checks that
+                        // had not issued a single nameserver request (plan 49e E3).
+                        tracing::debug!(
+                            terminal_attempts,
+                            "route repair reached no terminal answer: the replacement allowance is untouched"
+                        );
+                    }
+                    verdict
                 }
                 RepairOutcome::LostPull(round) => match round {
                     // A round that ran out of budget names the queue it reached and owes the rest;
@@ -1204,6 +1215,50 @@ pub(crate) fn sweep_verdict(unfinished: bool, resolved: bool) -> SweepVerdict {
         SweepVerdict::Resolved
     } else {
         SweepVerdict::Unresolved
+    }
+}
+
+/// What the slices of one route sweep answered (plan 49f F1).
+///
+/// A control-plane answer belongs to its **sweep**, not to whichever slice happened to have time
+/// for the last topic. Judging each round on its own counts threw away a failed fetch in an earlier
+/// topic whenever the topics behind it had nothing but cooldown evidence: the same failure was then
+/// re-fetched, re-deferred and discarded forever, so no allowance was ever spent and no replacement
+/// was ever reached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SweepEvidence {
+    /// Flights whose terminal answer this sweep received.
+    pub(crate) terminal_attempts: u32,
+    /// Terminal answers that said the fetch failed.
+    pub(crate) terminal_failures: u32,
+}
+
+impl SweepEvidence {
+    /// Fold one settled slice in (plan 49f F1 item 1). Called exactly once per settled pass - a
+    /// finished operation is taken out of `pending` before it is judged - so a status tick can
+    /// neither consume the same counts twice nor lose them.
+    pub(crate) fn add(&mut self, attempts: u32, failures: u32) {
+        self.terminal_attempts = self.terminal_attempts.saturating_add(attempts);
+        self.terminal_failures = self.terminal_failures.saturating_add(failures);
+    }
+}
+
+/// What a route sweep concluded (plan 49f F1).
+///
+/// Only a sweep that reached its last topic may conclude; an unfinished one still owes work and is
+/// deferred **with its evidence kept**. Within a finished sweep, resolution outranks failure - a
+/// refresh of another topic can fix the fault this sweep was asked about - while a failed flight
+/// anywhere in the sweep is one eligible failed sweep. A sweep in which no flight answered says
+/// nothing at all: waiting is not failing (plan 49e E3).
+pub(crate) fn route_sweep_verdict(unfinished: bool, resolved: bool, failures: u32) -> SweepVerdict {
+    if unfinished {
+        SweepVerdict::Deferred
+    } else {
+        match route_round_charge(resolved, failures) {
+            RoundCharge::Resolved => SweepVerdict::Resolved,
+            RoundCharge::FailedFlight => SweepVerdict::Unresolved,
+            RoundCharge::NoEvidence => SweepVerdict::Deferred,
+        }
     }
 }
 
@@ -2475,12 +2530,198 @@ mod review49e_refresh {
 mod review49f {
     use super::*;
 
+    use crate::consumer::consumer_impl::consumer_lifecycle::PullFailureKind;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+    use crate::factory::mq_client_instance::MQClientInstance;
+    use crate::factory::route_refresh_guard::BeginRefresh;
+    use cheetah_string::CheetahString;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+    use rocketmq_rust::ArcMut;
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failure_in_an_earlier_route_slice_must_reach_the_sweep_verdict() {
+        let policy = LifecyclePolicy {
+            progress_check: Duration::from_millis(10),
+            max_repairs_before_replace: 0,
+            ..Default::default()
+        };
+        let progress = ConsumerProgress::new();
+        let spec = ManagedConsumerSpec::new(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("review49f-sweep")
+                .subscribe("A", "*"),
+        )
+        .with_listener(Arc::new(|_, _| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)));
+        let mut consumer = spec.build_incarnation(progress.clone(), &policy).unwrap();
+        consumer.subscribe("Z", "*").unwrap();
+        let mut cc = consumer
+            .default_mqpush_consumer_impl
+            .as_ref()
+            .unwrap()
+            .client_config
+            .as_ref()
+            .clone();
+        cc.set_namesrv_addr(CheetahString::from_static_str("127.0.0.1:1"));
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49f-sweep-client", None);
+        consumer.default_mqpush_consumer_impl.as_mut().unwrap().client_instance = Some(client.clone());
+        let z = CheetahString::from_static_str("Z");
+        match client.route_refresh_guard.begin(&z) {
+            BeginRefresh::Fetch(mut ticket) => ticket.complete(true),
+            _ => panic!("fixture owns Z"),
+        };
+        let before = client.route_refresh_guard.claimed_flights();
+        let q = MessageQueue::from_parts("A", "broker", 0);
+        progress.note_queue_installed(&q);
+        progress.note_pull_failed(&q, PullFailureKind::RouteOrBrokerMiss);
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let initial = project(machine.state(), 1, &progress.snapshot(stall_after(), pull_deadline()));
+        let (status, _rx) = watch::channel(initial);
+        let (events, _ev) = broadcast::channel(128);
+        let publisher = StatusPublisher {
+            status,
+            events: Arc::new(events),
+        };
+        let stop = CancellationToken::new();
+        let effects = machine
+            .on_tick(&progress.snapshot(stall_after(), pull_deadline()), pull_deadline(), 0.5)
+            .1;
+        let lock = client.nameserver_lock();
+        let guard = lock.lock().await;
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(guard);
+        };
+        let controller = tokio::time::timeout(
+            Duration::from_millis(150),
+            run_incarnation(&mut consumer, &mut machine, &publisher, &stop, &progress, effects),
+        );
+        let (result, ()) = tokio::join!(controller, release);
+        let claims = client.route_refresh_guard.claimed_flights() - before;
+        eprintln!("multi-slice route sweep: result={result:?} new_flights={claims}");
+        client.shutdown().await;
+        assert!(claims > 0, "the prefix must contain real terminal work");
+        assert!(
+            matches!(result, Ok(IncarnationEnd::Replace)),
+            "the failed prefix was discarded when the final slice had only cooldown evidence"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_just_enqueued_repair_must_not_be_charged_as_a_failed_pull() {
+        let policy = LifecyclePolicy {
+            progress_check: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let progress = ConsumerProgress::new();
+        let spec = ManagedConsumerSpec::new(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("review49f-queued")
+                .subscribe("T", "*"),
+        )
+        .with_listener(Arc::new(|_, _| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)));
+        let mut consumer = spec.build_incarnation(progress.clone(), &policy).unwrap();
+        let cc = consumer
+            .default_mqpush_consumer_impl
+            .as_ref()
+            .unwrap()
+            .client_config
+            .as_ref()
+            .clone();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49f-queued-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        let inner = consumer.default_mqpush_consumer_impl.as_mut().unwrap();
+        inner.client_instance = Some(client.clone());
+        inner.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        inner.offset_store = Some(ArcMut::new(OffsetStore::new_with_remote(RemoteBrokerOffsetStore::new(
+            client.clone(),
+            CheetahString::from_static_str("review49f-queued"),
+        ))));
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        inner.offset_store.as_ref().unwrap().update_offset(&q, 7, false).await;
+        inner
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), Arc::new(ProcessQueue::new()));
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let initial = project(machine.state(), 1, &progress.snapshot(stall_after(), pull_deadline()));
+        let (status, _rx) = watch::channel(initial);
+        let (events, _ev) = broadcast::channel(128);
+        let publisher = StatusPublisher {
+            status,
+            events: Arc::new(events),
+        };
+        let stop = CancellationToken::new();
+        let effects = machine
+            .on_tick(&progress.snapshot(stall_after(), pull_deadline()), pull_deadline(), 0.5)
+            .1;
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_incarnation(&mut consumer, &mut machine, &publisher, &stop, &progress, effects),
+        )
+        .await;
+        let queued = capture.len();
+        let snapshot = progress.snapshot(stall_after(), pull_deadline());
+        eprintln!(
+            "newly enqueued repair: result={result:?} queued={queued} lost={} leased={}",
+            snapshot.lost_pull_queues, snapshot.leased_queues
+        );
+        client.shutdown().await;
+        assert_eq!(queued, 1, "one repair was admitted to the real channel");
+        assert!(
+            !matches!(result, Ok(IncarnationEnd::Replace)),
+            "an old progress timestamp spent the failure allowance before the queued pull had a chance to run"
+        );
+    }
+
     #[test]
     fn controller_reports_a_slice_exhausted_round_as_deferred() {
+        // A lost-pull step that ran out of budget still owes its own queues: nothing is charged and
+        // nothing is resolved.
         assert_eq!(sweep_verdict(true, false), SweepVerdict::Deferred);
         // A round that finished is judged by evidence alone...
         assert_eq!(sweep_verdict(false, true), SweepVerdict::Resolved);
         assert_eq!(sweep_verdict(false, false), SweepVerdict::Unresolved);
+    }
+
+    #[test]
+    fn a_failed_route_prefix_is_charged_when_its_sweep_completes() {
+        // Plan 49f F1: the failed fetch happened in an earlier slice; the slices behind it had only
+        // cooldown evidence. The sweep still ends as one eligible failed sweep...
+        assert_eq!(route_sweep_verdict(false, false, 1), SweepVerdict::Unresolved);
+        // ...resolution anywhere in the sweep still pays the debt (plan 49e E3)...
+        assert_eq!(route_sweep_verdict(false, true, 2), SweepVerdict::Resolved);
+        // ...an unfinished sweep defers whatever it collected so far...
+        assert_eq!(route_sweep_verdict(true, false, 3), SweepVerdict::Deferred);
+        // ...and a finished sweep in which no flight answered still charges nothing.
+        assert_eq!(route_sweep_verdict(false, false, 0), SweepVerdict::Deferred);
+    }
+
+    #[test]
+    fn each_route_slice_contributes_its_answers_exactly_once() {
+        let mut evidence = SweepEvidence::default();
+        evidence.add(1, 1);
+        assert_eq!(
+            evidence,
+            SweepEvidence {
+                terminal_attempts: 1,
+                terminal_failures: 1
+            },
+            "one failed flight in the first slice"
+        );
+        // A deferred final slice adds nothing and must not erase what came before it.
+        evidence.add(0, 0);
+        assert_eq!(evidence.terminal_failures, 1);
+        assert_eq!(
+            route_sweep_verdict(false, false, evidence.terminal_failures),
+            SweepVerdict::Unresolved
+        );
     }
 
     #[test]
