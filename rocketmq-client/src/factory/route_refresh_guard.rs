@@ -247,6 +247,14 @@ impl RouteRefreshGuard {
         }
     }
 
+    /// How many flights this guard has ever claimed (plan 49e E3, test-only). A deferred cooldown
+    /// or backoff check must claim none, and `len()` cannot show that because the topic keeps
+    /// its entry either way.
+    #[cfg(test)]
+    pub(crate) fn claimed_flights(&self) -> u64 {
+        self.state.next_generation.load(Ordering::Acquire)
+    }
+
     /// Number of topics holding refresh state; diagnostics and tests only.
     pub(crate) fn len(&self) -> usize {
         self.state.entries.lock().map(|guard| guard.len()).unwrap_or(0)

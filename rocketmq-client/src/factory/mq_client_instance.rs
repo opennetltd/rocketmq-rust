@@ -203,6 +203,85 @@ fn advertises_brokers(route: &TopicRouteData) -> bool {
         .any(|broker_data| !broker_data.broker_addrs().is_empty())
 }
 
+/// What one step of a miss-triggered route repair achieved (plan 49e E3).
+///
+/// The shared guard already distinguishes these cases internally; flattening them to a boolean
+/// at this boundary let the recovery controller read "nothing ran" as "an attempt failed", so a
+/// cooldown window, a scheduled retry or one slow owner's flight could spend every in-place
+/// repair allowance without any control-plane work finishing. A step therefore reports whether
+/// it received a **terminal** answer at all, separately from what that answer said.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteRepairStep {
+    /// This caller owned the fetch and it ended: `true` when the nameserver answered (applied,
+    /// unchanged or authoritatively empty), `false` when the attempt itself failed.
+    Fetched { succeeded: bool },
+    /// Joined the owner's flight and received its terminal answer.
+    Joined { succeeded: bool },
+    /// The join budget elapsed while the owner's flight still runs: no evidence either way, and
+    /// the next round may join it again.
+    StillJoining,
+    /// A recent successful refresh owns the cooldown window: the tables are as fresh as policy
+    /// allows and nothing was asked for.
+    Cooldown,
+    /// A failed attempt already scheduled the next one behind its retry window; asking now would
+    /// add a round trip the guard has deliberately deferred.
+    Backoff,
+    /// The flight this caller joined was replaced, or its topic was forgotten: another attempt owns
+    /// that topic now and this step learned nothing about its outcome.
+    Superseded,
+    /// The client is stopping; no wait and no further fetch are allowed.
+    Closed,
+}
+
+impl RouteRepairStep {
+    /// Variant name for logs and assertions.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            RouteRepairStep::Fetched { .. } => "fetched",
+            RouteRepairStep::Joined { .. } => "joined",
+            RouteRepairStep::StillJoining => "still_joining",
+            RouteRepairStep::Cooldown => "cooldown",
+            RouteRepairStep::Backoff => "backoff",
+            RouteRepairStep::Superseded => "superseded",
+            RouteRepairStep::Closed => "closed",
+        }
+    }
+
+    /// The flight's terminal answer, when this step received one. `None` means no control-plane
+    /// attempt finished here: a deferred check or an unfinished join cannot be charged as failed
+    /// work and cannot be counted as a success either (plan 49e E3).
+    ///
+    /// No separate flight identity has to travel with the answer for one result to be charged once:
+    /// a release records its outcome **and** opens that topic's retry window under the same lock,
+    /// so the next step against the same guard is `Backoff` until the window passes, and
+    /// anything after that claims a genuinely new generation.
+    pub(crate) fn terminal(self) -> Option<bool> {
+        match self {
+            RouteRepairStep::Fetched { succeeded } => Some(succeeded),
+            RouteRepairStep::Joined { succeeded } => Some(succeeded),
+            RouteRepairStep::StillJoining
+            | RouteRepairStep::Cooldown
+            | RouteRepairStep::Backoff
+            | RouteRepairStep::Superseded
+            | RouteRepairStep::Closed => None,
+        }
+    }
+
+    /// Whether the caller should re-check its own tables afterwards. This is the historical
+    /// boolean: a deferred check means the tables are as fresh as policy allows, so the caller
+    /// looks at what it has rather than issuing another round trip.
+    pub(crate) fn recheck(self) -> bool {
+        match self {
+            RouteRepairStep::Fetched { .. }
+            | RouteRepairStep::Joined { .. }
+            | RouteRepairStep::Cooldown
+            | RouteRepairStep::Backoff
+            | RouteRepairStep::Superseded => true,
+            RouteRepairStep::StillJoining | RouteRepairStep::Closed => false,
+        }
+    }
+}
+
 impl MQClientInstance {
     pub fn new(
         client_config: ClientConfig,
@@ -1533,6 +1612,19 @@ impl MQClientInstance {
     /// no further fetch are allowed. A joiner waits at most `join_budget` and never issues a
     /// second round trip.
     pub async fn repair_route_after_broker_miss(&mut self, topic: &CheetahString, join_budget: Duration) -> bool {
+        self.repair_route_after_broker_miss_step(topic, join_budget)
+            .await
+            .recheck()
+    }
+
+    /// The same repair keeping the guard's distinction that plan 49e E3 needs: a completed fetch, a
+    /// joined flight with its answer, a still-running owner's flight, and a deferred cooldown or
+    /// backoff check are four different pieces of evidence.
+    pub(crate) async fn repair_route_after_broker_miss_step(
+        &mut self,
+        topic: &CheetahString,
+        join_budget: Duration,
+    ) -> RouteRepairStep {
         match self.route_refresh_guard.begin(topic) {
             BeginRefresh::Fetch(mut ticket) => {
                 // The ticket owns the slot until it completes or drops, so a cancelled or
@@ -1547,14 +1639,16 @@ impl MQClientInstance {
                     .await;
                 // Cooldown is earned by answering, not only by changing something: an unchanged or
                 // authoritative-empty repair is still a completed refresh (plan 50 F7/F8).
-                ticket.complete(outcome.map(|outcome| outcome.succeeded()).unwrap_or(false));
-                true
+                let succeeded = outcome.map(|outcome| outcome.succeeded()).unwrap_or(false);
+                ticket.complete(succeeded);
+                RouteRepairStep::Fetched { succeeded }
             }
             BeginRefresh::Joining => {
                 // Wait for the owner's fetch, then re-check our own tables. The answer describes
                 // the flight this caller joined, so a timeout or someone else's
                 // outcome is never read as a refresh that happened for us (plan 49b
-                // R3).
+                // R3). An elapsed budget says nothing about the flight at all: it keeps running and
+                // remains joinable, which is not a failed attempt (plan 49e E3).
                 let answer = self.route_refresh_guard.await_flight(topic, join_budget).await;
                 if answer != FlightAnswer::Succeeded {
                     debug!(
@@ -1563,14 +1657,24 @@ impl MQClientInstance {
                         answer.kind()
                     );
                 }
-                answer.recheck()
+                match answer {
+                    FlightAnswer::Succeeded => RouteRepairStep::Joined { succeeded: true },
+                    // A flight that ended without an answer failed; a joiner whose own flight was
+                    // superseded or forgotten re-checks its tables but did not learn that this
+                    // fetch failed, so only `Succeeded`/`Failed` carry terminal evidence.
+                    FlightAnswer::Failed => RouteRepairStep::Joined { succeeded: false },
+                    FlightAnswer::Superseded => RouteRepairStep::Superseded,
+                    FlightAnswer::Timeout => RouteRepairStep::StillJoining,
+                    FlightAnswer::Closed => RouteRepairStep::Closed,
+                }
             }
             // A recent success means the tables are as fresh as the cooldown allows, and a recent
             // failure means the next attempt is already scheduled behind its own backoff window: in
             // both cases the caller re-checks what it has instead of adding another round trip
-            // (plan 49b R3).
-            BeginRefresh::Cooldown | BeginRefresh::Backoff(_) => true,
-            BeginRefresh::Closed => false,
+            // (plan 49b R3), and neither case is an attempt that finished (plan 49e E3).
+            BeginRefresh::Cooldown => RouteRepairStep::Cooldown,
+            BeginRefresh::Backoff(_) => RouteRepairStep::Backoff,
+            BeginRefresh::Closed => RouteRepairStep::Closed,
         }
     }
     async fn find_broker_version(&self, broker_name: &str, broker_addr: &str) -> i32 {

@@ -1353,6 +1353,17 @@ impl RecoveryMachine {
         }
     }
 
+    /// The controller reports a repair attempt that finished **without an answer to charge**: the
+    /// route work it pinned was deferred (a success owns the cooldown window, or a failed fetch has
+    /// already scheduled its retry) or is still owned by another caller's flight, and no flight of
+    /// this round said it failed (plan 49e E3).
+    ///
+    /// Such an attempt neither resolves a fault nor proves recovery impossible, so the allowance
+    /// stays exactly as it was. Charging deferred checks would turn a cooldown window or one slow
+    /// shared refresh into a guarded incarnation replacement with no evidence behind it; the next
+    /// eligibility instant asks again.
+    pub(crate) fn note_repair_deferred(&mut self) {}
+
     pub(crate) fn state(&self) -> MachineState {
         self.state
     }
@@ -2014,6 +2025,60 @@ mod tests {
                 "a resolved attempt cleared the accumulated failures: {effects:?}"
             );
         }
+    }
+
+    /// Plan 49e E3: a repair round whose route work was deferred - a success owns the cooldown
+    /// window, a failed fetch already scheduled its retry, or another caller's flight still runs -
+    /// finished with no answer to charge. Those rounds must never spend the replacement allowance,
+    /// while genuinely failed flights keep exhausting it exactly as before, deferrals interleaved
+    /// or not.
+    #[test]
+    fn deferred_repair_rounds_never_spend_the_replacement_budget() {
+        let policy = LifecyclePolicy::default();
+        let progress = ConsumerProgress::new();
+        assigned(&progress, 2);
+        for id in 0..2 {
+            progress.note_pull_failed(&queue("T", id), PullFailureKind::RouteOrBrokerMiss);
+        }
+        let snap = snapshot(&progress);
+
+        // Cooldown checks and unfinished joins, at any length: nothing accumulates.
+        let mut machine = RecoveryMachine::new(policy, 1);
+        for _ in 0..policy.max_repairs_before_replace * 20 {
+            machine.note_repair_deferred();
+            let (state, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+            assert_eq!(state.reason, Reason::RouteOrBrokerMiss);
+            assert!(
+                matches!(effects.first(), Some(Effect::Repair(RepairKind::RouteAndPull))),
+                "the fault still asks to be repaired in place: {effects:?}"
+            );
+        }
+
+        // Failed flights still spend it one at a time, and deferrals interleaved between them
+        // neither add to nor pay off the debt.
+        let mut machine = RecoveryMachine::new(policy, 1);
+        for spent in 0..policy.max_repairs_before_replace {
+            machine.note_repair_settled(false);
+            for _ in 0..4 {
+                machine.note_repair_deferred();
+                let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+                assert!(
+                    !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+                    "replacement came after only {spent} failed flights: {effects:?}"
+                );
+            }
+        }
+        let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+        assert!(
+            !effects.iter().any(|effect| matches!(effect, Effect::Stop { .. })),
+            "the allowance is spent by failed flights only, not by the deferrals between them"
+        );
+        machine.note_repair_settled(false);
+        let (_, effects) = machine.on_tick(&snap, Duration::from_secs(30), 0.5);
+        assert!(
+            matches!(effects.first(), Some(Effect::Stop { .. })),
+            "the failed flight that exhausts the allowance still rolls one guarded replacement: {effects:?}"
+        );
     }
 
     #[test]

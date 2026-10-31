@@ -640,6 +640,10 @@ impl MQPushConsumer for DefaultMQPushConsumer {
     }
 }
 
+/// How long a repair round waits on another caller's flight before moving on (plan 49d R3). The
+/// owner keeps running and a later round may join it again: waiting is not failing (plan 49e E3).
+pub(crate) const ROUTE_REPAIR_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A replacement is permitted only after `Complete`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsumerCleanup {
@@ -647,10 +651,29 @@ pub enum ConsumerCleanup {
     Incomplete,
 }
 
+/// What one route-repair round achieved (plan 49e E3).
+///
+/// A round can finish its sweep having done no control-plane work at all: every topic was inside a
+/// success cooldown, deferred behind a scheduled retry, or still waiting on another caller's
+/// flight. Reporting only "the sweep finished" let the controller charge those rounds as failed
+/// attempts and roll an incarnation after four checks that never reached a nameserver, while a
+/// genuinely failing fetch looks the same in the snapshot. So the round carries its own evidence:
+/// how many flights gave this round a terminal answer, and how many of those answers said the fetch
+/// failed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RouteRepairRound {
+    /// The topic a later round continues after, or `None` when this sweep finished.
+    pub(crate) continuation: Option<CheetahString>,
+    /// Flights whose terminal answer this round received (fetched by us, or joined).
+    pub(crate) terminal_attempts: u32,
+    /// Terminal answers that said the fetch failed.
+    pub(crate) terminal_failures: u32,
+}
+
 /// One bounded route-repair pass, owned by whoever asked for it so it can be pinned and polled
-/// beside other work instead of blocking it (plan 49d R3). Resolves to the topic a later pass
-/// continues from, or `None` when the repair is finished.
-pub(crate) type RouteRepairPass = Pin<Box<dyn Future<Output = Option<CheetahString>> + Send>>;
+/// beside other work instead of blocking it (plan 49d R3). Resolves to where a later round
+/// continues plus what this round's own flights proved.
+pub(crate) type RouteRepairPass = Pin<Box<dyn Future<Output = RouteRepairRound> + Send>>;
 
 /// One bounded lost-pull repair pass. Resolves to whether anything is still lost.
 pub(crate) type LostPullRepairPass =
@@ -725,6 +748,9 @@ impl DefaultMQPushConsumer {
             // hands off at a step boundary and names what it reached, rather than starting another
             // bounded lookup on an exhausted round or claiming work it never did (plan 49e E3).
             let mut reached: Option<cheetah_string::CheetahString> = None;
+            // Terminal evidence collected from this round's own flights (plan 49e E3).
+            let mut terminal_attempts = 0u32;
+            let mut terminal_failures = 0u32;
             for (index, topic) in pending.iter().enumerate() {
                 if index > 0 && started.elapsed() >= slice {
                     instance.re_balance_immediately();
@@ -732,7 +758,11 @@ impl DefaultMQPushConsumer {
                         topic = %topic,
                         "route repair reached its time slice, continuing with the remaining topics on the next status round"
                     );
-                    return reached.or_else(|| resume.clone());
+                    return RouteRepairRound {
+                        continuation: reached.or_else(|| resume.clone()),
+                        terminal_attempts,
+                        terminal_failures,
+                    };
                 }
                 // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must
                 // not get route work for a subscription this consumer no longer holds.
@@ -743,17 +773,34 @@ impl DefaultMQPushConsumer {
                     );
                     continue;
                 }
-                let refreshed = instance
+                // The guard's own distinction is what the controller needs (plan 49e E3): a fetch
+                // that answered, a joined flight's answer, an owner whose flight still runs and a
+                // deferred cooldown/backoff check are not four equivalent attempts. Reducing them
+                // to one boolean charged work that never happened as failed work.
+                let step = instance
                     .as_mut()
-                    .repair_route_after_broker_miss(topic, Duration::from_millis(500))
+                    .repair_route_after_broker_miss_step(topic, ROUTE_REPAIR_JOIN_BUDGET)
                     .await;
-                reached = Some(topic.clone());
-                if !refreshed {
-                    tracing::debug!("managed consumer: route repair for one subscribed topic did not refresh");
+                match step.terminal() {
+                    Some(true) => terminal_attempts += 1,
+                    Some(false) => {
+                        terminal_attempts += 1;
+                        terminal_failures += 1;
+                    }
+                    None => tracing::debug!(
+                        topic = %topic,
+                        route_step = step.kind(),
+                        "route repair for one subscribed topic reached no terminal answer this round"
+                    ),
                 }
+                reached = Some(topic.clone());
             }
             instance.re_balance_immediately();
-            None
+            RouteRepairRound {
+                continuation: None,
+                terminal_attempts,
+                terminal_failures,
+            }
         }))
     }
 

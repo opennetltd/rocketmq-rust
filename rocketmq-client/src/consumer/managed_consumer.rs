@@ -56,6 +56,7 @@ use crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound
 use crate::consumer::default_mq_push_consumer::DefaultMQPushConsumer;
 use crate::consumer::default_mq_push_consumer::LostPullRepairPass;
 use crate::consumer::default_mq_push_consumer::RouteRepairPass;
+use crate::consumer::default_mq_push_consumer::RouteRepairRound;
 use crate::consumer::default_mq_push_consumer_builder::DefaultMQPushConsumerBuilder;
 use crate::consumer::listener::consume_concurrently_context::ConsumeConcurrentlyContext;
 use crate::consumer::listener::consume_concurrently_status::ConsumeConcurrentlyStatus;
@@ -1111,10 +1112,34 @@ async fn run_incarnation(
         if let Some(settled) = settled {
             pending = None;
             match settled {
-                RepairOutcome::Routes(next_topic) => {
-                    repair = next_topic.map(|topic| RepairCursor::Routes { after: Some(topic) });
+                RepairOutcome::Routes(RouteRepairRound {
+                    continuation,
+                    terminal_attempts,
+                    terminal_failures,
+                }) => {
+                    repair = continuation.map(|topic| RepairCursor::Routes { after: Some(topic) });
                     if repair.is_none() {
-                        machine.note_repair_settled(route_repair_resolved(&snapshot));
+                        // Only a completed attempt whose flight answered with failure speaks for
+                        // the replacement allowance (plan 49e E3). A sweep
+                        // can finish while every topic sat in a success
+                        // cooldown, behind a scheduled retry, or still joining one slow
+                        // owner's flight; charging those checks rolled an incarnation after four
+                        // rounds that had not issued a single nameserver
+                        // request. Equally, a fetch that succeeded but
+                        // whose allocation/pull evidence has not caught up yet is not a
+                        // failed fetch - the woken rebalance gets its own chance to apply it.
+                        match route_round_charge(route_repair_resolved(&snapshot), terminal_failures) {
+                            RoundCharge::Resolved => machine.note_repair_settled(true),
+                            RoundCharge::FailedFlight => machine.note_repair_settled(false),
+                            RoundCharge::NoEvidence => {
+                                tracing::debug!(
+                                    terminal_attempts,
+                                    "route repair finished with no failed flight: the replacement allowance is \
+                                     untouched"
+                                );
+                                machine.note_repair_deferred();
+                            }
+                        }
                     }
                 }
                 RepairOutcome::LostPull(round) => {
@@ -1185,12 +1210,38 @@ impl Future for PendingRepair {
 
 /// What a pinned repair pass reported when it settled.
 enum RepairOutcome {
-    /// The route pass ended; `Some(topic)` means its slice ran out and the next pass continues
-    /// there.
-    Routes(Option<cheetah_string::CheetahString>),
+    /// The route pass ended, with where a later round continues (if its slice ran out) and what its
+    /// own flights proved (plan 49e E3).
+    Routes(RouteRepairRound),
     /// The lost-pull pass ended, reporting either a finished sweep or the queue the next round
     /// continues after.
     LostPull(RepairRound),
+}
+
+/// What one finished route-repair round does to the replacement allowance (plan 49e E3). Kept apart
+/// from the controller loop so the rule itself is testable without a clock or a nameserver: what
+/// counts as failed work is exactly the question this plan turned on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoundCharge {
+    /// The faults this repair addresses are gone; earlier fruitless attempts are paid off.
+    Resolved,
+    /// A flight answered that the control-plane operation failed: one charge against the allowance.
+    FailedFlight,
+    /// Nothing in this round said recovery is impossible - every topic was deferred or still
+    /// joining, or a refresh succeeded while its allocation/pull evidence has not caught up
+    /// yet. A successful fetch followed by a stale snapshot is not a failed fetch: the woken
+    /// rebalance gets its own chance to apply it on a later tick.
+    NoEvidence,
+}
+
+fn route_round_charge(resolved: bool, terminal_failures: u32) -> RoundCharge {
+    if resolved {
+        RoundCharge::Resolved
+    } else if terminal_failures > 0 {
+        RoundCharge::FailedFlight
+    } else {
+        RoundCharge::NoEvidence
+    }
 }
 
 /// Whether a finished route repair cleared the faults it addresses (a failed allocation, a queue
@@ -1865,10 +1916,16 @@ mod tests {
 
         // One topic per round: a zero slice must stop between topics and hand back where it
         // stopped.
-        let cursor = consumer
+        let first_round = consumer
             .route_repair_pass(None, Duration::ZERO)
             .expect("a client instance is attached")
-            .await
+            .await;
+        assert_eq!(
+            first_round.terminal_attempts, 1,
+            "the one topic this round asked for gave it a terminal answer"
+        );
+        let cursor = first_round
+            .continuation
             .expect("two subscriptions cannot both fit in a zero-length slice");
         assert_eq!(
             cursor, retry_topic,
@@ -1898,7 +1955,7 @@ mod tests {
             .route_repair_pass(Some(cursor.clone()), Duration::from_secs(30))
             .expect("a client instance is attached")
             .await;
-        assert!(finished.is_none(), "the cursor pass finishes the repair");
+        assert!(finished.continuation.is_none(), "the cursor pass finishes the repair");
         assert_eq!(
             client.route_refresh_guard.len(),
             2,
@@ -2094,5 +2151,275 @@ mod tests {
         drop(lease);
         stopper.abort();
         held.abort();
+    }
+}
+
+/// Plan 49e E3: deferred or still-running shared refreshes consume failed-attempt allowance.
+///
+/// The route repair pass reduces per-topic control-plane work to "the sweep finished", and the
+/// controller charged every such round against the replacement allowance. A cooldown window, a
+/// scheduled retry after one failure, and a join whose owner is still fetching are three kinds of
+/// *no terminal answer*: none of them says this consumer cannot recover, yet together they rolled
+/// an incarnation four checks in - with no nameserver request issued at all. These tests drive the
+/// real controller loop against the real shared refresh guard.
+#[cfg(test)]
+mod review49e_refresh {
+    use super::*;
+    use crate::consumer::consumer_impl::consumer_lifecycle::PullFailureKind;
+    use crate::factory::mq_client_instance::MQClientInstance;
+    use crate::factory::route_refresh_guard::BeginRefresh;
+    use cheetah_string::CheetahString;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+
+    struct Fixture {
+        consumer: DefaultMQPushConsumer,
+        client: rocketmq_rust::ArcMut<MQClientInstance>,
+        progress: Arc<ConsumerProgress>,
+    }
+
+    /// A managed incarnation with a client instance of its own and no reachable nameserver, so the
+    /// only control-plane work that happens is the work a repair round itself claims.
+    fn fixture(group: &str, policy: &LifecyclePolicy) -> Fixture {
+        let progress = ConsumerProgress::new();
+        let spec = ManagedConsumerSpec::new(
+            DefaultMQPushConsumer::builder()
+                .consumer_group(group)
+                .subscribe("T", "*"),
+        )
+        .with_listener(Arc::new(|_, _| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)));
+        let mut consumer = spec
+            .build_incarnation(progress.clone(), policy)
+            .expect("a valid managed spec builds an incarnation");
+        let client = {
+            let inner = consumer.default_mqpush_consumer_impl.as_mut().unwrap();
+            let config = crate::base::client_config::ClientConfig {
+                namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:1")),
+                ..Default::default()
+            };
+            let client = MQClientInstance::new_arc(config, 0, format!("{group}-client"), None);
+            inner.client_instance = Some(client.clone());
+            client
+        };
+        Fixture {
+            consumer,
+            client,
+            progress,
+        }
+    }
+
+    /// Run the controller loop with one owned queue whose pull failed for a route/broker miss. The
+    /// fault never clears, so every round asks for the same repair; only how that round is
+    /// *accounted* differs.
+    async fn drive(
+        fix: &mut Fixture,
+        policy: LifecyclePolicy,
+        limit: Duration,
+    ) -> Result<IncarnationEnd, tokio::time::error::Elapsed> {
+        let queue = MessageQueue::from_parts("T", "broker", 0);
+        fix.progress.note_queue_installed(&queue);
+        fix.progress
+            .note_pull_failed(&queue, PullFailureKind::RouteOrBrokerMiss);
+        let snapshot = fix.progress.snapshot(stall_after(), pull_deadline());
+        assert_eq!(snapshot.route_miss_queues, 1, "the fixture must start with a fault");
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let (status, _rx) = watch::channel(project(machine.state(), 1, &snapshot));
+        let (events, _ev) = broadcast::channel(128);
+        let publisher = StatusPublisher {
+            status,
+            events: Arc::new(events),
+        };
+        let stop = CancellationToken::new();
+        let effects = machine.on_tick(&snapshot, pull_deadline(), 0.5).1;
+        tokio::time::timeout(
+            limit,
+            run_incarnation(
+                &mut fix.consumer,
+                &mut machine,
+                &publisher,
+                &stop,
+                &fix.progress,
+                effects,
+            ),
+        )
+        .await
+    }
+
+    /// One failed flight schedules a retry window. Repair rounds inside that window check the guard
+    /// and come back; they must not be read as four completed attempts (the reviewer's
+    /// reproduction: 5 ms cadence, no refresh possible).
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_backoff_must_not_be_charged_as_completed_failed_attempts() {
+        let policy = LifecyclePolicy {
+            progress_check: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let mut fix = fixture("review49e-backoff", &policy);
+        let topic = CheetahString::from_static_str("T");
+        match fix.client.route_refresh_guard.begin(&topic) {
+            BeginRefresh::Fetch(mut ticket) => ticket.complete(false),
+            other => panic!("first caller must own the flight, got {}", other.kind()),
+        }
+        assert!(
+            matches!(fix.client.route_refresh_guard.begin(&topic), BeginRefresh::Backoff(_)),
+            "a failed flight must defer the next attempt"
+        );
+        let claimed = fix.client.route_refresh_guard.claimed_flights();
+
+        let result = drive(&mut fix, policy, Duration::from_millis(100)).await;
+        let still_backing_off = matches!(fix.client.route_refresh_guard.begin(&topic), BeginRefresh::Backoff(_));
+        let claimed_after = fix.client.route_refresh_guard.claimed_flights();
+        fix.client.clone().shutdown().await;
+
+        assert!(
+            still_backing_off,
+            "the repair rounds consumed the retry window they were told to wait out"
+        );
+        assert_eq!(
+            claimed_after, claimed,
+            "deferred checks issued nameserver flights they had no right to start"
+        );
+        assert!(
+            !matches!(result, Ok(IncarnationEnd::Replace)),
+            "no refresh ran, but deferred checks exhausted the replacement allowance: {result:?}"
+        );
+    }
+
+    /// The shared owner's flight is still running: joiners wait their bounded budget and move on.
+    /// That is neither a failed fetch nor a finished attempt, so at the default cadence six seconds
+    /// of joins must not roll an incarnation (the reviewer's reproduction).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_running_shared_refresh_must_not_spend_failed_attempts() {
+        let policy = LifecyclePolicy::default();
+        let mut fix = fixture("review49e-join", &policy);
+        let topic = CheetahString::from_static_str("T");
+        let ticket = match fix.client.route_refresh_guard.begin(&topic) {
+            BeginRefresh::Fetch(ticket) => ticket,
+            other => panic!("first caller must own the flight, got {}", other.kind()),
+        };
+        let claimed = fix.client.route_refresh_guard.claimed_flights();
+
+        let result = drive(&mut fix, policy, Duration::from_secs(6)).await;
+        let owner_still_running = matches!(fix.client.route_refresh_guard.begin(&topic), BeginRefresh::Joining);
+        let claimed_after = fix.client.route_refresh_guard.claimed_flights();
+        drop(ticket);
+        fix.client.clone().shutdown().await;
+
+        assert!(owner_still_running, "the owner's flight was cut short by joiners");
+        assert_eq!(
+            claimed_after, claimed,
+            "a second nameserver flight started beside the one still running"
+        );
+        assert!(
+            !matches!(result, Ok(IncarnationEnd::Replace)),
+            "the shared owner's attempt never settled, but join timeouts consumed the failed-attempt allowance: \
+             {result:?}"
+        );
+    }
+
+    /// A cooldown check is not an attempt that finished: the round reports no terminal evidence and
+    /// claims no flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cooldown_check_reports_no_terminal_work_and_claims_no_flight() {
+        let policy = LifecyclePolicy::default();
+        let mut fix = fixture("review49e-cooldown", &policy);
+        let topic = CheetahString::from_static_str("T");
+        match fix.client.route_refresh_guard.begin(&topic) {
+            BeginRefresh::Fetch(mut ticket) => ticket.complete(true),
+            other => panic!("first caller must own the flight, got {}", other.kind()),
+        }
+        assert!(matches!(
+            fix.client.route_refresh_guard.begin(&topic),
+            BeginRefresh::Cooldown
+        ));
+        let claimed = fix.client.route_refresh_guard.claimed_flights();
+
+        let round = fix
+            .consumer
+            .route_repair_pass(None, Duration::from_secs(30))
+            .expect("a client instance is attached")
+            .await;
+
+        assert!(round.continuation.is_none(), "one topic fits in any slice");
+        assert_eq!(
+            round.terminal_attempts, 0,
+            "a cooldown check finished no flight and must not be counted as one"
+        );
+        assert_eq!(round.terminal_failures, 0);
+        assert_eq!(
+            fix.client.route_refresh_guard.claimed_flights(),
+            claimed,
+            "the cooldown window was broken by a fetch it had no right to start"
+        );
+        fix.client.clone().shutdown().await;
+    }
+
+    /// Same for the retry window after a failed flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backoff_check_reports_no_terminal_work_and_claims_no_flight() {
+        let policy = LifecyclePolicy::default();
+        let mut fix = fixture("review49e-deferred", &policy);
+        let topic = CheetahString::from_static_str("T");
+        match fix.client.route_refresh_guard.begin(&topic) {
+            BeginRefresh::Fetch(mut ticket) => ticket.complete(false),
+            other => panic!("first caller must own the flight, got {}", other.kind()),
+        }
+        assert!(matches!(
+            fix.client.route_refresh_guard.begin(&topic),
+            BeginRefresh::Backoff(_)
+        ));
+        let claimed = fix.client.route_refresh_guard.claimed_flights();
+
+        let round = fix
+            .consumer
+            .route_repair_pass(None, Duration::from_secs(30))
+            .expect("a client instance is attached")
+            .await;
+
+        assert!(round.continuation.is_none());
+        assert_eq!(round.terminal_attempts, 0, "a deferred retry finished no flight");
+        assert_eq!(round.terminal_failures, 0);
+        assert_eq!(fix.client.route_refresh_guard.claimed_flights(), claimed);
+        fix.client.clone().shutdown().await;
+    }
+
+    /// The rule itself, apart from any clock or nameserver: resolution pays the debt, a failed
+    /// flight charges one attempt, and everything else - deferred checks, unfinished joins, a
+    /// successful refresh whose allocation/pull evidence has not caught up yet - charges
+    /// nothing.
+    #[test]
+    fn only_a_failed_flight_or_resolution_judges_a_round() {
+        assert_eq!(route_round_charge(true, 0), RoundCharge::Resolved);
+        // A round that fixed the faults pays off earlier ones even if a sibling topic failed.
+        assert_eq!(route_round_charge(true, 2), RoundCharge::Resolved);
+        assert_eq!(route_round_charge(false, 1), RoundCharge::FailedFlight);
+        assert_eq!(route_round_charge(false, 0), RoundCharge::NoEvidence);
+    }
+
+    /// Positive control: work that really ran and really failed is still reported as terminal, so
+    /// the controller keeps charging genuine failures exactly as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_flight_is_reported_as_terminal_work() {
+        let policy = LifecyclePolicy::default();
+        let mut fix = fixture("review49e-failed-flight", &policy);
+        let claimed = fix.client.route_refresh_guard.claimed_flights();
+
+        let round = tokio::time::timeout(
+            Duration::from_secs(20),
+            fix.consumer
+                .route_repair_pass(None, Duration::from_secs(30))
+                .expect("a client instance is attached"),
+        )
+        .await
+        .expect("the unreachable nameserver fails the fetch quickly");
+
+        assert!(round.continuation.is_none());
+        assert_eq!(round.terminal_attempts, 1, "one subscribed topic, one answered flight");
+        assert_eq!(
+            round.terminal_failures, 1,
+            "an unreachable nameserver is a completed attempt that failed"
+        );
+        assert_eq!(fix.client.route_refresh_guard.claimed_flights(), claimed + 1);
+        fix.client.clone().shutdown().await;
     }
 }
