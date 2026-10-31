@@ -324,8 +324,12 @@ struct QueueProgress {
     /// Not before this instant may the next attempt run: a scheduled retry or a deliberate flow
     /// control wait. Waiting is healthy until its own expectation fails (plan 49c C2).
     wait_until_ms: u64,
-    /// Newest failed outcome for this acquisition, compared against `last_progress_ms` so an old
-    /// failure cannot stay current forever.
+    /// When this acquisition last **answered a pull successfully**. Kept apart from
+    /// `last_progress_ms`, which any local activity refreshes, because only a newer successful pull
+    /// says the route or transport that failed has recovered (plan 49e E2).
+    last_pull_ok_ms: u64,
+    /// Newest failed outcome for this acquisition, compared against `last_pull_ok_ms` so an old
+    /// failure cannot stay current forever and no unrelated activity can retire it.
     failure_ms: u64,
     failure_kind: PullFailureKind,
 }
@@ -671,6 +675,9 @@ impl ConsumerProgress {
         self.last_pull_ok_ms.store(now, Ordering::Relaxed);
         if let Some(entry) = self.queues.write().get_mut(queue) {
             entry.last_progress_ms = now;
+            // The one event that retires a route or transport fault for this acquisition (plan 49e
+            // E2): the pull itself answered successfully.
+            entry.last_pull_ok_ms = now;
         }
     }
 
@@ -874,6 +881,7 @@ impl ConsumerProgress {
                     QueueProgress {
                         epoch,
                         last_progress_ms: now,
+                        last_pull_ok_ms: now,
                         pull_leased: false,
                         attempt_id: 0,
                         attempt_started_ms: 0,
@@ -1056,11 +1064,13 @@ impl ConsumerProgress {
             if standing.silent && !standing.waiting {
                 stalled_queues += 1;
             }
-            // A failure is current evidence only while nothing has completed since it (plan 49c
-            // C2). `>=` on purpose: a failure stamped in the same millisecond as the
-            // last completion is ambiguous, and guessing "fine" would drop a live fault
-            // for a whole tick.
-            if entry.failure_ms >= entry.last_progress_ms {
+            // A failure is current evidence only while no **successful pull** has answered this
+            // acquisition since (plan 49c C2, plan 49e E2): releasing delivery ownership, touching
+            // a queue, or another queue's response says nothing about whether pull
+            // routing recovered. `>=` on purpose: a failure stamped in the same
+            // millisecond as the last successful pull is ambiguous, and guessing "fine"
+            // would drop a live fault for a whole tick.
+            if entry.failure_ms >= entry.last_pull_ok_ms {
                 match entry.failure_kind {
                     PullFailureKind::RouteOrBrokerMiss => route_miss_queues += 1,
                     PullFailureKind::RpcTimeout => rpc_timeout_queues += 1,
@@ -1611,42 +1621,17 @@ impl RecoveryMachine {
             );
         }
 
-        // Expected waits: successful empty pulls, or an outstanding long poll inside its deadline.
-        if snapshot.pulls_empty > 0 && !snapshot.has_pending_work() && snapshot.stalled_queues == 0 {
-            self.stalled_repairs = 0;
-            self.state = MachineState {
-                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
-                reason: Reason::IdleNoMessages,
-            };
-            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-        }
-        if snapshot.pull_within_deadline(pull_deadline) {
-            self.stalled_repairs = 0;
-            self.state = MachineState {
-                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
-                reason: Reason::LongPollPending,
-            };
-            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-        }
-
-        // Pending work that is advancing: busy rather than blocked.
-        if snapshot.has_pending_work() {
-            self.stalled_repairs = 0;
-            self.state = MachineState {
-                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
-                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
-                reason: Reason::None,
-            };
-            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
-        }
-
-        // Transport and route faults come from what each acquisition's newest outcome was, or - for
-        // a queue we do not track - from the newest failure anywhere measured against the
-        // newest completed pull. Lifetime tallies are not evidence: a consumer that
-        // recovered a second ago must not stay faulty, and one unrelated counter moving
-        // must not hide a fault that is still standing (plan 49c C2).
+        // Transport and route faults come from what each acquisition's newest outcome was - a route
+        // or broker miss is repaired in place, an RPC timeout is only watched - and they are judged
+        // **before** any aggregate "everything is fine" answer below (plan 49e E2). A queue sitting
+        // in a scheduled retry keeps `stalled_queues` at zero, so judging these later let another
+        // queue's old empty pull, a live long poll elsewhere, or callbacks advancing on a different
+        // queue certify a consumer whose own newest answer was a failure. For queues this
+        // incarnation does not track at all, the aggregate timestamps remain as the
+        // fallback: the newest failure anywhere measured against the newest completed pull.
+        // Lifetime tallies are never evidence - a consumer that recovered a second ago must
+        // not stay faulty, and one unrelated counter moving must not hide a fault that is
+        // still standing (plan 49c C2).
         let transport_reason =
             if snapshot.route_miss_queues > 0 || snapshot.pull_route_miss_ms > snapshot.last_pull_ok_ms {
                 Some(Reason::RouteOrBrokerMiss)
@@ -1677,6 +1662,37 @@ impl RecoveryMachine {
                 self.state,
                 vec![Effect::Repair(repair), Effect::Idle(self.policy.progress_check)],
             );
+        }
+
+        // Expected waits: successful empty pulls, or an outstanding long poll inside its deadline.
+        if snapshot.pulls_empty > 0 && !snapshot.has_pending_work() && snapshot.stalled_queues == 0 {
+            self.stalled_repairs = 0;
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
+                reason: Reason::IdleNoMessages,
+            };
+            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
+        }
+        if snapshot.pull_within_deadline(pull_deadline) {
+            self.stalled_repairs = 0;
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
+                reason: Reason::LongPollPending,
+            };
+            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
+        }
+
+        // Pending work that is advancing: busy rather than blocked.
+        if snapshot.has_pending_work() {
+            self.stalled_repairs = 0;
+            self.state = MachineState {
+                phase: crate::consumer::managed_consumer::ConsumerPhase::Running,
+                health: crate::consumer::managed_consumer::ConsumerHealth::Healthy,
+                reason: Reason::None,
+            };
+            return (self.state, vec![Effect::Idle(self.policy.progress_check)]);
         }
 
         // A queue sitting in a scheduled retry or a deliberate flow control wait is healthy while
@@ -3069,6 +3085,63 @@ mod tests {
     }
 }
 
+mod review49e {
+    use super::*;
+    #[test]
+    fn a_siblings_empty_pull_must_not_hide_a_current_route_failure() {
+        let p = ConsumerProgress::new();
+        let good = MessageQueue::from_parts("T", "good", 0);
+        let bad = MessageQueue::from_parts("T", "bad", 0);
+        p.note_queue_installed(&good);
+        p.note_queue_installed(&bad);
+        p.note_pull_completed(&good, false);
+        p.note_pull_failed(&bad, PullFailureKind::RouteOrBrokerMiss);
+        p.note_queue_wait(&bad, Duration::from_secs(3));
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        let mut m = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        m.on_start_result(true, false, false, 0.5);
+        let (state, effects) = m.on_tick(&s, Duration::from_secs(35), 0.5);
+        eprintln!(
+            "current queue fault: route_miss_queues={} state={state:?} effects={effects:?}",
+            s.route_miss_queues
+        );
+        assert_eq!(s.route_miss_queues, 1);
+        assert_eq!(
+            state.reason,
+            Reason::RouteOrBrokerMiss,
+            "a historical empty pull certified another queue's current failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review49e_delivery {
+    use super::*;
+    #[test]
+    fn releasing_delivery_ownership_must_not_clear_a_pull_route_failure() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        p.note_queue_installed(&q);
+        p.note_pull_failed(&q, PullFailureKind::RouteOrBrokerMiss);
+        assert_eq!(
+            p.snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .route_miss_queues,
+            1
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        drop(p.admit_batch(&q, 1));
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "delivery release after a route failure: route_miss_queues={} pulls_completed={}",
+            s.route_miss_queues, s.pulls_completed
+        );
+        assert_eq!(
+            s.route_miss_queues, 1,
+            "delivery bookkeeping is not a successful pull response"
+        );
+    }
+}
+
 /// Plan 49e E1: whose evidence a report may become is decided under the same lock that writes it,
 /// so no interleaving between a revoke and a reinstall can let retired work stamp the replacement.
 #[cfg(test)]
@@ -3131,5 +3204,157 @@ mod review49e_acquisition {
             "exactly one pull loop may hold this queue"
         );
         drop(lease);
+    }
+}
+
+/// Plan 49e E2: a queue's own current transport fault is judged before any aggregate healthy
+/// answer, and only a successful pull of the same acquisition retires it.
+#[cfg(test)]
+mod review49e_evidence {
+    use super::*;
+
+    fn new_machine() -> RecoveryMachine {
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_start_result(true, false, false, 0.5);
+        machine
+    }
+
+    #[test]
+    fn a_current_route_failure_stands_beside_a_live_long_poll() {
+        let progress = ConsumerProgress::new();
+        let good = MessageQueue::from_parts("T", "good", 0);
+        let bad = MessageQueue::from_parts("T", "bad", 0);
+        progress.note_queue_installed(&good);
+        progress.note_queue_installed(&bad);
+        // A sibling that answered empty and is now sitting in a long poll inside its own deadline.
+        progress.note_pull_completed(&good, false);
+        let lease = progress.acquire_pull_lease(&good).unwrap();
+        progress.begin_pull_attempt(&good, lease.epoch(), Duration::from_secs(30));
+        // This queue's newest answer was a route miss and it is waiting on a scheduled retry.
+        progress.note_pull_failed(&bad, PullFailureKind::RouteOrBrokerMiss);
+        progress.note_queue_wait(&bad, Duration::from_secs(3));
+
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.route_miss_queues, 1);
+        assert!(snapshot.waiting_queues > 0, "the failed queue waits on purpose");
+        let mut machine = new_machine();
+        let (state, effects) = machine.on_tick(&snapshot, Duration::from_secs(35), 0.5);
+        eprintln!("mixed queues: reason={:?} effects={:?}", state.reason, effects);
+        assert_eq!(state.reason, Reason::RouteOrBrokerMiss);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Repair(RepairKind::RouteAndPull))
+        ));
+    }
+
+    #[test]
+    fn an_rpc_timeout_stands_beside_advancing_callbacks() {
+        let progress = ConsumerProgress::new();
+        let bad = MessageQueue::from_parts("T", "bad", 0);
+        let busy = MessageQueue::from_parts("T", "busy", 0);
+        progress.note_queue_installed(&bad);
+        progress.note_queue_installed(&busy);
+        // Work is outstanding on this queue while its callbacks keep advancing: the listener call
+        // returned and the batch sits in the commit phase.
+        let mut owner = progress.admit_batch(&busy, 3);
+        owner.enter_listener();
+        owner.leave_listener();
+        // Another queue's newest answer was an RPC timeout.
+        progress.note_pull_failed(&bad, PullFailureKind::RpcTimeout);
+
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert!(snapshot.has_pending_work());
+        let mut machine = new_machine();
+        let (state, effects) = machine.on_tick(&snapshot, Duration::from_secs(35), 0.5);
+        eprintln!("advancing callbacks: reason={:?} effects={:?}", state.reason, effects);
+        assert_eq!(state.reason, Reason::RpcTimeout);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Repair(RepairKind::RouteAndPull))
+        ));
+        drop(owner);
+    }
+
+    #[test]
+    fn only_a_successful_pull_or_a_revocation_retires_the_fault() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        progress.note_queue_installed(&q);
+        progress.note_pull_failed(&q, PullFailureKind::RouteOrBrokerMiss);
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .route_miss_queues,
+            1
+        );
+
+        // Local activity of every kind leaves the fault standing (plan 49e E2).
+        std::thread::sleep(Duration::from_millis(2));
+        progress.touch(&q);
+        drop(progress.admit_batch(&q, 1));
+        let mut owner = progress.admit_batch(&q, 1);
+        owner.enter_listener();
+        owner.leave_listener();
+        drop(owner);
+        progress.note_queue_installed(&q);
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.route_miss_queues, 1, "none of this answered a pull");
+
+        // The same acquisition answering a pull successfully retires it.
+        std::thread::sleep(Duration::from_millis(2));
+        progress.note_pull_completed(&q, true);
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.route_miss_queues, 0);
+
+        // And a revoked queue stops being evidence the moment it leaves this incarnation.
+        progress.note_pull_failed(&q, PullFailureKind::RpcTimeout);
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .rpc_timeout_queues,
+            1
+        );
+        progress.note_queue_revoked(&q);
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.rpc_timeout_queues, 0);
+        assert_eq!(snapshot.assigned_queues, 0);
+    }
+
+    #[test]
+    fn healthy_idle_and_deliberate_waits_stay_quiet() {
+        // Successful empty pulls and nothing outstanding: idle, with no repair requested.
+        let progress = ConsumerProgress::new();
+        for id in 0..2 {
+            let q = MessageQueue::from_parts("T", "broker", id);
+            progress.note_queue_installed(&q);
+            progress.note_pull_completed(&q, false);
+        }
+        let mut machine = new_machine();
+        let (state, effects) = machine.on_tick(
+            &progress.snapshot(Duration::from_secs(30), Duration::from_secs(35)),
+            Duration::from_secs(35),
+            0.5,
+        );
+        assert_eq!(state.reason, Reason::IdleNoMessages);
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::Repair(_))));
+
+        // Queues sitting in scheduled retries with no failure of their own: waiting, not faulty.
+        let progress = ConsumerProgress::new();
+        for id in 0..2 {
+            let q = MessageQueue::from_parts("T", "broker", id);
+            progress.note_queue_installed(&q);
+            progress.note_pull_completed(&q, false);
+            progress.note_queue_wait(&q, Duration::from_secs(3));
+        }
+        let mut machine = new_machine();
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.route_miss_queues, 0);
+        let (state, effects) = machine.on_tick(&snapshot, Duration::from_secs(35), 0.5);
+        eprintln!("quiet waits: reason={:?} effects={:?}", state.reason, effects);
+        assert!(!matches!(
+            state.health,
+            crate::consumer::managed_consumer::ConsumerHealth::Degraded
+        ));
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::Repair(_))));
     }
 }
