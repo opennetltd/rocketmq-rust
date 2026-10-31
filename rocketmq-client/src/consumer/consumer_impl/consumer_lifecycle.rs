@@ -695,18 +695,48 @@ impl ConsumerProgress {
 
     /// A successful pull, including an empty one, is progress for that queue.
     pub(crate) fn note_pull_completed(&self, queue: &MessageQueue, found_message: bool) {
+        self.record_pull_completion(queue, None, found_message);
+    }
+
+    /// Record a pull that **answered successfully for the acquisition that issued it** (plan 49f
+    /// F3).
+    ///
+    /// A success is the one answer that retires this queue's route or transport fault, so it has to
+    /// name its owner: identity is checked inside the same map write lock that mutates the
+    /// evidence. Checking ownership earlier and writing by key alone let an answer decoded
+    /// before a revoke land on the acquisition installed after it - clearing the new owner's
+    /// fault with work the old one had finished. `None` means the reporter carries no
+    /// acquisition identity, which is how consumers without SDK-owned assignment keep their
+    /// existing behaviour.
+    pub(crate) fn note_pull_completed_for(
+        &self,
+        queue: &MessageQueue,
+        epoch: Option<u64>,
+        found_message: bool,
+    ) -> bool {
+        self.record_pull_completion(queue, epoch, found_message)
+    }
+
+    fn record_pull_completion(&self, queue: &MessageQueue, epoch: Option<u64>, found_message: bool) -> bool {
+        // History first and unconditionally: a completed pull is a fact about the past whatever it
+        // was issued under. What attribution decides is only whether it speaks for current work.
         self.bump(&self.pulls_completed);
         if !found_message {
             self.bump(&self.pulls_empty);
         }
         let now = get_current_millis();
         self.last_pull_ms.store(now, Ordering::Relaxed);
-        self.last_pull_ok_ms.store(now, Ordering::Relaxed);
-        if let Some(entry) = self.queues.write().get_mut(queue) {
-            entry.last_progress_ms = now;
-            // The one event that retires a route or transport fault for this acquisition (plan 49e
-            // E2): the pull itself answered successfully.
-            entry.last_pull_ok_ms = now;
+        let mut queues = self.queues.write();
+        match queues.get_mut(queue) {
+            Some(entry) if epoch.is_none_or(|epoch| entry.epoch == epoch) => {
+                entry.last_progress_ms = now;
+                // The one event that retires a route or transport fault for this acquisition (plan
+                // 49e E2): the pull itself answered successfully.
+                entry.last_pull_ok_ms = now;
+                self.last_pull_ok_ms.store(now, Ordering::Relaxed);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -740,7 +770,13 @@ impl ConsumerProgress {
                     QueueEvidence::Current
                 }
                 Some(_) => QueueEvidence::Expired,
-                // Nothing tracks this queue, so only the aggregate fallback can describe it.
+                // Nothing tracks this queue any more. A report that still names an acquisition can
+                // only come from one that has ended - revocation removes the entry - so it is expired
+                // for the same reason a stale row is: history, never fallback health for the queues
+                // this incarnation does own (plan 49f F3 item 3).
+                None if epoch.is_some() => QueueEvidence::Expired,
+                // A report with no acquisition identity describes a queue nothing tracks, which is the
+                // only thing the aggregate fallback exists to describe.
                 None => QueueEvidence::Untracked,
             }
         };
@@ -3502,6 +3538,18 @@ impl ConsumerProgress {
     /// Test seam (plan 49f): make this queue's recorded completion older by `age`, so a test can
     /// put a queue past its stall allowance without sleeping for it. Ownership, attempts and
     /// waits are left exactly as they are - only the memory of the last completed pull moves.
+    /// Test seam (plan 49f F3): read an aggregate fallback timestamp **before** snapshot
+    /// attribution retires it. A test needs this to tell "that report was history" apart from
+    /// "no tracked queue holds that fault any more", which the snapshot reports as the same
+    /// zero.
+    pub(crate) fn review49f_aggregate_fault_ms(&self, kind: PullFailureKind) -> u64 {
+        match kind {
+            PullFailureKind::RouteOrBrokerMiss => self.pull_route_miss_ms.load(Ordering::Relaxed),
+            PullFailureKind::RpcTimeout => self.pull_rpc_timeout_ms.load(Ordering::Relaxed),
+            PullFailureKind::Other => 0,
+        }
+    }
+
     pub(crate) fn review49f_age_activity(&self, queue: &MessageQueue, age: Duration) {
         let mut queues = self.queues.write();
         if let Some(entry) = queues.get_mut(queue) {
@@ -3514,6 +3562,85 @@ impl ConsumerProgress {
 #[cfg(test)]
 mod review49f {
     use super::*;
+
+    #[test]
+    fn a_stale_success_cannot_retire_the_current_acquisitions_fault() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        p.note_queue_installed(&q);
+        let stale = p.current_epoch(&q).unwrap();
+        p.note_queue_revoked(&q);
+        p.note_queue_installed(&q);
+        let current = p.current_epoch(&q).unwrap();
+        assert_ne!(stale, current, "reacquisition mints a new identity");
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(p.note_pull_failed_for(&q, Some(current), PullFailureKind::RouteOrBrokerMiss));
+
+        // An answer decoded before the revoke, recorded after the reinstall: it belongs to an ended
+        // acquisition and may not clear the fault its replacement now carries.
+        assert!(!p.note_pull_completed_for(&q, Some(stale), true));
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            s.route_miss_queues, 1,
+            "a late success for an expired acquisition retired the current owner's fault"
+        );
+
+        // The same answer from the owning acquisition retires it (plan 49e E2 unchanged) - and only
+        // once it is unambiguously newer than the failure it answers.
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(p.note_pull_completed_for(&q, Some(current), true));
+        assert_eq!(
+            p.snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .route_miss_queues,
+            0
+        );
+    }
+
+    #[test]
+    fn an_expired_report_without_an_entry_is_not_fallback_evidence() {
+        let p = ConsumerProgress::new();
+        let gone = MessageQueue::from_parts("T", "gone", 0);
+        let tracked = MessageQueue::from_parts("T", "tracked", 0);
+        p.note_queue_installed(&gone);
+        let stale_epoch = p.current_epoch(&gone).unwrap();
+        p.note_queue_revoked(&gone);
+        // Another queue keeps a route fault, so the aggregate fallback stays live for that family
+        // and cannot be zeroed by retirement: only classification can keep this report out
+        // of it.
+        p.note_queue_installed(&tracked);
+        let epoch = p.current_epoch(&tracked).unwrap();
+        assert!(p.note_pull_failed_for(&tracked, Some(epoch), PullFailureKind::RouteOrBrokerMiss));
+
+        // A timeout reported by the revoked queue's own late answer: history, never a fault.
+        assert!(!p.note_pull_failed_for(&gone, Some(stale_epoch), PullFailureKind::RpcTimeout));
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "expired report after revocation: tracked_faults={} aggregate_miss={} aggregate_timeout={}",
+            s.route_miss_queues, s.pull_route_miss_ms, s.pull_rpc_timeout_ms
+        );
+        assert_eq!(s.route_miss_queues, 1);
+        assert_eq!(
+            s.rpc_timeout_queues, 0,
+            "an expired tracked request became fallback evidence for an untracked queue"
+        );
+        // The raw fallback stamp is what classification decides. The snapshot retires an aggregate
+        // no tracked queue holds (plan 49f F1), so only this shows whether the report was
+        // treated as history rather than as a fault on some untracked queue.
+        assert_eq!(
+            p.review49f_aggregate_fault_ms(PullFailureKind::RpcTimeout),
+            0,
+            "an expired tracked request renewed the aggregate fault timestamp health reads"
+        );
+
+        // Positive control: a report that names no acquisition still describes an untracked queue
+        // and stays allowed to fault the fallback (plan 49f F3 item 3 keeps legacy
+        // behaviour intact).
+        p.note_pull_failed(&MessageQueue::from_parts("T", "legacy", 0), PullFailureKind::RpcTimeout);
+        assert!(
+            p.review49f_aggregate_fault_ms(PullFailureKind::RpcTimeout) > 0,
+            "untracked legacy failures stopped being fallback evidence"
+        );
+    }
 
     #[test]
     fn revocation_must_retire_current_managed_failure_from_the_fallback() {

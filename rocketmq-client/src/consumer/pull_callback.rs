@@ -235,9 +235,16 @@ impl PullCallback for DefaultPullCallback {
                     .msg_found_list
                     .as_ref()
                     .is_some_and(|list| !list.is_empty());
-            push_consumer_impl
-                .progress
-                .note_pull_completed(&message_queue_inner, found);
+            // Plan 49f F3: the answer names the acquisition it belongs to, so the write itself is
+            // attributed rather than landing on whichever acquisition occupies the key. The
+            // entry-point ownership check above stops shared effects early; this closes
+            // the window between that check and this write, where a revoke and
+            // reinstall can land while another task decodes.
+            push_consumer_impl.progress.note_pull_completed_for(
+                &message_queue_inner,
+                pull_request.lease_epoch(),
+                found,
+            );
         }
         match pull_result_ext.pull_result.pull_status {
             PullStatus::Found => {
