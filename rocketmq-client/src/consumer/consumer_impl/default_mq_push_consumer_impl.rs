@@ -5229,7 +5229,7 @@ mod review49h_identity {
         push.subscribe(CheetahString::from_static_str("T"), CheetahString::from_static_str("*"))
             .await
             .unwrap();
-        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-dequeue-client", None);
+        let client = MQClientInstance::new_arc(cc, 0, "review49h-dequeue-client", None);
         push.client_instance = Some(client.clone());
         push.pull_api_wrapper = Some(ArcMut::new(PullAPIWrapper::new(client.clone(), group.clone(), false)));
         *push.service_state = ServiceState::Running;
