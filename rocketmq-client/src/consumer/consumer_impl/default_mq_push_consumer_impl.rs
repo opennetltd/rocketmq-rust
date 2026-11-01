@@ -1460,6 +1460,12 @@ impl DefaultMQPushConsumerImpl {
             service.execute_pull_request_immediately(pull_request).await;
             return Admission::Accepted;
         }
+        // Ownership first (plan 49g G1): a request that reaches the channel without it leaves its
+        // queue readable only as a lost pull, however healthy the hand-off is.
+        let mut pull_request = pull_request;
+        if pull_request.lease().is_none() && !self.adopt_dispatch_lease(&mut pull_request) {
+            return Admission::Superseded;
+        }
         let cancellation = self.work.cancellation();
         service
             .admit_pull_request(pull_request, tokio::time::Instant::now() + budget, Some(&cancellation))
@@ -1467,6 +1473,17 @@ impl DefaultMQPushConsumerImpl {
     }
     pub fn execute_pull_request_later(&mut self, pull_request: PullRequest, time_delay: u64) {
         if self.work.is_closed() {
+            return;
+        }
+        // A delayed request owns its queue from the moment the wait is scheduled (plan 49g G1): the
+        // timer is this loop's own expectation, and work that will run must not read as a loop that
+        // stopped. Adopting here also lets the wait below be recorded for the acquisition that owes
+        // it.
+        let mut pull_request = pull_request;
+        if self.managed_lifecycle.load(Ordering::Acquire)
+            && pull_request.lease().is_none()
+            && !self.adopt_dispatch_lease(&mut pull_request)
+        {
             return;
         }
         // Plan 49e E1: a continuation is owed by the acquisition that issued it. A request whose
@@ -1483,10 +1500,12 @@ impl DefaultMQPushConsumerImpl {
             }
         }
         self.progress.note_retry_scheduled();
-        // The delay this schedules **is** the queue's own expectation (plan 49d R1 item 3):
-        // suspension, flow control, broker-busy and error continuations all arrive here, so
-        // the controller sees a deliberate wait that is healthy until its own due time
-        // passes instead of an RPC that never finished.
+        // The delay this schedules **is** the queue's own expectation (plan 49d R1 item 3), and it
+        // replaces any submitting or queued window: while the timer runs nothing waits for channel
+        // room and nothing is owed an attempt yet (plan 49g G1 item 3). Suspension, flow
+        // control, broker-busy and error continuations all arrive here, so the controller
+        // sees a deliberate wait that is healthy until its own due time passes instead of
+        // an RPC that never finished.
         self.progress.note_queue_wait_for(
             pull_request.get_message_queue(),
             pull_request.lease_epoch(),
@@ -1677,6 +1696,42 @@ impl DefaultMQPushConsumerImpl {
         }
     }
 
+    /// Establish loop ownership **before** a request waits for anything (plan 49g G1).
+    ///
+    /// Initial work arrives from rebalance carrying no lease at all, so until now its queue could
+    /// only be read through the age of its last answer: accepted work sitting in the shared
+    /// channel looked like a loop that had stopped pulling. Ownership is therefore taken here,
+    /// at dispatch entry.
+    ///
+    /// It is adopted from the acquisition this incarnation holds for the very process queue the
+    /// request names, not by key alone: a process queue that has been dropped describes an
+    /// ended acquisition, and a queue whose loop already holds the lease must not get a second
+    /// pull stacked behind it - duplicate initial dispatch included. Both are refused, which
+    /// drops just this request.
+    fn adopt_dispatch_lease(&self, pull_request: &mut PullRequest) -> bool {
+        if pull_request.get_process_queue().is_dropped() {
+            debug!(
+                queue = %pull_request.get_message_queue(),
+                "this dispatch named a process queue that has already been retired, dropping it instead of owning work nobody runs"
+            );
+            return false;
+        }
+        let queue = pull_request.get_message_queue();
+        match self.progress.acquire_pull_lease(queue) {
+            Some(lease) => {
+                pull_request.hold_lease(lease);
+                true
+            }
+            None => {
+                debug!(
+                    queue = %queue,
+                    "no acquisition of this queue is available to own the dispatch - it was revoked, or a loop already owes its next pull"
+                );
+                false
+            }
+        }
+    }
+
     /// Ends the RPC attempt one request admitted, if it recorded one (plan 49d R1). Called by every
     /// path that owns an issued attempt without a callback answering it - issuance failure above
     /// all - and by the pull callback on answer, failure and cancellation. Ownership identity
@@ -1835,19 +1890,28 @@ impl DefaultMQPushConsumerImpl {
                 continue;
             };
             let epoch = lease.epoch();
-            // Every part of this queue's step - the offset read and the consumption-point lookup
-            // both wait on the nameserver - carries an absolute deadline (plan 49e E3). A queue
-            // that cannot answer inside its step is left lost and handed to a later
-            // round *after* it, so one stalled broker neither spends the rest of this
-            // slice nor starves what is behind it. The first queue may use its whole preparation
-            // allowance; later ones get what is left of the slice.
+            // **One** absolute deadline for this queue's whole step (plan 49g G2, carrying plan 49e
+            // E3's rule that every wait names the instant it stops at). Preparation -
+            // the offset read and the consumption-point lookup, both of which can wait
+            // on the nameserver - revalidation and the hand-off are stages of a single
+            // allowance: bounding each with its own relative timeout let every stage
+            // start the clock again, so one queue could spend its preparation allowance,
+            // five seconds by default, twice over.
+            //
+            // The allowance is chosen once here and no stage may extend it. A queue that cannot
+            // finish inside its step is left lost and handed to a later round *after*
+            // it, so one stalled broker neither spends the rest of this slice nor
+            // starves what is behind it; the first queue may use its whole preparation
+            // allowance even when the slice has run out, later ones get what is left
+            // with one minimum floor.
             let remaining = slice.saturating_sub(started.elapsed());
-            let budget = if index == 0 {
+            let step_allowance = if index == 0 {
                 remaining.max(prep_allowance)
             } else {
                 remaining.max(LOST_PULL_STEP_MINIMUM)
             };
-            let prepared = tokio::time::timeout(budget, self.prepare_repair_offset(&mq)).await;
+            let step_deadline = tokio::time::Instant::now() + step_allowance;
+            let prepared = tokio::time::timeout_at(step_deadline, self.prepare_repair_offset(&mq)).await;
             let Ok(next_offset) = prepared else {
                 warn!(
                     queue = %mq,
@@ -1861,18 +1925,16 @@ impl DefaultMQPushConsumerImpl {
             // hold a different process queue under this key. Revalidating is part of **this queue's
             // step**, so it waits only for what is left of that step rather than starting another
             // unbounded stage after the lookup (plan 49f F4 item 1).
-            let revalidated = tokio::time::timeout(
-                slice.saturating_sub(started.elapsed()).max(LOST_PULL_STEP_MINIMUM),
-                async {
-                    let table = self
-                        .rebalance_impl
-                        .rebalance_impl_inner
-                        .process_queue_table
-                        .read()
-                        .await;
-                    matches!(table.get(&mq), Some(current) if Arc::ptr_eq(current, &pq))
-                },
-            )
+            // Only what is left of this queue's step, never a fresh minimum (plan 49g G2).
+            let revalidated = tokio::time::timeout_at(step_deadline, async {
+                let table = self
+                    .rebalance_impl
+                    .rebalance_impl_inner
+                    .process_queue_table
+                    .read()
+                    .await;
+                matches!(table.get(&mq), Some(current) if Arc::ptr_eq(current, &pq))
+            })
             .await;
             let Ok(still_ours) = revalidated else {
                 warn!(
@@ -1909,15 +1971,22 @@ impl DefaultMQPushConsumerImpl {
                 // Handing the request to the shared service is **not** part of owning this queue's
                 // lease (plan 49f F4): the channel belongs to every consumer on the client
                 // instance, so waiting for room may not spend the rest of this
-                // round. One step per queue, and a request that finds no room is
-                // dropped - which releases only its own lease and leaves
-                // the queue exactly as lost as it was.
-                let remaining = slice.saturating_sub(started.elapsed());
-                let admission_budget = if index == 0 {
-                    remaining.max(prep_allowance)
-                } else {
-                    remaining.max(LOST_PULL_STEP_MINIMUM)
-                };
+                // round. It is still a stage of *this* queue's step, so it waits only until the
+                // deadline this step started with - never another full allowance
+                // (plan 49g G2). A request that finds no room is dropped, which
+                // releases only its own lease and leaves the queue exactly as lost
+                // as it was.
+                if tokio::time::Instant::now() >= step_deadline {
+                    // No time left to even ask for room: stop here rather than dispatch against a
+                    // deadline that has already passed, and let the next round
+                    // reach this queue again.
+                    warn!(
+                        queue = %mq,
+                        "this queue's step ran out before its repair could be handed off, leaving it lost"
+                    );
+                    unfinished = true;
+                    break;
+                }
                 // Kept for the logs below: the request takes ownership of the queue it resumes.
                 let repair_queue = mq.clone();
                 let mut request = PullRequest::new(self.consumer_config.consumer_group.clone(), mq, pq, next_offset);
@@ -1925,11 +1994,7 @@ impl DefaultMQPushConsumerImpl {
                 debug!("re-dispatching a queue whose pull loop was lost");
                 let cancellation = self.work.cancellation();
                 match service
-                    .admit_pull_request(
-                        request,
-                        tokio::time::Instant::now() + admission_budget,
-                        Some(&cancellation),
-                    )
+                    .admit_pull_request(request, step_deadline, Some(&cancellation))
                     .await
                 {
                     Admission::Accepted => dispatched += 1,
@@ -3403,6 +3468,13 @@ mod review49e {
             "a second pull loop may not stack onto a leased queue"
         );
         let mut request = request_for(&q);
+        // The loop keeps its own reference for as long as the wait it scheduled is owed: in
+        // production that is the timer task which owns the request, and this fixture has no
+        // client instance to hand it to. Without one the request really is dropped, and a
+        // dropped loop retires the expectations it owned (plan 49g G3), so holding the
+        // second reference here is what keeps this test about the continuation of a
+        // **live** loop.
+        let _loop_owner = Arc::clone(&lease);
         request.hold_lease(lease);
         push.progress.begin_pull_attempt(&q, epoch, Duration::ZERO).unwrap();
 
@@ -4265,5 +4337,493 @@ mod review49f {
                 .lost_pull_queues,
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod review49g {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::consumer::consumer_impl::message_request::MessageRequest;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_managed_dispatch_must_publish_queued_ownership() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49g-initial");
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        ));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49g-initial-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed(&q);
+        push.progress
+            .review49f_age_activity(&q, std::time::Duration::from_secs(31));
+        Rebalance::dispatch_pull_request(push.rebalance_impl.as_ref(), vec![PullRequest::new(group, q, pq, 7)], 0)
+            .await;
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        eprintln!(
+            "initial dispatch: buffered={} lost={} leased={}",
+            capture.len(),
+            s.lost_pull_queues,
+            s.leased_queues
+        );
+        client.shutdown().await;
+        assert_eq!(capture.len(), 1);
+        assert_eq!(
+            s.lost_pull_queues, 0,
+            "an accepted initial request carried no lease and published no queued expectation"
+        );
+        assert_eq!(s.leased_queues, 1);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_and_admission_must_share_one_step_deadline() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49g-step");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49g-step-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        let dummy = MessageQueue::from_parts("T", "dummy", 0);
+        for _ in 0..32 {
+            client
+                .pull_message_service
+                .execute_pull_request_immediately(PullRequest::new(
+                    group.clone(),
+                    dummy.clone(),
+                    Arc::new(ProcessQueue::new()),
+                    0,
+                ))
+                .await;
+        }
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        push.progress.note_queue_installed(&q);
+        push.progress
+            .review49f_age_activity(&q, std::time::Duration::from_secs(31));
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), Arc::new(ProcessQueue::new()));
+        let remote = RemoteBrokerOffsetStore::new(client.clone(), group);
+        let table = remote.offset_table_lock();
+        let store = OffsetStore::new_with_remote(remote);
+        store.update_offset(&q, 7, false).await;
+        push.offset_store = Some(ArcMut::new(store));
+        push.client_instance = Some(client.clone());
+        let guard = table.lock().await;
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            drop(guard);
+        };
+        let started = tokio::time::Instant::now();
+        let pass = tokio::time::timeout(
+            std::time::Duration::from_millis(280),
+            push.repair_lost_pulls(
+                None,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(35),
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(10),
+            ),
+        );
+        let (result, ()) = tokio::join!(pass, release);
+        let elapsed = started.elapsed();
+        client.shutdown().await;
+        eprintln!(
+            "compound step: result={result:?} elapsed={elapsed:?} buffered={}",
+            capture.len()
+        );
+        assert!(
+            result.is_ok(),
+            "the 200ms step was restarted for admission after 120ms of preparation"
+        );
+    }
+
+    /// A scheduled continuation owns its queue from the moment the wait is booked: work that will
+    /// run must not read as a loop that stopped, and once that request is destroyed the queue
+    /// becomes repairable again at once - both through the production timer path (plan 49g G1 +
+    /// G3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_dispatch_owns_its_queue_before_the_timer_runs() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49g-delay");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49g-delay-client", None);
+        let mut capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), Arc::new(ProcessQueue::new()));
+        push.progress.note_queue_installed(&q);
+        push.progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let before = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(before.lost_pull_queues, 1, "the fixture starts lost and silent");
+
+        // No lease travels with a retry timer's request: ownership has to be taken at dispatch
+        // entry.
+        push.execute_pull_request_later(
+            PullRequest::new(group.clone(), q.clone(), Arc::new(ProcessQueue::new()), 9),
+            250,
+        );
+        let owned = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "delayed dispatch: lost={} leased={} waiting={}",
+            owned.lost_pull_queues, owned.leased_queues, owned.waiting_queues
+        );
+        assert_eq!(
+            (owned.lost_pull_queues, owned.leased_queues, owned.waiting_queues),
+            (0, 1, 1),
+            "a scheduled continuation left its queue readable as a loop that stopped pulling"
+        );
+
+        // The timer fires and the request reaches the shared service; destroying what it produced
+        // ends the loop for good.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(capture.len(), 1, "the scheduled continuation never arrived");
+        while let Ok(request) = capture.try_recv() {
+            drop(request);
+        }
+        let gone = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (gone.lost_pull_queues, gone.leased_queues),
+            (1, 0),
+            "a destroyed continuation kept its queue out of repair"
+        );
+        client.shutdown().await;
+    }
+
+    /// A step whose deadline passed while its offset lookup was silent must stop on that deadline:
+    /// it may not wait the I/O out, and it may not leave anything behind (plan 49g G2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_step_that_ran_out_stops_without_dispatching() {
+        let (mut push, mut client, capture, queues) = step_fixture("review49g-expired-step", &[("ready", 0)]).await;
+        let store = push.offset_store.clone().expect("the fixture installs an offset store");
+        // Preparation cannot answer at all inside the step; capacity is free the whole time.
+        let guard = store.review49g_hold_offsets().await.expect("remote offsets");
+        let q = queues[0].clone();
+        let ((round, elapsed), ()) = tokio::join!(
+            async {
+                let started = tokio::time::Instant::now();
+                let round = push
+                    .repair_lost_pulls(
+                        None,
+                        Duration::from_secs(30),
+                        Duration::from_secs(35),
+                        Duration::from_millis(150),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+                (round, started.elapsed())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                drop(guard);
+            }
+        );
+        eprintln!(
+            "expired step: round={round:?} elapsed={elapsed:?} buffered={}",
+            capture.len()
+        );
+        let LostPullRound::Incomplete { after } = round else {
+            panic!("an exhausted step reported {round:?} instead of an unfinished round");
+        };
+        assert_eq!(after.as_deref(), Some(lost_pull_cursor_key(&q).as_str()));
+        assert_eq!(capture.len(), 0, "a queue whose step expired was still dispatched");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the step waited for its I/O instead of its own deadline ({elapsed:?})"
+        );
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (s.lost_pull_queues, s.leased_queues),
+            (1, 0),
+            "an abandoned repair kept the queue's lease or hid it from the next round"
+        );
+        client.shutdown().await;
+    }
+
+    /// A stage that has to wait for the process-queue table waits **inside** its queue's step:
+    /// neither revalidation nor the hand-off afterwards may start a second allowance (plan 49g
+    /// G2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_contended_revalidation_stays_inside_the_step_it_started() {
+        let (mut push, mut client, capture, queues) = step_fixture("review49g-contend", &[("ready", 0)]).await;
+        let q = queues[0].clone();
+        // Preparation is held by another writer first, so the round reaches revalidation while the
+        // process-queue table is being taken away underneath it.
+        let store = push.offset_store.clone().expect("the fixture installs an offset store");
+        let preparation = store.review49g_hold_offsets().await.expect("remote offsets");
+        let contention = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+
+        let ((round, elapsed), (), ()) = tokio::join!(
+            // The round itself, timed on its own.
+            async {
+                let started = tokio::time::Instant::now();
+                let round = push
+                    .repair_lost_pulls(
+                        None,
+                        Duration::from_secs(30),
+                        Duration::from_secs(35),
+                        Duration::from_millis(400),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+                (round, started.elapsed())
+            },
+            // Once the round is parked in preparation - before it can ask for the table again - take the
+            // table away and keep it longer than this queue's whole step.
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let guard = contention.write().await;
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                drop(guard);
+            },
+            // Let preparation answer while the table is already held: revalidation is what waits next.
+            async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                drop(preparation);
+            }
+        );
+        eprintln!(
+            "contended revalidation: round={round:?} elapsed={elapsed:?} buffered={}",
+            capture.len()
+        );
+        let LostPullRound::Incomplete { after } = round else {
+            panic!("a step that could not revalidate reported {round:?} instead of an unfinished round");
+        };
+        assert_eq!(after.as_deref(), Some(lost_pull_cursor_key(&q).as_str()));
+        assert_eq!(capture.len(), 0, "work was dispatched past a step that had run out");
+        // One allowance for the whole step: revalidation may use what is left of it, and no stage
+        // may add another. A wait that outlived the deadline would show up above; an
+        // unbounded wait for the table would not return at all.
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "the step gave up before its own deadline ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(460),
+            "the step spent more than its own allowance ({elapsed:?})"
+        );
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!((s.lost_pull_queues, s.leased_queues), (1, 0));
+        client.shutdown().await;
+    }
+
+    /// A later queue in the same round gets what is left of the slice with one minimum floor -
+    /// never a fresh preparation allowance - and the round reports exactly what it reached
+    /// (plan 49g G2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_later_queue_stops_on_the_minimum_step_not_a_fresh_allowance() {
+        let (mut push, mut client, capture, queues) = step_fixture("review49g-later", &[("a", 0), ("b", 1)]).await;
+        // Exactly one free slot: the first queue is handed off, the second has to wait for room.
+        for _ in 0..31 {
+            client
+                .pull_message_service
+                .execute_pull_request_immediately(PullRequest::new(
+                    CheetahString::from_static_str("review49g-later"),
+                    MessageQueue::from_parts("T", "dummy", 0),
+                    Arc::new(ProcessQueue::new()),
+                    0,
+                ))
+                .await;
+        }
+        let started = tokio::time::Instant::now();
+        let round = push
+            .repair_lost_pulls(
+                None,
+                Duration::from_secs(30),
+                Duration::from_secs(35),
+                // A preparation allowance an order of magnitude longer than the slice: a later queue
+                // that was given it would show up here as a nine-hundred-millisecond round.
+                Duration::from_millis(900),
+                Duration::from_millis(60),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "later queue: round={round:?} elapsed={elapsed:?} buffered={}",
+            capture.len()
+        );
+        let LostPullRound::Incomplete { after } = round else {
+            panic!("a round that could not hand off reported {round:?}");
+        };
+        assert_eq!(after.as_deref(), Some(lost_pull_cursor_key(&queues[1]).as_str()));
+        assert_eq!(capture.len(), 32, "the accepted repair was not the only new request");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "a later queue spent a first-queue allowance ({elapsed:?})"
+        );
+
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(s.lost_pull_queues, 1, "only the second queue is still owed");
+        assert_eq!(
+            s.leased_queues, 1,
+            "the accepted request owns its queue until it is pulled"
+        );
+        client.shutdown().await;
+    }
+
+    /// A hand-off that cannot find room ends on the deadline its step started with, even though
+    /// preparation already spent part of it: waiting for capacity is a stage of this queue's
+    /// repair, not a fresh allowance (plan 49g G2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hand_off_that_could_not_open_ends_the_step_it_was_in() {
+        let (mut push, mut client, capture, queues) = step_fixture("review49g-handoff", &[("ready", 0)]).await;
+        let q = queues[0].clone();
+        // Preparation takes 120ms of a 400ms step, and the shared channel has no room at all.
+        let store = push.offset_store.clone().expect("the fixture installs an offset store");
+        let preparation = store.review49g_hold_offsets().await.expect("remote offsets");
+        for _ in 0..32 {
+            client
+                .pull_message_service
+                .execute_pull_request_immediately(PullRequest::new(
+                    CheetahString::from_static_str("review49g-handoff"),
+                    MessageQueue::from_parts("T", "dummy", 0),
+                    Arc::new(ProcessQueue::new()),
+                    0,
+                ))
+                .await;
+        }
+
+        let ((elapsed, round), ()) = tokio::join!(
+            async {
+                let started = tokio::time::Instant::now();
+                let round = push
+                    .repair_lost_pulls(
+                        None,
+                        Duration::from_secs(30),
+                        Duration::from_secs(35),
+                        // A preparation allowance longer than the slice: this queue's step is 400ms.
+                        Duration::from_millis(400),
+                        Duration::from_millis(300),
+                    )
+                    .await;
+                (started.elapsed(), round)
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                drop(preparation);
+            }
+        );
+        eprintln!(
+            "hand-off inside its step: round={round:?} elapsed={elapsed:?} buffered={}",
+            capture.len()
+        );
+        let LostPullRound::Incomplete { after } = round else {
+            panic!("a repair that found no room reported {round:?} instead of an unfinished round");
+        };
+        assert_eq!(after.as_deref(), Some(lost_pull_cursor_key(&q).as_str()));
+        assert_eq!(capture.len(), 32, "nothing opened and the queue was dispatched anyway");
+        // The step began with 400ms; preparation used 120ms of them. A hand-off given its own
+        // allowance would still be waiting near 520ms here.
+        assert!(
+            elapsed >= Duration::from_millis(380),
+            "the repair gave up before the step it was given ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(470),
+            "waiting for pull-service room started a second allowance ({elapsed:?})"
+        );
+
+        let s = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (s.lost_pull_queues, s.leased_queues),
+            (1, 0),
+            "a dropped repair kept its lease or hid the queue from the next round"
+        );
+        client.shutdown().await;
+    }
+
+    /// A managed consumer with lost queues whose offset preparation and process-queue table are
+    /// under the test's control, plus a capture channel standing in for the shared pull
+    /// service.
+    async fn step_fixture(
+        name: &str,
+        brokers: &[(&str, i32)],
+    ) -> (
+        DefaultMQPushConsumerImpl,
+        ArcMut<MQClientInstance>,
+        tokio::sync::mpsc::Receiver<Box<dyn MessageRequest + Send>>,
+        Vec<MessageQueue>,
+    ) {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(name.to_string());
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, format!("{name}-client"), None);
+        let capture = client.pull_message_service.review49e_capture();
+        let remote = RemoteBrokerOffsetStore::new(client.clone(), group);
+        let table = remote.offset_table_lock();
+        let store = OffsetStore::new_with_remote(remote);
+        let mut owned = Vec::with_capacity(brokers.len());
+        {
+            let mut push_queues = push
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await;
+            for (broker, id) in brokers {
+                let q = MessageQueue::from_parts("T", *broker, *id);
+                push_queues.insert(q.clone(), Arc::new(ProcessQueue::new()));
+                push.progress.note_queue_installed(&q);
+                push.progress.review49f_age_activity(&q, Duration::from_secs(31));
+                store.update_offset(&q, 7, false).await;
+                owned.push(q);
+            }
+        }
+        push.offset_store = Some(ArcMut::new(store));
+        push.client_instance = Some(client.clone());
+        drop(table);
+        (push, client, capture, owned)
     }
 }

@@ -296,6 +296,18 @@ pub trait OffsetStoreTrait {
 }
 
 #[cfg(test)]
+impl OffsetStore {
+    /// Test seam (plan 49g G2): take the lock a remote offset query needs, so a test can make a
+    /// repair step wait for preparation exactly as it would behind another writer. The guard's
+    /// type stays private - callers keep it alive and drop it - and this is never compiled into
+    /// anything that ships.
+    pub(crate) async fn review49g_hold_offsets(&self) -> Option<Box<dyn Send>> {
+        let remote = self.remote_broker_offset_store.as_ref()?;
+        Some(Box::new(remote.offset_table_lock().lock_owned().await))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

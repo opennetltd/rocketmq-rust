@@ -2740,3 +2740,103 @@ mod review49f {
         assert!(repair_is_settled(&snapshot));
     }
 }
+
+#[cfg(test)]
+mod review49g {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_request::PullRequest;
+    use crate::factory::mq_client_instance::MQClientInstance;
+    use cheetah_string::CheetahString;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_live_capacity_wait_must_not_be_charged_as_a_lost_loop() {
+        let policy = LifecyclePolicy {
+            progress_check: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let progress = ConsumerProgress::new();
+        let spec = ManagedConsumerSpec::new(
+            DefaultMQPushConsumer::builder()
+                .consumer_group("review49g-submit")
+                .subscribe("T", "*"),
+        )
+        .with_listener(Arc::new(|_, _| Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)));
+        let mut consumer = spec.build_incarnation(progress.clone(), &policy).unwrap();
+        let cc = consumer
+            .default_mqpush_consumer_impl
+            .as_ref()
+            .unwrap()
+            .client_config
+            .as_ref()
+            .clone();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49g-submit-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        let dummy = MessageQueue::from_parts("T", "dummy", 0);
+        let group = CheetahString::from_static_str("review49g-submit");
+        for _ in 0..32 {
+            client
+                .pull_message_service
+                .execute_pull_request_immediately(PullRequest::new(
+                    group.clone(),
+                    dummy.clone(),
+                    Arc::new(ProcessQueue::new()),
+                    0,
+                ))
+                .await;
+        }
+        let inner = consumer.default_mqpush_consumer_impl.as_mut().unwrap();
+        inner.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        inner
+            .rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let mut request = PullRequest::new(group, q, pq, 7);
+        request.hold_lease(progress.acquire_pull_lease(request.get_message_queue()).unwrap());
+        let mut push = consumer.default_mqpush_consumer_impl.as_ref().unwrap().clone();
+        let work = push.work.clone();
+        let submission = async {
+            push.execute_pull_request_immediately(request).await;
+        };
+        tokio::pin!(submission);
+        let mut machine = RecoveryMachine::new(policy, 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let initial = project(machine.state(), 1, &progress.snapshot(stall_after(), pull_deadline()));
+        let (status, _rx) = watch::channel(initial);
+        let (events, _ev) = broadcast::channel(128);
+        let publisher = StatusPublisher {
+            status,
+            events: Arc::new(events),
+        };
+        let stop = CancellationToken::new();
+        let effects = machine
+            .on_tick(&progress.snapshot(stall_after(), pull_deadline()), pull_deadline(), 0.5)
+            .1;
+        let control = tokio::time::timeout(
+            Duration::from_millis(150),
+            run_incarnation(&mut consumer, &mut machine, &publisher, &stop, &progress, effects),
+        );
+        let result = tokio::select! {biased;_=&mut submission=>panic!("full-channel submission ended before observation"),result=control=>result};
+        let waiting = progress.snapshot(stall_after(), pull_deadline());
+        work.close();
+        submission.await;
+        client.shutdown().await;
+        eprintln!(
+            "capacity wait: result={result:?} lost={} leased={} buffered={}",
+            waiting.lost_pull_queues,
+            waiting.leased_queues,
+            capture.len()
+        );
+        assert!(
+            !matches!(result, Ok(IncarnationEnd::Replace)),
+            "a valid ten-second admission wait spent replacement allowance before it ended"
+        );
+    }
+}

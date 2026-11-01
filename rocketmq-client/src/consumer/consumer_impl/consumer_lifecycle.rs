@@ -329,6 +329,12 @@ struct QueueProgress {
     /// yet, so it gets the stall allowance measured from **admission** rather than looking like a
     /// lost pull because its previous answer is old (plan 49f F2). `0` means nothing is queued.
     queued_since_ms: u64,
+    /// Not after this instant may a submission still be treated as waiting for room in the shared
+    /// pull service (plan 49g G1). Recording it *before* the wait is what separates "this loop's
+    /// work is validly waiting for capacity" from "the loop stopped working": the window comes from
+    /// the caller's own admission deadline, so status polling can never renew it and an expired
+    /// submission becomes visible again by itself. `0` means nothing is submitting.
+    submitting_until_ms: u64,
     /// When this acquisition last **answered a pull successfully**. Kept apart from
     /// `last_progress_ms`, which any local activity refreshes, because only a newer successful pull
     /// says the route or transport that failed has recovered (plan 49e E2).
@@ -337,6 +343,36 @@ struct QueueProgress {
     /// failure cannot stay current forever and no unrelated activity can retire it.
     failure_ms: u64,
     failure_kind: PullFailureKind,
+}
+
+/// Which phase of the hand-off a request-owned expectation describes (plan 49g G1).
+///
+/// Only one phase is current for a queue at a time, and it exists only while that acquisition's
+/// lease does: submitting becomes queued when capacity is reserved, queued becomes an RPC with its
+/// own answer window when the attempt is admitted, and any ending of the loop retires both
+/// (plan 49g G3). Neither phase counts as completed work - issuing is not finishing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PullPhase {
+    /// Waiting for room in the process-wide pull channel, inside the caller's admission deadline.
+    Submitting,
+    /// Accepted by the shared service and owed an attempt inside the stall allowance measured from
+    /// admission (plan 49f F2).
+    Queued,
+}
+
+/// Move one queue's request-owned phase expectation, keeping the windows mutually exclusive so that
+/// exactly one - or none - says what the loop currently owes (plan 49g G1 item 3). `stamp` means
+/// "when this phase began" for [`PullPhase::Queued`], which health judges against the stall
+/// allowance, and "not valid after this instant" for [`PullPhase::Submitting`], which carries the
+/// deadline its caller issued the admission under.
+fn set_pull_phase(entry: &mut QueueProgress, phase: Option<PullPhase>, stamp: u64) {
+    let (queued_since_ms, submitting_until_ms) = match phase {
+        Some(PullPhase::Queued) => (stamp, 0),
+        Some(PullPhase::Submitting) => (0, stamp),
+        None => (0, 0),
+    };
+    entry.queued_since_ms = queued_since_ms;
+    entry.submitting_until_ms = submitting_until_ms;
 }
 
 /// One in-flight pull of one queue acquisition (plan 49a F4 section 4.3 item 3).
@@ -367,6 +403,18 @@ impl PullLease {
     /// Take back the queued expectation this lease recorded (plan 49f F2).
     pub(crate) fn forget_queued(&self) {
         self.progress.forget_pull_queued(&self.queue, self.epoch);
+    }
+
+    /// Record that a request carrying this lease is **waiting for room** in the shared pull
+    /// service, for as long as its own admission deadline allows (plan 49g G1). False means the
+    /// acquisition ended and the caller must not wait for capacity on its behalf.
+    pub(crate) fn note_submitting(&self, window: Duration) -> bool {
+        self.progress.note_pull_submitting(&self.queue, self.epoch, window)
+    }
+
+    /// Take back a submitting expectation whose wait ended without becoming visible (plan 49g G1).
+    pub(crate) fn forget_submitting(&self) {
+        self.progress.forget_pull_submitting(&self.queue, self.epoch);
     }
 }
 
@@ -515,6 +563,10 @@ struct QueueStanding {
     /// Admitted to the shared pull service and waiting for its attempt inside the stall allowance
     /// measured from admission (plan 49f F2).
     queued: bool,
+    /// A submission of this lease's own is still waiting for room in the shared pull service,
+    /// inside the deadline it was issued under (plan 49g G1). Without it a valid capacity wait
+    /// read as an idle lease, so replacement was charged for work that had not failed yet.
+    submitting: bool,
 }
 
 impl QueueStanding {
@@ -522,7 +574,9 @@ impl QueueStanding {
     /// in the future, is not lost however old its last answer looks - only an expired attempt
     /// deadline or a failed wait expectation says the work is gone (plan 49c C2, plan 49d R1).
     fn is_lost(&self) -> bool {
-        self.overdue || self.idle_lease || (!self.leased && !self.waiting && !self.queued && self.silent)
+        self.overdue
+            || self.idle_lease
+            || (!self.leased && !self.waiting && !self.queued && !self.submitting && self.silent)
     }
 }
 
@@ -543,14 +597,24 @@ impl QueueProgress {
         // A request the service has accepted is expected to reach an attempt within the same
         // allowance that says a queue has gone quiet; measuring it from the previous completion is
         // what made a just-dispatched repair look like a lost pull (plan 49f F2).
-        let queued = self.queued_since_ms != 0 && now_ms.saturating_sub(self.queued_since_ms) < stall;
+        // A phase expectation belongs to a request whose loop still owes this queue an attempt.
+        // Once no lease owner is left it describes nothing, so it vouches for nothing
+        // either - an abandoned marker must never read as healthy expected work (plan 49g
+        // G3).
+        let owned = self.pull_leased;
+        let queued = owned && self.queued_since_ms != 0 && now_ms.saturating_sub(self.queued_since_ms) < stall;
+        // Judged against the deadline the submission was issued under, not against status polling:
+        // an expired wait for capacity is a fault like any other unmet expectation (plan
+        // 49g G1).
+        let submitting = owned && self.submitting_until_ms > now_ms;
         QueueStanding {
             silent,
             waiting,
             leased: self.pull_leased,
             overdue,
-            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && !queued && silent,
+            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && !queued && !submitting && silent,
             queued,
+            submitting,
         }
     }
 }
@@ -619,11 +683,11 @@ impl ConsumerProgress {
         entry.attempt_id = attempt_id;
         entry.attempt_started_ms = now;
         entry.attempt_deadline_ms = now.saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
-        // An admitted RPC supersedes both the wait expectation and any queued-work expectation
-        // recorded for this queue: from here its own answer window is what health watches
-        // (plan 49f F2).
+        // An admitted RPC supersedes the wait expectation and every request-owned phase expectation
+        // for this queue: from here its own answer window is what health watches
+        // (plan 49f F2, plan 49g G1).
         entry.wait_until_ms = 0;
-        entry.queued_since_ms = 0;
+        set_pull_phase(entry, None, 0);
         Some(attempt_id)
     }
 
@@ -666,6 +730,13 @@ impl ConsumerProgress {
 
     /// Releases the lease after a pull completes, fails or is cancelled. `epoch` rejects a
     /// release from a stale assignment generation.
+    /// Ends this acquisition's loop lease, and with it every expectation a request owned
+    /// (plan 49g G3): submitting, queued, the scheduled wait and an outstanding attempt all
+    /// describe work some task still has to do. Once the last reference to the loop is gone no
+    /// task owes this queue anything, so keeping those markers would let a dropped request
+    /// suppress repair until each window expired on its own. Historical evidence - progress and
+    /// failure timestamps - stays put, and an epoch that no longer matches is never written, so
+    /// a newer acquisition keeps its own.
     pub(crate) fn release_pull(&self, queue: &MessageQueue, epoch: u64) {
         let mut queues = self.queues.write();
         if let Some(entry) = queues.get_mut(queue) {
@@ -674,6 +745,8 @@ impl ConsumerProgress {
                 entry.attempt_id = 0;
                 entry.attempt_started_ms = 0;
                 entry.attempt_deadline_ms = 0;
+                entry.wait_until_ms = 0;
+                set_pull_phase(entry, None, 0);
             }
         }
     }
@@ -821,10 +894,48 @@ impl ConsumerProgress {
         let mut queues = self.queues.write();
         match queues.get_mut(queue) {
             Some(entry) if entry.epoch == epoch && entry.pull_leased => {
-                entry.queued_since_ms = get_current_millis();
+                // The submitting window this request waited under ends in the same write lock that
+                // opens the queued one: there is no moment in which a request its receiver can
+                // already see is described by neither (plan 49g G1 item 3).
+                set_pull_phase(entry, Some(PullPhase::Queued), get_current_millis());
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Record that a request for this acquisition is **waiting for room** in the shared pull
+    /// service, before it has any (plan 49g G1). The window is the caller's own admission
+    /// deadline, so polling status cannot renew it and an expired submission becomes
+    /// diagnosable again by itself.
+    ///
+    /// Returns whether it was recorded: a request whose acquisition ended must not put an
+    /// expectation on the queue its replacement now owns.
+    pub(crate) fn note_pull_submitting(&self, queue: &MessageQueue, epoch: u64, window: Duration) -> bool {
+        let mut queues = self.queues.write();
+        match queues.get_mut(queue) {
+            Some(entry) if entry.epoch == epoch && entry.pull_leased => {
+                set_pull_phase(
+                    entry,
+                    Some(PullPhase::Submitting),
+                    get_current_millis().saturating_add(window.as_millis() as u64),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take back a submitting expectation whose wait ended without the request becoming visible to
+    /// its receiver (plan 49g G1). Only the acquisition that recorded it may, and only while
+    /// submitting is still the current phase: a queued expectation belongs to a request its
+    /// receiver may hold.
+    pub(crate) fn forget_pull_submitting(&self, queue: &MessageQueue, epoch: u64) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            if entry.epoch == epoch && entry.submitting_until_ms != 0 {
+                set_pull_phase(entry, None, 0);
+            }
         }
     }
 
@@ -833,8 +944,8 @@ impl ConsumerProgress {
     pub(crate) fn forget_pull_queued(&self, queue: &MessageQueue, epoch: u64) {
         let mut queues = self.queues.write();
         if let Some(entry) = queues.get_mut(queue) {
-            if entry.epoch == epoch {
-                entry.queued_since_ms = 0;
+            if entry.epoch == epoch && entry.queued_since_ms != 0 {
+                set_pull_phase(entry, None, 0);
             }
         }
     }
@@ -870,6 +981,10 @@ impl ConsumerProgress {
         entry.attempt_id = 0;
         entry.attempt_started_ms = 0;
         entry.attempt_deadline_ms = 0;
+        // A scheduled wait replaces every request-owned phase expectation too: the loop said what
+        // it expects next, and nothing is waiting for capacity or an attempt in the
+        // meantime (plan 49g G1 item 3).
+        set_pull_phase(entry, None, 0);
         true
     }
 
@@ -981,6 +1096,7 @@ impl ConsumerProgress {
                         attempt_deadline_ms: 0,
                         wait_until_ms: 0,
                         queued_since_ms: 0,
+                        submitting_until_ms: 0,
                         failure_ms: 0,
                         failure_kind: PullFailureKind::Other,
                     },
@@ -3566,6 +3682,44 @@ impl ConsumerProgress {
             entry.queued_since_ms = entry.queued_since_ms.saturating_sub(age.as_millis() as u64);
         }
     }
+
+    /// Test seam (plan 49g G1): shorten what is left of a submitting window, so a test can watch a
+    /// wait for pull-service room outlive the deadline it was issued under without waiting for it.
+    pub(crate) fn review49g_expire_submitting(&self, queue: &MessageQueue) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            entry.submitting_until_ms = entry
+                .submitting_until_ms
+                .saturating_sub(get_current_millis().saturating_add(1));
+        }
+    }
+
+    /// Test seam (plan 49g G3): everything one loop owes a queue, read straight off the ledger -
+    /// `(leased, wait_until_ms, queued_since_ms, submitting_until_ms)`. A snapshot cannot tell an
+    /// expectation that was retired from one that is merely outvoted by its ownership gate, so this
+    /// says directly whether a dropped loop left anything behind.
+    pub(crate) fn review49g_owed(&self, queue: &MessageQueue) -> Option<(bool, u64, u64, u64)> {
+        let queues = self.queues.read();
+        queues.get(queue).map(|entry| {
+            (
+                entry.pull_leased,
+                entry.wait_until_ms,
+                entry.queued_since_ms,
+                entry.submitting_until_ms,
+            )
+        })
+    }
+
+    /// Test seam (plan 49g G3): open a phase expectation without an owner, which no production path
+    /// does. This is how the ownership gate - the second line of defence behind `release_pull`
+    /// retiring what a loop owed - is exercised: an abandoned marker must never read as healthy
+    /// expected work.
+    pub(crate) fn review49g_abandon_phase(&self, queue: &MessageQueue, phase: PullPhase) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            set_pull_phase(entry, Some(phase), get_current_millis());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3774,5 +3928,243 @@ mod review49f {
             snapshot.lost_pull_queues, 1,
             "the new owner was vouched for by a queued window it never opened"
         );
+    }
+}
+
+/// Plan 49g G1/G3: what a queue is **owed** belongs to the request that owes it, and ends with it.
+#[cfg(test)]
+mod review49g {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn queue(id: i32) -> MessageQueue {
+        MessageQueue::from_parts("T", "broker", id)
+    }
+
+    /// A queue is described by exactly one request-owned phase, and only the acquisition that owes
+    /// the work may put it there (plan 49g G1 item 3).
+    #[test]
+    fn phase_expectations_are_exclusive_and_owned_by_one_acquisition() {
+        let progress = ConsumerProgress::new();
+        let q = queue(0);
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1
+        );
+
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+        let stale = epoch + 7;
+
+        // Neither phase may be opened by an acquisition that is not current.
+        assert!(!progress.note_pull_submitting(&q, stale, Duration::from_secs(5)));
+        assert!(!progress.note_pull_queued(&q, stale));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1,
+            "an ended acquisition vouched for this queue"
+        );
+
+        // The current one may submit, and being accepted replaces submitting with queued in one
+        // move.
+        assert!(progress.note_pull_submitting(&q, epoch, Duration::from_secs(5)));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            0
+        );
+        assert!(progress.note_pull_queued(&q, epoch));
+        let queues = progress.queues.read();
+        let entry = queues.get(&q).unwrap();
+        assert_eq!(
+            (entry.queued_since_ms != 0, entry.submitting_until_ms != 0),
+            (true, false),
+            "a queued request still carried a submitting window"
+        );
+        drop(queues);
+
+        // A scheduled wait replaces both: while the timer runs nothing waits for room and no
+        // attempt is owed yet.
+        assert!(progress.note_queue_wait_for(&q, Some(epoch), Duration::from_millis(500)));
+        let queues = progress.queues.read();
+        let entry = queues.get(&q).unwrap();
+        assert_eq!((entry.queued_since_ms, entry.submitting_until_ms), (0, 0));
+        drop(queues);
+
+        // And an admitted RPC retires them too - its own answer window governs from there.
+        progress.begin_pull_attempt(&q, epoch, Duration::from_secs(5)).unwrap();
+        let queues = progress.queues.read();
+        let entry = queues.get(&q).unwrap();
+        assert_eq!((entry.queued_since_ms, entry.submitting_until_ms), (0, 0));
+    }
+
+    /// The expectation lives and dies with the loop that owes it: an extra reference keeps it, the
+    /// last one dropping retires every request-owned expectation at once (plan 49g G3).
+    #[test]
+    fn a_dropped_loop_retires_everything_it_owed() {
+        for open in [PullPhase::Submitting, PullPhase::Queued] {
+            let progress = ConsumerProgress::new();
+            let q = queue(1);
+            progress.note_queue_installed(&q);
+            progress.review49f_age_activity(&q, Duration::from_secs(31));
+            let loop_owner = progress.acquire_pull_lease(&q).unwrap();
+            let epoch = loop_owner.epoch();
+            match open {
+                PullPhase::Submitting => assert!(progress.note_pull_submitting(&q, epoch, Duration::from_secs(30))),
+                PullPhase::Queued => assert!(progress.note_pull_queued(&q, epoch)),
+            }
+            // Progress history stays old; only the phase expectation says this queue is owed work.
+            let live = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+            assert_eq!(
+                (live.lost_pull_queues, live.leased_queues),
+                (0, 1),
+                "{open:?} phase was not owned"
+            );
+
+            // A second owner - the request sitting in the channel - may go first: `PullLease` is
+            // only ever held behind an `Arc`, so its destructor runs at the **last**
+            // reference, and one clone ending must not retire what the other still
+            // owes.
+            let extra = Arc::clone(&loop_owner);
+            drop(extra);
+            assert_eq!(
+                progress
+                    .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                    .lost_pull_queues,
+                0,
+                "{open:?}: dropping one of two owners ended the loop"
+            );
+
+            // The last reference is the end of the loop. Nothing may keep vouching for work that no
+            // task will do - not a window with seconds left to run.
+            drop(loop_owner);
+            let gone = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+            assert_eq!(gone.leased_queues, 0, "{open:?}: the lease outlived its last owner");
+            assert_eq!(
+                gone.lost_pull_queues, 1,
+                "{open:?}: a dropped loop left an expectation behind that hid the queue from repair"
+            );
+            // And nothing is owed on the ledger either: a window with seconds left to run would
+            // read as expected work for any owner that later takes this queue at its
+            // epoch.
+            assert_eq!(
+                progress.review49g_owed(&q),
+                Some((false, 0, 0, 0)),
+                "{open:?}: a dropped loop kept an expectation behind"
+            );
+        }
+    }
+
+    /// A phase expectation only vouches for a queue while some loop owns it. This test opens one
+    /// with no owner standing behind it - which no production path does, because `release_pull`
+    /// retires what a dropped loop owed - to pin the second line of defence: an abandoned
+    /// marker reads as a queue that stopped pulling, never as healthy expected work (plan 49g
+    /// G3).
+    #[test]
+    fn a_phase_expectation_without_an_owner_vouches_for_nothing() {
+        for open in [PullPhase::Submitting, PullPhase::Queued] {
+            let progress = ConsumerProgress::new();
+            let q = queue(7);
+            progress.note_queue_installed(&q);
+            progress.review49f_age_activity(&q, Duration::from_secs(31));
+
+            progress.review49g_abandon_phase(&q, open);
+            let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+            assert_eq!(
+                (snapshot.lost_pull_queues, snapshot.leased_queues),
+                (1, 0),
+                "{open:?} with no owner kept a queue that stopped pulling out of repair"
+            );
+
+            // The same marker while an owner does stand behind it is expected work, so this is the
+            // gate deciding and not the absence of a window.
+            let owner = progress.acquire_pull_lease(&q).unwrap();
+            match open {
+                PullPhase::Submitting => {
+                    assert!(progress.note_pull_submitting(&q, owner.epoch(), Duration::from_secs(30)))
+                }
+                PullPhase::Queued => assert!(progress.note_pull_queued(&q, owner.epoch())),
+            }
+            let live = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+            assert_eq!(
+                (live.lost_pull_queues, live.leased_queues),
+                (0, 1),
+                "{open:?} owned by a live loop was still read as a lost pull"
+            );
+        }
+    }
+
+    /// Releasing on an epoch that is no longer current must not clear what the new acquisition
+    /// opened (plan 49g G3).
+    #[test]
+    fn a_stale_release_leaves_a_reacquired_loops_expectation() {
+        let progress = ConsumerProgress::new();
+        let q = queue(2);
+        progress.note_queue_installed(&q);
+        let previous = progress.acquire_pull_lease(&q).unwrap();
+        let stale_epoch = previous.epoch();
+        // The acquisition ends and a new one takes the queue.
+        progress.note_queue_revoked(&q);
+        progress.note_queue_installed(&q);
+        let current = progress.acquire_pull_lease(&q).unwrap();
+        assert_ne!(current.epoch(), stale_epoch, "epochs must be strictly monotonic");
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        assert!(progress.note_pull_submitting(&q, current.epoch(), Duration::from_secs(30)));
+
+        drop(previous);
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!((snapshot.lost_pull_queues, snapshot.leased_queues), (0, 1));
+
+        // And the current owner can still retire its own expectation on purpose.
+        progress.forget_pull_submitting(&q, current.epoch());
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(snapshot.lost_pull_queues, 1);
+    }
+
+    /// A submission that outlives the deadline it was issued under is diagnosable by itself:
+    /// nothing renews it and no polling has to notice (plan 49g G1 item 1).
+    #[test]
+    fn an_expired_submission_is_diagnosable_without_polling() {
+        let progress = ConsumerProgress::new();
+        let q = queue(3);
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+
+        assert!(progress.note_pull_submitting(&q, lease.epoch(), Duration::from_millis(20)));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            0
+        );
+
+        progress.review49g_expire_submitting(&q);
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (snapshot.lost_pull_queues, snapshot.leased_queues),
+            (1, 1),
+            "an expired wait for pull-service room stayed invisible to repair"
+        );
+
+        // Retiring it by hand is likewise owned work: a stale epoch may not clear the current one,
+        // and forgetting twice is harmless.
+        progress.forget_pull_submitting(&q, lease.epoch() + 1);
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .leased_queues,
+            1
+        );
+        progress.forget_pull_submitting(&q, lease.epoch());
+        progress.forget_pull_submitting(&q, lease.epoch());
     }
 }

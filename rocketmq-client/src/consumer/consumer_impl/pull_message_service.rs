@@ -152,12 +152,17 @@ impl PullMessageService {
     /// thousands of requests for other queues while health read the still-held lease as work in
     /// progress. Room is reserved first, so the hand-off itself cannot wait:
     ///
-    /// 1. reserve capacity, bounded by `deadline` and ended by `cancelled`;
-    /// 2. record this request's queued expectation while nothing can observe it yet;
-    /// 3. make it visible with no await in between.
+    /// 1. record that this submission is waiting for room, under `deadline` itself (plan 49g G1),
+    ///    so the wait has an owner and an expiry instead of reading as a loop that stopped working;
+    /// 2. reserve capacity, bounded by `deadline` and ended by `cancelled`;
+    /// 3. turn that submitting expectation into the queued one while nothing can observe the
+    ///    request yet - both moves happen in one progress write, so no window describes a visible
+    ///    request as owed nothing;
+    /// 4. make it visible with no await in between.
     ///
-    /// Anything other than [`Admission::Accepted`] drops the request, which releases only **its
-    /// own** lease: the queue stays lost and a later round owns it again (plan 49f F4).
+    /// Anything other than [`Admission::Accepted`] drops the request and retires its phase
+    /// expectation, releasing only **its own** lease: the queue stays lost and a later round
+    /// owns it again (plan 49f F4, plan 49g G1).
     pub(crate) async fn admit_pull_request(
         &self,
         pull_request: PullRequest,
@@ -171,6 +176,30 @@ impl PullMessageService {
         if tx.is_closed() {
             return Admission::Closed;
         }
+        // Step 1: the wait for capacity is owned work, bounded by the deadline its caller issued
+        // and by nothing else. Status polling cannot renew it, and once it passes the queue
+        // is diagnosable again on its own (plan 49g G1 item 1).
+        let submitting = pull_request.lease().map(|lease| {
+            lease.note_submitting({
+                let now = tokio::time::Instant::now();
+                if deadline > now {
+                    deadline - now
+                } else {
+                    std::time::Duration::ZERO
+                }
+            })
+        });
+        if matches!(submitting, Some(false)) {
+            // Its acquisition ended before this request could even start waiting for room.
+            return Admission::Superseded;
+        }
+        let retiring = pull_request.lease().cloned();
+        let not_accepted = |admission: Admission| {
+            if let Some(lease) = retiring {
+                lease.forget_submitting();
+            }
+            admission
+        };
         let stopping = cancelled.cloned();
         let watching = stopping.is_some();
         match tokio::select! {
@@ -180,13 +209,13 @@ impl PullMessageService {
                     Some(token) => token.cancelled().await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if watching => return Admission::Cancelled,
-            _ = tokio::time::sleep_until(deadline) => return Admission::TimedOut,
+            }, if watching => return not_accepted(Admission::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return not_accepted(Admission::TimedOut),
             reserved = tx.clone().reserve_owned() => reserved,
         } {
-            Err(_) => Admission::Closed,
+            Err(_) => not_accepted(Admission::Closed),
             Ok(permit) => {
-                // Steps 2 and 3: the expectation belongs to the acquisition that issued the request
+                // Steps 3 and 4: the expectation belongs to the acquisition that issued the request
                 // and is recorded before its receiver can see it; `send` on a held permit never
                 // waits.
                 if let Some(lease) = pull_request.lease() {
@@ -399,5 +428,190 @@ mod review49f {
         let mut pull_request = request(queue);
         pull_request.hold_lease(lease);
         pull_request
+    }
+}
+
+#[cfg(test)]
+mod review49g {
+    use super::*;
+
+    /// A request for a queue nothing else tracks, used to fill the capture channel.
+    fn filler() -> PullRequest {
+        PullRequest::new(
+            CheetahString::from_static_str("review49g-filler"),
+            MessageQueue::from_parts("T", "dummy", 0),
+            Arc::new(ProcessQueue::new()),
+            0,
+        )
+    }
+    use crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use cheetah_string::CheetahString;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_the_last_queued_request_must_retire_its_expectation() {
+        let p = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        p.note_queue_installed(&q);
+        p.review49f_age_activity(&q, Duration::from_secs(31));
+        let mut service = PullMessageService::new();
+        let mut capture = service.review49e_capture();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49g-drop"),
+            q.clone(),
+            Arc::new(ProcessQueue::new()),
+            7,
+        );
+        request.hold_lease(p.acquire_pull_lease(&q).unwrap());
+        assert_eq!(
+            service
+                .admit_pull_request(request, tokio::time::Instant::now() + Duration::from_secs(1), None)
+                .await,
+            Admission::Accepted
+        );
+        let live = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!((live.lost_pull_queues, live.leased_queues), (0, 1));
+        drop(capture.try_recv().unwrap());
+        let s = p.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "last queued owner dropped: lost={} leased={}",
+            s.lost_pull_queues, s.leased_queues
+        );
+        assert_eq!(s.leased_queues, 0);
+        assert_eq!(
+            s.lost_pull_queues, 1,
+            "queued health outlived the only task that owed the next pull"
+        );
+    }
+
+    /// A submission that is waiting for room is owned work with an expiry of its own, and it
+    /// becomes exactly one queued expectation the moment room appears - never two expectations,
+    /// and never nothing in between (plan 49g G1 items 2-3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_capacity_wait_becomes_one_queued_expectation_when_room_appears() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let mut service = PullMessageService::new();
+        let mut capture = service.review49e_capture();
+        for _ in 0..32 {
+            service.execute_pull_request_immediately(filler()).await;
+        }
+
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+        let mut pull_request = PullRequest::new(
+            CheetahString::from_static_str("review49g-wait"),
+            q.clone(),
+            Arc::new(ProcessQueue::new()),
+            7,
+        );
+        pull_request.hold_lease(Arc::clone(&lease));
+
+        let admit =
+            service.admit_pull_request(pull_request, tokio::time::Instant::now() + Duration::from_secs(5), None);
+        tokio::pin!(admit);
+        // One poll without consuming it: no room means the hand-off has to wait.
+        if let Ok(admission) = tokio::time::timeout(Duration::ZERO, admit.as_mut()).await {
+            panic!("the request was admitted with no room in the channel ({admission:?})");
+        }
+
+        // While it waits, its queue is owned work: not lost, whatever its history says.
+        let waiting = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "mid-wait: lost={} leased={}",
+            waiting.lost_pull_queues, waiting.leased_queues
+        );
+        assert_eq!((waiting.lost_pull_queues, waiting.leased_queues), (0, 1));
+
+        // What vouches for it is the submission's own window and nothing else: once that passes,
+        // the queue is diagnosable again even though the wait has not been cancelled (plan
+        // 49g G1 item 1).
+        progress.review49g_expire_submitting(&q);
+        let expired = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (expired.lost_pull_queues, expired.leased_queues),
+            (1, 1),
+            "an expired wait for capacity stayed invisible to repair"
+        );
+
+        // Room appears: the same request becomes visible and its expectation moves to queued in one
+        // move - exactly one buffered request, no second lease, no gap where it owed nothing.
+        drop(capture.try_recv().unwrap());
+        assert_eq!(admit.await, Admission::Accepted);
+        assert_eq!(capture.len(), 32, "the submission was published twice");
+        let queued = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!((queued.lost_pull_queues, queued.leased_queues), (0, 1));
+        assert_eq!(
+            lease.epoch(),
+            epoch,
+            "acceptance changed the acquisition that owns the queue"
+        );
+
+        // And when the loop's last reference goes with its request destroyed, nothing is left owed.
+        drop(lease);
+        while let Ok(request) = capture.try_recv() {
+            drop(request);
+        }
+        let gone = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!((gone.lost_pull_queues, gone.leased_queues), (1, 0));
+    }
+
+    /// Revocation while a request waits for capacity: the wait ends as superseded, its request is
+    /// never published, and it leaves no expectation on the queue - which now belongs to
+    /// whomever the next allocation assigns it to (plan 49g G1 item 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revoked_acquisition_leaves_nothing_after_its_wait() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        progress.note_queue_installed(&q);
+        let mut service = PullMessageService::new();
+        let mut capture = service.review49e_capture();
+        for _ in 0..32 {
+            service.execute_pull_request_immediately(filler()).await;
+        }
+
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        let mut pull_request = PullRequest::new(
+            CheetahString::from_static_str("review49g-revoked"),
+            q.clone(),
+            Arc::new(ProcessQueue::new()),
+            7,
+        );
+        pull_request.hold_lease(lease);
+
+        let admit =
+            service.admit_pull_request(pull_request, tokio::time::Instant::now() + Duration::from_secs(5), None);
+        tokio::pin!(admit);
+        if let Ok(admission) = tokio::time::timeout(Duration::ZERO, admit.as_mut()).await {
+            panic!("the request was admitted with no room ({admission:?})");
+        }
+
+        // The assignment is taken away while the request waits for room, and then capacity appears.
+        progress.note_queue_revoked(&q);
+        drop(capture.try_recv().unwrap());
+        assert_eq!(admit.await, Admission::Superseded);
+        assert_eq!(capture.len(), 31, "work for an ended acquisition was published");
+
+        let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "after revocation during the wait: assigned={} leased={}",
+            snapshot.assigned_queues, snapshot.leased_queues
+        );
+        assert_eq!((snapshot.assigned_queues, snapshot.leased_queues), (0, 0));
+
+        // A queue handed to a later acquisition starts clean: it inherits no submitting or queued
+        // window from the request that was dropped (plan 49g G3).
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let fresh = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            (fresh.lost_pull_queues, fresh.leased_queues),
+            (1, 0),
+            "the new acquisition was vouched for by a phase expectation it never opened"
+        );
     }
 }
