@@ -36,12 +36,16 @@ use rocketmq_remoting::protocol::header::pull_message_request_header::PullMessag
 use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_remoting::rpc::rpc_request_header::RpcRequestHeader;
 use rocketmq_rust::ArcMut;
+use tracing::debug;
+use tracing::warn;
 
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::PULL_ANSWER_ALLOWANCE_MILLIS;
 use crate::consumer::consumer_impl::pull_request_ext::PullResultExt;
 use crate::consumer::pop_callback::PopCallback;
 use crate::consumer::pull_callback::PullCallback;
 use crate::consumer::pull_status::PullStatus;
 use crate::factory::mq_client_instance::MQClientInstance;
+use crate::factory::mq_client_instance::LOOKUP_LOCK_ALLOWANCE;
 use crate::hook::filter_message_context::FilterMessageContext;
 use crate::hook::filter_message_hook::FilterMessageHook;
 use crate::implementation::communication_mode::CommunicationMode;
@@ -50,6 +54,18 @@ use crate::implementation::mq_client_api_impl::MQClientAPIImpl;
 /// Upper bound on how long a pull or pop waits for another caller's route refresh. The
 /// request's own timeout always wins (plan 49 section 4.1.4).
 const BROKER_MISS_JOIN_BUDGET_MILLIS: u64 = 500;
+
+/// How a bounded preparation ended before it could hand anything to the transport (plan 49h H2).
+enum Preparation<T> {
+    /// The target was resolved; an RPC may be issued.
+    Resolved(T),
+    /// This caller's consumer stopped. No RPC and no failure evidence: nothing of ours is waiting
+    /// for an answer, and its own cleanup must not wait on this lookup.
+    Stopped,
+    /// The lookup allowance ran out. Reported as the route fault it is - a route refresh is the
+    /// smallest repair that can help - but with no RPC issued and therefore no answer window spent.
+    Expired,
+}
 
 #[derive(Clone)]
 pub struct PullAPIWrapper {
@@ -208,6 +224,74 @@ impl PullAPIWrapper {
         }
     }
 
+    /// Resolve where a pull has to go, before anything is handed to the transport (plan 49h H2).
+    ///
+    /// Table reads, one coalesced route repair or a join of somebody else's, and filter-server
+    /// lookup all happen here. Every one of them is a wait this caller owes and none of them has
+    /// issued an RPC, so the whole function is one cancellable preparation step for its caller.
+    async fn prepare_pull_target(
+        &mut self,
+        mq: &MessageQueue,
+        expression_type: &str,
+        sys_flag: i32,
+        repair_budget: Duration,
+    ) -> rocketmq_error::RocketMQResult<(CheetahString, i32)> {
+        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+        let broker_id = self.recalculate_pull_from_which_node(mq);
+        let mut find_broker_result = self
+            .client_instance
+            .find_broker_address_in_subscribe(&broker_name, broker_id, false)
+            .await;
+
+        if find_broker_result.is_none() {
+            // Coalesce the repair across every queue of this topic: one miss fetches, the rest
+            // join it or take its cooldown, and an exhausted wait budget re-checks the tables
+            // without another round trip (plan 49 section 4.1.4).
+            let repaired = self
+                .client_instance
+                .repair_route_after_broker_miss(mq.get_topic_cs(), repair_budget)
+                .await;
+            if repaired {
+                let broker_name_again = self.client_instance.get_broker_name_from_message_queue(mq).await;
+                let broker_id_again = self.recalculate_pull_from_which_node(mq);
+                find_broker_result = self
+                    .client_instance
+                    .find_broker_address_in_subscribe(&broker_name_again, broker_id_again, false)
+                    .await;
+            }
+        }
+
+        let Some(find_broker_result) = find_broker_result else {
+            return Err(mq_client_err!(format!(
+                "The broker[{}] not exist",
+                mq.get_broker_name(),
+            )));
+        };
+
+        if !ExpressionType::is_tag_type(Some(expression_type))
+            && find_broker_result.broker_version < RocketMqVersion::V4_1_0_SNAPSHOT as i32
+        {
+            return Err(mq_client_err!(format!(
+                "The broker[{}],[{}] does not support consumer to filter message by tag[{}]",
+                mq.get_broker_name(),
+                find_broker_result.broker_version,
+                expression_type
+            )));
+        }
+
+        let mut sys_flag_inner = sys_flag;
+        if find_broker_result.slave {
+            sys_flag_inner = PullSysFlag::clear_commit_offset_flag(sys_flag_inner as u32) as i32;
+        }
+        let mut broker_addr = find_broker_result.broker_addr.clone();
+        if PullSysFlag::has_class_filter_flag(sys_flag_inner as u32) {
+            broker_addr = self
+                .compute_pull_from_which_filter_server(mq.get_topic_cs(), &broker_addr)
+                .await?;
+        }
+        Ok((broker_addr, sys_flag_inner))
+    }
+
     /// Pulls messages from the broker asynchronously.
     ///
     /// # Arguments
@@ -245,58 +329,90 @@ impl PullAPIWrapper {
         broker_suspend_max_time_millis: u64,
         timeout_millis: u64,
         communication_mode: CommunicationMode,
-        pull_callback: PCB,
+        mut pull_callback: PCB,
     ) -> rocketmq_error::RocketMQResult<Option<PullResultExt>>
     where
         PCB: PullCallback + 'static,
     {
-        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
-        let broker_id = self.recalculate_pull_from_which_node(mq);
-        let mut find_broker_result = self
-            .client_instance
-            .find_broker_address_in_subscribe(&broker_name, broker_id, false)
-            .await;
-
-        if find_broker_result.is_none() {
-            // Coalesce the repair across every queue of this topic: one miss fetches, the rest
-            // join it or take its cooldown, and an exhausted wait budget re-checks the tables
-            // without another round trip (plan 49 section 4.1.4).
-            let repaired = self
-                .client_instance
-                .repair_route_after_broker_miss(
-                    mq.get_topic_cs(),
-                    Duration::from_millis(timeout_millis.min(BROKER_MISS_JOIN_BUDGET_MILLIS)),
-                )
-                .await;
-            if repaired {
-                let broker_name_again = self.client_instance.get_broker_name_from_message_queue(mq).await;
-                let broker_id_again = self.recalculate_pull_from_which_node(mq);
-                find_broker_result = self
-                    .client_instance
-                    .find_broker_address_in_subscribe(&broker_name_again, broker_id_again, false)
-                    .await;
+        // Plan 49h H3: everything between here and the transport hand-off is *preparation*. It has
+        // issued no RPC, so what bounds it is this SDK's own lookup allowance - one absolute
+        // deadline for the whole step, not a fresh allowance per stage - and never the
+        // answer window of an attempt that has not been issued.
+        let lookup_allowance =
+            Duration::from_millis(self.client_instance.client_config.mq_client_api_timeout) + LOOKUP_LOCK_ALLOWANCE;
+        if !pull_callback.begin_preparation(lookup_allowance) {
+            debug!(
+                queue = %mq,
+                "this queue's acquisition ended before its pull started preparing, issuing no RPC"
+            );
+            return Ok(None);
+        }
+        let cancellation = pull_callback.cancellation();
+        // Plan 49h H2: preparation is a wait this caller owes and the consumer may stop while it
+        // runs. Cancellation is polled first, so a stop ready at the same moment as a lookup result
+        // ends the preparation instead of issuing an RPC nobody asked for.
+        let prepared = {
+            let prepare = self.prepare_pull_target(
+                mq,
+                expression_type.as_str(),
+                sys_flag,
+                Duration::from_millis(timeout_millis.min(BROKER_MISS_JOIN_BUDGET_MILLIS)),
+            );
+            tokio::pin!(prepare);
+            let deadline = tokio::time::sleep_until(tokio::time::Instant::now() + lookup_allowance);
+            tokio::pin!(deadline);
+            let stopped = async {
+                match cancellation.as_ref() {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = stopped => Preparation::Stopped,
+                _ = &mut deadline => Preparation::Expired,
+                outcome = &mut prepare => match outcome {
+                    Ok(target) => Preparation::Resolved(target),
+                    Err(error) => return Err(error),
+                },
             }
+        };
+        let (broker_addr, sys_flag_inner) = match prepared {
+            Preparation::Resolved(target) => target,
+            // Stopping is not a fault here: nothing was issued and nothing of ours is waiting.
+            Preparation::Stopped => {
+                debug!(
+                    queue = %mq,
+                    "this consumer stopped while its pull was resolving a broker address, issuing no RPC"
+                );
+                return Ok(None);
+            }
+            // The lookup allowance ran out. Reported as the route fault it is: there is still no RPC
+            // here, so no answer window of ours has been spent on it (plan 49h H3).
+            Preparation::Expired => {
+                warn!(
+                    queue = %mq,
+                    allowance_ms = lookup_allowance.as_millis(),
+                    "route preparation did not resolve a broker address inside its own allowance, ending this pull without issuing an RPC"
+                );
+                return Err(mq_client_err!(format!(
+                    "The route of broker[{}] was not prepared inside its allowance",
+                    mq.get_broker_name(),
+                )));
+            }
+        };
+
+        // One last look before the task leaves this process: a stop that arrived while preparation
+        // was finishing must still not be answered with an RPC (plan 49h H2).
+        if cancellation.as_ref().is_some_and(|token| token.is_cancelled()) {
+            debug!(
+                queue = %mq,
+                "this consumer stopped between preparation and hand-off, issuing no RPC"
+            );
+            return Ok(None);
         }
 
-        if let Some(find_broker_result) = find_broker_result {
-            {
-                if !ExpressionType::is_tag_type(Some(expression_type.as_str()))
-                    && find_broker_result.broker_version < RocketMqVersion::V4_1_0_SNAPSHOT as i32
-                {
-                    return Err(mq_client_err!(format!(
-                        "The broker[{}],[{}] does not support consumer to filter message by tag[{}]",
-                        mq.get_broker_name(),
-                        find_broker_result.broker_version,
-                        expression_type
-                    )));
-                }
-            }
-
-            let mut sys_flag_inner = sys_flag;
-            if find_broker_result.slave {
-                sys_flag_inner = PullSysFlag::clear_commit_offset_flag(sys_flag_inner as u32) as i32;
-            }
-
+        {
             let request_header = PullMessageRequestHeader {
                 consumer_group: self.consumer_group.clone(),
                 topic: CheetahString::from_string(mq.get_topic().to_string()),
@@ -323,11 +439,16 @@ impl PullAPIWrapper {
                 }),
             };
 
-            let mut broker_addr = find_broker_result.broker_addr.clone();
-            if PullSysFlag::has_class_filter_flag(sys_flag_inner as u32) {
-                broker_addr = self
-                    .compute_pull_from_which_filter_server(mq.get_topic_cs(), &broker_addr)
-                    .await?;
+            // Plan 49h H3: **this** is where the request reaches the transport, after every route
+            // and broker lookup, so its answer window starts here and nowhere earlier.
+            // Refusing admission means this queue's acquisition ended while preparing:
+            // no RPC, no attempt, no fault.
+            if !pull_callback.admit_rpc(Duration::from_millis(timeout_millis + PULL_ANSWER_ALLOWANCE_MILLIS)) {
+                debug!(
+                    queue = %mq,
+                    "this queue's acquisition ended while its pull was preparing, issuing no RPC"
+                );
+                return Ok(None);
             }
 
             MQClientAPIImpl::pull_message(
@@ -339,11 +460,6 @@ impl PullAPIWrapper {
                 pull_callback,
             )
             .await
-        } else {
-            Err(mq_client_err!(format!(
-                "The broker[{}] not exist",
-                mq.get_broker_name(),
-            )))
         }
     }
 

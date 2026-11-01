@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_common::common::mix_all;
@@ -124,6 +125,28 @@ pub trait PullCallbackLocal: Sync {
     fn cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
         None
     }
+
+    /// Says that this caller is resolving the address its pull needs, before the first wait that
+    /// could fail to resolve it (plan 49h H3).
+    ///
+    /// `allowance` is how long the whole of that preparation may take. Returning `false` means this
+    /// caller's acquisition has ended and neither the preparation nor the RPC behind it may start.
+    /// The default records nothing, which is what a caller with no tracked queue wants.
+    fn begin_preparation(&mut self, allowance: Duration) -> bool {
+        let _ = allowance;
+        true
+    }
+
+    /// Admits the attempt for the RPC about to be published, under the answer window it will be
+    /// issued with (plan 49h H3).
+    ///
+    /// This is called with nothing left between it and the transport, so an answer window can never
+    /// cover route or broker preparation. Returning `false` means this caller's acquisition ended
+    /// while preparing and no RPC may be issued; the default issues every request as before.
+    fn admit_rpc(&mut self, answer_window: Duration) -> bool {
+        let _ = answer_window;
+        true
+    }
 }
 
 pub(crate) struct DefaultPullCallback {
@@ -155,6 +178,44 @@ impl DefaultPullCallback {
 impl PullCallback for DefaultPullCallback {
     fn cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
         Some(self.push_consumer_impl.work.cancellation())
+    }
+
+    /// Preparation is work this loop owes before any RPC exists, so it is expected to finish inside
+    /// the lookup allowance that bounds it - and only while the acquisition that owns this request
+    /// still does (plan 49h H3).
+    fn begin_preparation(&mut self, allowance: Duration) -> bool {
+        match self.pull_request.as_ref().and_then(PullRequest::lease) {
+            // Nothing tracks this request's loop, so there is no expectation to open.
+            None => true,
+            Some(lease) => lease.note_preparing(allowance),
+        }
+    }
+
+    /// Records the attempt at the moment its RPC is handed over, which is the only point where an
+    /// answer window describes reality (plan 49h H3). The identity goes into the request this
+    /// callback owns, before the task that may answer it exists.
+    fn admit_rpc(&mut self, answer_window: Duration) -> bool {
+        let tracked = self.pull_request.as_ref().and_then(|request| {
+            request
+                .lease()
+                .map(|lease| (request.get_message_queue().clone(), lease.epoch()))
+        });
+        let Some((queue, epoch)) = tracked else {
+            return true;
+        };
+        // An acquisition that ended while its pull was resolving an address issued nothing, and a
+        // replacement's attempt is not this one to open.
+        let Some(attempt_id) = self
+            .push_consumer_impl
+            .progress
+            .begin_pull_attempt(&queue, epoch, answer_window)
+        else {
+            return false;
+        };
+        if let Some(request) = self.pull_request.as_mut() {
+            request.set_attempt_id(attempt_id);
+        }
+        true
     }
 
     async fn on_success(&mut self, mut pull_result_ext: PullResultExt) {

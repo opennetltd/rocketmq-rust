@@ -25,11 +25,14 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 
 use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_common::TimeUtils::get_current_millis;
+
+use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use tracing::debug;
 use tracing::error;
 
@@ -301,9 +304,16 @@ impl ProgressSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct QueueProgress {
     epoch: u64,
+    /// The **exact** process queue this acquisition was installed with (plan 49h H1).
+    ///
+    /// A dropped flag and a matching message-queue key are properties any unrelated object can
+    /// have; only this object speaks for the work the loop is doing. It is held weakly - progress
+    /// tracking must not keep a retired process queue alive - so an installation that has been
+    /// thrown away stops vouching for anything by itself.
+    bound: Option<Weak<ProcessQueue>>,
     /// When this acquisition last **completed** work. Only completion refreshes it, so a queue that
     /// keeps launching retries or waiting on flow control still reads as silent (plan 49c C2).
     last_progress_ms: u64,
@@ -329,6 +339,11 @@ struct QueueProgress {
     /// yet, so it gets the stall allowance measured from **admission** rather than looking like a
     /// lost pull because its previous answer is old (plan 49f F2). `0` means nothing is queued.
     queued_since_ms: u64,
+    /// Not after this instant may a request still be treated as preparing to reach the transport
+    /// (plan 49h H3): resolving the broker address is work the loop owes, and it happens before an
+    /// RPC exists, so it is judged by the lookup allowance that bounds it rather than by the
+    /// answer window of an attempt that was never issued. `0` means nothing is preparing.
+    preparing_until_ms: u64,
     /// Not after this instant may a submission still be treated as waiting for room in the shared
     /// pull service (plan 49g G1). Recording it *before* the wait is what separates "this loop's
     /// work is validly waiting for capacity" from "the loop stopped working": the window comes from
@@ -353,6 +368,9 @@ struct QueueProgress {
 /// (plan 49g G3). Neither phase counts as completed work - issuing is not finishing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PullPhase {
+    /// Resolving the broker address this pull needs, inside the SDK's own lookup allowance
+    /// (plan 49h H3). Before an RPC exists there is no answer window to spend.
+    Preparing,
     /// Waiting for room in the process-wide pull channel, inside the caller's admission deadline.
     Submitting,
     /// Accepted by the shared service and owed an attempt inside the stall allowance measured from
@@ -366,13 +384,15 @@ pub(crate) enum PullPhase {
 /// allowance, and "not valid after this instant" for [`PullPhase::Submitting`], which carries the
 /// deadline its caller issued the admission under.
 fn set_pull_phase(entry: &mut QueueProgress, phase: Option<PullPhase>, stamp: u64) {
-    let (queued_since_ms, submitting_until_ms) = match phase {
-        Some(PullPhase::Queued) => (stamp, 0),
-        Some(PullPhase::Submitting) => (0, stamp),
-        None => (0, 0),
+    let (queued_since_ms, submitting_until_ms, preparing_until_ms) = match phase {
+        Some(PullPhase::Queued) => (stamp, 0, 0),
+        Some(PullPhase::Submitting) => (0, stamp, 0),
+        Some(PullPhase::Preparing) => (0, 0, stamp),
+        None => (0, 0, 0),
     };
     entry.queued_since_ms = queued_since_ms;
     entry.submitting_until_ms = submitting_until_ms;
+    entry.preparing_until_ms = preparing_until_ms;
 }
 
 /// One in-flight pull of one queue acquisition (plan 49a F4 section 4.3 item 3).
@@ -382,6 +402,22 @@ fn set_pull_phase(entry: &mut QueueProgress, phase: Option<PullPhase>, stamp: u6
 /// consumer stopped, request dropped while still queued - cannot leave its queue permanently
 /// leased. A retry of the same loop carries the same token and therefore keeps holding it, which is
 /// what makes "one pull per queue" hold across delayed retries instead of only within a single RPC.
+/// Why a request was not allowed to run under its queue's acquisition (plan 49h H1). Each is a
+/// reason to drop exactly one request, never to restart or exit anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchRefusal {
+    /// The process queue it carries has already been retired; nothing runs work for a dropped
+    /// object.
+    Dropped,
+    /// Something says which process queue this acquisition runs on - the live table entry or the
+    /// binding published with the installation - and this request does not name it.
+    ForeignQueue,
+    /// A loop already owes this queue its next pull; a second would stack behind it.
+    AlreadyOwned,
+    /// This incarnation was never assigned the queue, or the acquisition it names has ended.
+    NotAssigned,
+}
+
 pub(crate) struct PullLease {
     progress: Arc<ConsumerProgress>,
     queue: MessageQueue,
@@ -415,6 +451,18 @@ impl PullLease {
     /// Take back a submitting expectation whose wait ended without becoming visible (plan 49g G1).
     pub(crate) fn forget_submitting(&self) {
         self.progress.forget_pull_submitting(&self.queue, self.epoch);
+    }
+
+    /// Record that a request carrying this lease is resolving the address it will pull from,
+    /// bounded by the lookup allowance that bounds that preparation (plan 49h H3). False means the
+    /// acquisition ended and no preparation - nor the RPC behind it - may start for its behalf.
+    pub(crate) fn note_preparing(&self, window: Duration) -> bool {
+        self.progress.note_pull_preparing(&self.queue, self.epoch, window)
+    }
+
+    /// Take back a preparation expectation that ended without an RPC being issued (plan 49h H3).
+    pub(crate) fn forget_preparing(&self) {
+        self.progress.forget_pull_preparing(&self.queue, self.epoch);
     }
 }
 
@@ -567,6 +615,10 @@ struct QueueStanding {
     /// inside the deadline it was issued under (plan 49g G1). Without it a valid capacity wait
     /// read as an idle lease, so replacement was charged for work that had not failed yet.
     submitting: bool,
+    /// This loop is resolving the address its pull needs, inside the lookup allowance that bounds
+    /// that preparation (plan 49h H3). An RPC answer window says nothing about it, because no RPC
+    /// has been issued to spend one.
+    preparing: bool,
 }
 
 impl QueueStanding {
@@ -576,11 +628,41 @@ impl QueueStanding {
     fn is_lost(&self) -> bool {
         self.overdue
             || self.idle_lease
-            || (!self.leased && !self.waiting && !self.queued && !self.submitting && self.silent)
+            || (!self.leased && !self.waiting && !self.queued && !self.submitting && !self.preparing && self.silent)
     }
 }
 
 impl QueueProgress {
+    /// Whether `process_queue` is the object this acquisition runs on (plan 49h H1).
+    ///
+    /// The live table entry wins when there is one - it says what rebalance installed for this key
+    /// right now - and otherwise the binding published with the acquisition decides. A missing or
+    /// expired binding fails closed: identity is never inferred from a key alone.
+    fn identity_matches(&self, process_queue: &Arc<ProcessQueue>, live: Option<&Arc<ProcessQueue>>) -> bool {
+        match live {
+            Some(live) => Arc::ptr_eq(live, process_queue),
+            None => self
+                .bound
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|bound| Arc::ptr_eq(&bound, process_queue)),
+        }
+    }
+
+    /// Binds this acquisition to `process_queue`, but only ever to *complete* a binding: an
+    /// acquisition bound to one live object is never quietly pointed at another, because that would
+    /// hand work owed to a retired process queue to its replacement. A real replacement arrives as
+    /// a new installation with a newer epoch (plan 49h H1).
+    fn complete_binding(&mut self, process_queue: &Arc<ProcessQueue>) {
+        let rebind = match self.bound.as_ref().and_then(Weak::upgrade) {
+            None => true,
+            Some(bound) => Arc::ptr_eq(&bound, process_queue),
+        };
+        if rebind {
+            self.bound = Some(Arc::downgrade(process_queue));
+        }
+    }
+
     fn standing(&self, now_ms: u64, stall: u64, rpc_grace: u64) -> QueueStanding {
         let silent = now_ms.saturating_sub(self.last_progress_ms) >= stall;
         let waiting = self.wait_until_ms > now_ms;
@@ -607,14 +689,25 @@ impl QueueProgress {
         // an expired wait for capacity is a fault like any other unmet expectation (plan
         // 49g G1).
         let submitting = owned && self.submitting_until_ms > now_ms;
+        // Judged by the allowance that bounds the lookup itself: preparation that finishes inside
+        // it is a pull that has not been issued yet, and preparation that ran past it is a
+        // fault like any other unmet expectation (plan 49h H3).
+        let preparing = owned && self.preparing_until_ms > now_ms;
         QueueStanding {
             silent,
             waiting,
             leased: self.pull_leased,
             overdue,
-            idle_lease: self.pull_leased && self.attempt_id == 0 && !waiting && !queued && !submitting && silent,
+            idle_lease: self.pull_leased
+                && self.attempt_id == 0
+                && !waiting
+                && !queued
+                && !submitting
+                && !preparing
+                && silent,
             queued,
             submitting,
+            preparing,
         }
     }
 }
@@ -926,6 +1019,36 @@ impl ConsumerProgress {
         }
     }
 
+    /// Record that this acquisition's loop is resolving the address its next pull needs, for as
+    /// long as the SDK's own lookup allowance bounds that work (plan 49h H3). False means the
+    /// acquisition ended and the caller may neither prepare nor issue an RPC on its behalf.
+    pub(crate) fn note_pull_preparing(&self, queue: &MessageQueue, epoch: u64, window: Duration) -> bool {
+        let mut queues = self.queues.write();
+        match queues.get_mut(queue) {
+            Some(entry) if entry.epoch == epoch && entry.pull_leased => {
+                set_pull_phase(
+                    entry,
+                    Some(PullPhase::Preparing),
+                    get_current_millis().saturating_add(window.as_millis() as u64),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take back a preparation expectation that ended without reaching the transport (plan 49h H3).
+    /// Only the acquisition that recorded it may, and only while preparing is still its phase: an
+    /// admitted attempt or a scheduled wait describes what the loop owes now.
+    pub(crate) fn forget_pull_preparing(&self, queue: &MessageQueue, epoch: u64) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            if entry.epoch == epoch && entry.preparing_until_ms != 0 {
+                set_pull_phase(entry, None, 0);
+            }
+        }
+    }
+
     /// Take back a submitting expectation whose wait ended without the request becoming visible to
     /// its receiver (plan 49g G1). Only the acquisition that recorded it may, and only while
     /// submitting is still the current phase: a queued expectation belongs to a request its
@@ -1063,6 +1186,134 @@ impl ConsumerProgress {
         Self::acquire_queue(&mut queues, &self.next_epoch, queue, now);
     }
 
+    /// Publishes the acquisition of one queue **together with the process queue object that was
+    /// just inserted for it** (plan 49h H1). This is the only place a binding between an
+    /// acquisition and an exact process queue is created, and it happens on the real
+    /// installation path.
+    ///
+    /// A live binding to a different object means replacement: the previous installation's epoch is
+    /// retired here rather than inherited, so work issued against the object it was running on can
+    /// never publish into the new one.
+    pub(crate) fn note_queue_installed_with(&self, queue: &MessageQueue, process_queue: &Arc<ProcessQueue>) {
+        let now = get_current_millis();
+        self.bump(&self.assignments);
+        self.last_assignment_ms.store(now, Ordering::Relaxed);
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            let same_object = entry
+                .bound
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|bound| Arc::ptr_eq(&bound, process_queue));
+            if same_object {
+                // Retained: identity, lease and running work belong to that acquisition.
+                return;
+            }
+            if entry.bound.is_none() && !entry.pull_leased {
+                // Observed by key before (an assignment pass that named the queue without its
+                // process queue): bind it now under the epoch it already holds, and retire nothing.
+                entry.bound = Some(Arc::downgrade(process_queue));
+                return;
+            }
+            // A different object answers for this key: the acquisition that ran on the old one is
+            // over, and its epoch must not outlive it.
+            queues.remove(queue);
+        }
+        Self::acquire_queue(&mut queues, &self.next_epoch, queue, now);
+        if let Some(entry) = queues.get_mut(queue) {
+            entry.bound = Some(Arc::downgrade(process_queue));
+        }
+    }
+
+    /// Whether `process_queue` is the object this incarnation owes `queue`'s work to
+    /// (plan 49h H1), judged **without mutating anything** so a rejected dispatch leaves no trace.
+    ///
+    /// The live table entry is authoritative: it says which object rebalance installed for this key
+    /// right now. Only when the table names nothing does the acquisition's own binding decide, and
+    /// a missing or expired binding fails closed - a dropped flag and a matching key are
+    /// properties an unrelated process queue can have too.
+    pub(crate) fn authorizes_dispatch(
+        &self,
+        queue: &MessageQueue,
+        epoch: Option<u64>,
+        process_queue: &Arc<ProcessQueue>,
+        live: Option<&Arc<ProcessQueue>>,
+    ) -> bool {
+        let queues = self.queues.read();
+        let Some(entry) = queues.get(queue) else {
+            // Not assigned to this incarnation at all: nothing here adopts an acquisition.
+            return false;
+        };
+        Self::epoch_matches(entry, epoch) && QueueProgress::identity_matches(entry, process_queue, live)
+    }
+
+    /// Validates the identity of `process_queue` against this queue's acquisition **and takes its
+    /// loop lease in the same write lock** (plan 49h H1 item 2).
+    ///
+    /// Checking first and claiming second is what let a revocation or reinstallation slip between
+    /// the two: the identity that was proved was no longer the one the claim published. `live`
+    /// is whatever the process queue table held when the caller looked, or `None` where a
+    /// synchronous caller must judge by the binding this acquisition already published.
+    pub(crate) fn claim_pull_lease_for(
+        self: &Arc<Self>,
+        queue: &MessageQueue,
+        epoch: Option<u64>,
+        process_queue: &Arc<ProcessQueue>,
+        live: Option<&Arc<ProcessQueue>>,
+    ) -> Result<Arc<PullLease>, DispatchRefusal> {
+        if process_queue.is_dropped() {
+            return Err(DispatchRefusal::Dropped);
+        }
+        let mut queues = self.queues.write();
+        let Some(entry) = queues.get_mut(queue) else {
+            return Err(DispatchRefusal::NotAssigned);
+        };
+        if !Self::epoch_matches(entry, epoch) {
+            return Err(DispatchRefusal::NotAssigned);
+        }
+        if !QueueProgress::identity_matches(entry, process_queue, live) {
+            return Err(DispatchRefusal::ForeignQueue);
+        }
+        if entry.pull_leased {
+            // A loop already owes this queue its next pull; a second one would stack behind it.
+            return Err(DispatchRefusal::AlreadyOwned);
+        }
+        entry.pull_leased = true;
+        // Taking the lease says one loop owns this queue; it starts no RPC timer, and a wait
+        // scheduled before the claim is no longer an expectation anyone owes (plan 49d R1).
+        entry.wait_until_ms = 0;
+        // From now on this acquisition answers for exactly this object.
+        QueueProgress::complete_binding(entry, process_queue);
+        let epoch = entry.epoch;
+        drop(queues);
+        Ok(Arc::new(PullLease {
+            progress: Arc::clone(self),
+            queue: queue.clone(),
+            epoch,
+        }))
+    }
+
+    fn epoch_matches(entry: &QueueProgress, epoch: Option<u64>) -> bool {
+        match epoch {
+            Some(epoch) => entry.epoch == epoch,
+            // Nothing travels with initial work from rebalance; the current acquisition is its own.
+            None => true,
+        }
+    }
+
+    /// Records the exact process queue an admitted request runs on (plan 49h H1), so a later round
+    /// of the same acquisition is judged against that object and not against whatever answers to
+    /// the key next. Only the acquisition's own epoch may be bound.
+    pub(crate) fn bind_dispatch(&self, queue: &MessageQueue, epoch: u64, process_queue: &Arc<ProcessQueue>) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            if entry.epoch != epoch {
+                return;
+            }
+            entry.complete_binding(process_queue);
+        }
+    }
+
     /// Ends one queue's acquisition because its process queue left the table. Its epoch is retired
     /// with it, so a replacement installation receives a strictly newer identity even when the
     /// desired allocation never changed.
@@ -1088,6 +1339,7 @@ impl ConsumerProgress {
                     queue.clone(),
                     QueueProgress {
                         epoch,
+                        bound: None,
                         last_progress_ms: now,
                         last_pull_ok_ms: now,
                         pull_leased: false,
@@ -1096,6 +1348,7 @@ impl ConsumerProgress {
                         attempt_deadline_ms: 0,
                         wait_until_ms: 0,
                         queued_since_ms: 0,
+                        preparing_until_ms: 0,
                         submitting_until_ms: 0,
                         failure_ms: 0,
                         failure_kind: PullFailureKind::Other,
@@ -3698,7 +3951,7 @@ impl ConsumerProgress {
     /// `(leased, wait_until_ms, queued_since_ms, submitting_until_ms)`. A snapshot cannot tell an
     /// expectation that was retired from one that is merely outvoted by its ownership gate, so this
     /// says directly whether a dropped loop left anything behind.
-    pub(crate) fn review49g_owed(&self, queue: &MessageQueue) -> Option<(bool, u64, u64, u64)> {
+    pub(crate) fn review49g_owed(&self, queue: &MessageQueue) -> Option<(bool, u64, u64, u64, u64)> {
         let queues = self.queues.read();
         queues.get(queue).map(|entry| {
             (
@@ -3706,6 +3959,7 @@ impl ConsumerProgress {
                 entry.wait_until_ms,
                 entry.queued_since_ms,
                 entry.submitting_until_ms,
+                entry.preparing_until_ms,
             )
         })
     }
@@ -3719,6 +3973,20 @@ impl ConsumerProgress {
         if let Some(entry) = queues.get_mut(queue) {
             set_pull_phase(entry, Some(phase), get_current_millis());
         }
+    }
+
+    /// Test seam (plan 49h H3): age a preparation expectation on its own, so a test can watch the
+    /// lookup allowance run out without waiting for a NameServer that never answers.
+    pub(crate) fn review49h_age_preparing(&self, queue: &MessageQueue, age: Duration) {
+        let mut queues = self.queues.write();
+        if let Some(entry) = queues.get_mut(queue) {
+            entry.preparing_until_ms = entry.preparing_until_ms.saturating_sub(age.as_millis() as u64);
+        }
+    }
+
+    /// Test seam (plan 49h H1): which process queue object, if any, this acquisition answers for.
+    pub(crate) fn review49h_bound_to(&self, queue: &MessageQueue) -> Option<std::sync::Weak<ProcessQueue>> {
+        self.queues.read().get(queue).and_then(|entry| entry.bound.clone())
     }
 }
 
@@ -4010,7 +4278,7 @@ mod review49g {
     /// last one dropping retires every request-owned expectation at once (plan 49g G3).
     #[test]
     fn a_dropped_loop_retires_everything_it_owed() {
-        for open in [PullPhase::Submitting, PullPhase::Queued] {
+        for open in [PullPhase::Preparing, PullPhase::Submitting, PullPhase::Queued] {
             let progress = ConsumerProgress::new();
             let q = queue(1);
             progress.note_queue_installed(&q);
@@ -4018,6 +4286,7 @@ mod review49g {
             let loop_owner = progress.acquire_pull_lease(&q).unwrap();
             let epoch = loop_owner.epoch();
             match open {
+                PullPhase::Preparing => assert!(progress.note_pull_preparing(&q, epoch, Duration::from_secs(30))),
                 PullPhase::Submitting => assert!(progress.note_pull_submitting(&q, epoch, Duration::from_secs(30))),
                 PullPhase::Queued => assert!(progress.note_pull_queued(&q, epoch)),
             }
@@ -4057,7 +4326,7 @@ mod review49g {
             // epoch.
             assert_eq!(
                 progress.review49g_owed(&q),
-                Some((false, 0, 0, 0)),
+                Some((false, 0, 0, 0, 0)),
                 "{open:?}: a dropped loop kept an expectation behind"
             );
         }
@@ -4070,7 +4339,7 @@ mod review49g {
     /// G3).
     #[test]
     fn a_phase_expectation_without_an_owner_vouches_for_nothing() {
-        for open in [PullPhase::Submitting, PullPhase::Queued] {
+        for open in [PullPhase::Preparing, PullPhase::Submitting, PullPhase::Queued] {
             let progress = ConsumerProgress::new();
             let q = queue(7);
             progress.note_queue_installed(&q);
@@ -4088,6 +4357,9 @@ mod review49g {
             // gate deciding and not the absence of a window.
             let owner = progress.acquire_pull_lease(&q).unwrap();
             match open {
+                PullPhase::Preparing => {
+                    assert!(progress.note_pull_preparing(&q, owner.epoch(), Duration::from_secs(30)))
+                }
                 PullPhase::Submitting => {
                     assert!(progress.note_pull_submitting(&q, owner.epoch(), Duration::from_secs(30)))
                 }
@@ -4166,5 +4438,258 @@ mod review49g {
         );
         progress.forget_pull_submitting(&q, lease.epoch());
         progress.forget_pull_submitting(&q, lease.epoch());
+    }
+}
+
+/// Plan 49h H1/H3: an acquisition answers for one process queue object, and preparation is judged
+/// by the allowance that bounds it.
+#[cfg(test)]
+mod review49h {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn queue(id: i32) -> MessageQueue {
+        MessageQueue::from_parts("T", "broker", id)
+    }
+
+    /// A dropped flag and a matching key are properties an unrelated process queue can have too, so
+    /// the acquisition is bound to the object rebalance installed - and a replacement begins a new
+    /// acquisition rather than inheriting the old one (plan 49h H1).
+    #[test]
+    fn a_replacement_process_queue_begins_a_new_acquisition() {
+        let progress = ConsumerProgress::new();
+        let q = queue(0);
+        let first = Arc::new(ProcessQueue::new());
+        let second = Arc::new(ProcessQueue::new());
+
+        progress.note_queue_installed_with(&q, &first);
+        let epoch_first = progress.queues.read().get(&q).unwrap().epoch;
+        assert!(progress.review49h_bound_to(&q).is_some(), "installation bound nothing");
+        assert!(progress.authorizes_dispatch(&q, Some(epoch_first), &first, Some(&first)));
+        assert!(!progress.authorizes_dispatch(&q, Some(epoch_first), &second, Some(&first)),);
+
+        // The loop working on the first object holds this acquisition.
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        assert_eq!(lease.epoch(), epoch_first);
+
+        // Binding only ever *completes* a binding: work naming another object - whatever identity
+        // it carries - may not re-point this acquisition, and re-binding its own object is
+        // idempotent.
+        progress.bind_dispatch(&q, epoch_first + 1, &second);
+        progress.bind_dispatch(&q, epoch_first, &second);
+        assert!(
+            Arc::ptr_eq(&progress.review49h_bound_to(&q).unwrap().upgrade().unwrap(), &first),
+            "an acquisition was quietly re-pointed at another process queue"
+        );
+        progress.bind_dispatch(&q, epoch_first, &first);
+
+        // Rebalance installs another object under the same key: that is a new acquisition, with a
+        // strictly newer identity.
+        progress.note_queue_installed_with(&q, &second);
+        let epoch_second = progress.queues.read().get(&q).unwrap().epoch;
+        assert!(epoch_second > epoch_first, "replacement reused the retired identity");
+        assert!(
+            !progress.is_current(&q, epoch_first),
+            "a retired acquisition still vouched for this queue"
+        );
+        // Work carrying either no identity or the old one may not run on the replacement object.
+        assert!(!progress.authorizes_dispatch(&q, None, &first, Some(&second)));
+        assert!(
+            !progress.authorizes_dispatch(&q, Some(epoch_first), &second, Some(&second)),
+            "the retired lease was adopted by the replacement"
+        );
+        assert!(progress.authorizes_dispatch(&q, Some(epoch_second), &second, Some(&second)));
+
+        // Nobody currently installs this queue: its own binding answers, and only for that object.
+        assert!(progress.authorizes_dispatch(&q, None, &second, None));
+        assert!(!progress.authorizes_dispatch(&q, None, &first, None));
+
+        // A queue this incarnation was never assigned authorizes nothing, however plausibly the
+        // request names it.
+        let other = queue(3);
+        assert!(!progress.authorizes_dispatch(&other, None, &second, Some(&second)));
+
+        // The loop that ran on the retired object releases only what it still owns: dropping its
+        // lease must not retire the replacement's acquisition.
+        drop(lease);
+        let queues = progress.queues.read();
+        let after = queues.get(&q).expect("a stale release removed the replacement's entry");
+        assert_eq!(after.epoch, epoch_second);
+        drop(queues);
+
+        // And the binding is weak: observing a queue must never keep a retired process queue alive.
+        let witness = Arc::downgrade(&second);
+        drop(second);
+        drop(first);
+        assert!(
+            witness.upgrade().is_none(),
+            "progress tracking kept a retired process queue alive"
+        );
+    }
+
+    /// Identity and ownership are one decision: what was proved a moment ago may not be claimed
+    /// after a reinstallation slipped in between, and concurrent claims still hand out exactly
+    /// one lease (plan 49h H1 item 2).
+    #[test]
+    fn a_reinstallation_cannot_slip_between_proving_identity_and_claiming() {
+        let progress = ConsumerProgress::new();
+        let q = queue(4);
+        let first = Arc::new(ProcessQueue::new());
+        let replacement = Arc::new(ProcessQueue::new());
+        progress.note_queue_installed_with(&q, &first);
+
+        // A request is validated against the installation of the moment...
+        assert!(progress.authorizes_dispatch(&q, None, &first, None));
+        // ...and rebalance replaces that object before the claim runs.
+        progress.note_queue_installed_with(&q, &replacement);
+        let stale = progress.claim_pull_lease_for(&q, None, &first, None);
+        assert_eq!(
+            stale.err(),
+            Some(DispatchRefusal::ForeignQueue),
+            "work for a retired process queue claimed the replacement's acquisition"
+        );
+        // The object actually installed claims under its own newer identity.
+        let current = progress
+            .claim_pull_lease_for(&q, None, &replacement, None)
+            .expect("the installed process queue could not own its own queue");
+        assert!(progress.is_current(&q, current.epoch()));
+
+        // And however many requests race for the same queue, only one loop may owe its next pull.
+        let progress = ConsumerProgress::new();
+        let q = queue(5);
+        let installed = Arc::new(ProcessQueue::new());
+        progress.note_queue_installed_with(&q, &installed);
+        let racers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(racers));
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..racers {
+            let progress = progress.clone();
+            let q = q.clone();
+            let installed = installed.clone();
+            let barrier = barrier.clone();
+            let winners = winners.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                // A won lease is kept rather than dropped: releasing it would let the next loop
+                // claim legitimately, and this leg is about two loops owing the
+                // same pull at once.
+                match progress.claim_pull_lease_for(&q, None, &installed, None) {
+                    Ok(lease) => {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                        Some(lease)
+                    }
+                    Err(_) => None,
+                }
+            }));
+        }
+        let held: Vec<_> = threads.into_iter().filter_map(|thread| thread.join().ok()).collect();
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "a queue was handed to more than one pull loop at once"
+        );
+        drop(held);
+    }
+
+    /// Preparation is expected to finish inside the lookup allowance that bounds it - which may be
+    /// far longer than an answer window, because no RPC exists yet - and once that allowance
+    /// runs out it is a fault like any other unmet expectation (plan 49h H3).
+    #[test]
+    fn preparation_is_judged_by_the_allowance_that_bounds_it() {
+        let progress = ConsumerProgress::new();
+        let q = queue(1);
+        progress.note_queue_installed(&q);
+        progress.review49f_age_activity(&q, Duration::from_secs(31));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1,
+            "the fixture starts lost and silent"
+        );
+
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+        assert!(
+            !progress.note_pull_preparing(&q, epoch + 5, Duration::from_secs(63)),
+            "an ended acquisition opened this queue's preparation"
+        );
+        assert!(progress.note_pull_preparing(&q, epoch, Duration::from_secs(63)));
+
+        // A lookup still inside its allowance is a pull that has not been issued yet: the 35s
+        // answer window says nothing about it, and looking again changes nothing.
+        for _ in 0..3 {
+            let snapshot = progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+            assert_eq!(
+                snapshot.lost_pull_queues, 0,
+                "the answer window expired while preparation was still within its allowance"
+            );
+        }
+
+        // Nothing was issued, so no attempt is outstanding: the queue is not reported as an RPC
+        // that never finished.
+        let queues = progress.queues.read();
+        let entry = queues.get(&q).unwrap();
+        assert_eq!(entry.attempt_id, 0, "preparation opened an answer window");
+        drop(queues);
+
+        // Once its own allowance runs out the silence counts again, so repair can reach it.
+        progress.review49h_age_preparing(&q, Duration::from_secs(64));
+        assert_eq!(
+            progress
+                .snapshot(Duration::from_secs(30), Duration::from_secs(35))
+                .lost_pull_queues,
+            1,
+            "an expired lookup expectation kept the queue out of repair"
+        );
+    }
+
+    /// Only what actually follows preparation - an admitted RPC, a scheduled wait, or the loop
+    /// letting go - retires its expectation; a stranger's release may not (plan 49h H3).
+    #[test]
+    fn only_what_follows_preparation_retires_it() {
+        let progress = ConsumerProgress::new();
+        let q = queue(2);
+        progress.note_queue_installed(&q);
+        let lease = progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+
+        assert!(progress.note_pull_preparing(&q, epoch, Duration::from_secs(63)));
+        progress.forget_pull_preparing(&q, epoch + 9);
+        assert_ne!(
+            progress.review49g_owed(&q).unwrap().4,
+            0,
+            "another acquisition retired this loop's preparation"
+        );
+
+        // The transport hand-off takes over: from here the attempt's answer window describes the
+        // work.
+        progress.begin_pull_attempt(&q, epoch, Duration::from_secs(35)).unwrap();
+        assert_eq!(
+            progress.review49g_owed(&q).unwrap().4,
+            0,
+            "an admitted attempt still carried a preparation expectation"
+        );
+
+        // A scheduled wait says the same thing from a timer: nothing is resolving an address now.
+        assert!(progress.note_pull_preparing(&q, epoch, Duration::from_secs(63)));
+        assert!(progress.note_queue_wait_for(&q, Some(epoch), Duration::from_millis(500)));
+        assert_eq!(progress.review49g_owed(&q).unwrap().4, 0);
+
+        // The owner may take it back when preparation ended without reaching the transport, and
+        // only while preparing is still what the loop owes.
+        assert!(progress.note_pull_preparing(&q, epoch, Duration::from_secs(63)));
+        progress.forget_pull_preparing(&q, epoch);
+        assert_eq!(progress.review49g_owed(&q).unwrap().4, 0);
+        progress.forget_pull_preparing(&q, epoch);
+
+        // And a loop that stops mid-preparation leaves nothing behind.
+        assert!(lease.note_preparing(Duration::from_secs(63)));
+        drop(lease);
+        let owed = progress.review49g_owed(&q).unwrap();
+        assert_eq!((owed.0, owed.4), (false, 0), "a dropped loop kept a preparation open");
     }
 }

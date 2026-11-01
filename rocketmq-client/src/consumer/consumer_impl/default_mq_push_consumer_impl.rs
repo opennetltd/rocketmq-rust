@@ -110,7 +110,7 @@ const CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: u64 = 1000 * 30;
 /// (plan 49d R1). Covers dispatch and decoding, not a hung RPC; the managed controller's pull
 /// deadline is this same total, so health and repair judge one attempt exactly like the loop that
 /// issued it.
-const PULL_ANSWER_ALLOWANCE_MILLIS: u64 = 5_000;
+pub(crate) const PULL_ANSWER_ALLOWANCE_MILLIS: u64 = 5_000;
 /// How long one queue's next pull may wait for room in the **process-wide** pull channel before
 /// this consumer stops treating the wait as progress and lets health re-dispatch it (plan 49f
 /// F2/F4).
@@ -1067,9 +1067,15 @@ impl DefaultMQPushConsumerImpl {
     /// Publishes the acquisition identity of an installed process queue, so that ownership exists
     /// before any pull is dispatched for it (plan 49c C1). A legacy consumer that leaves assignment
     /// observation to the application publishes nothing.
-    pub(crate) fn note_queue_installed(&self, mq: &MessageQueue) {
+    /// The object is part of what is published (plan 49h H1): the acquisition this creates answers
+    /// for that process queue and no other, so work issued against a retired one cannot adopt it.
+    pub(crate) fn note_queue_installed(
+        &self,
+        mq: &MessageQueue,
+        process_queue: &Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>,
+    ) {
         if self.tracks_assignment() {
-            self.progress.note_queue_installed(mq);
+            self.progress.note_queue_installed_with(mq, process_queue);
         }
     }
 
@@ -1460,11 +1466,39 @@ impl DefaultMQPushConsumerImpl {
             service.execute_pull_request_immediately(pull_request).await;
             return Admission::Accepted;
         }
-        // Ownership first (plan 49g G1): a request that reaches the channel without it leaves its
-        // queue readable only as a lost pull, however healthy the hand-off is.
+        // Identity before anything else (plan 49h H1): a dropped flag and a matching key are
+        // properties an unrelated process queue can have too, and admitting one would let its
+        // answers publish into this acquisition. The live table entry decides, and
+        // rejecting leaves no trace in progress state.
+        let live = self.installed_process_queue(pull_request.get_message_queue()).await;
         let mut pull_request = pull_request;
-        if pull_request.lease().is_none() && !self.adopt_dispatch_lease(&mut pull_request) {
+        if pull_request.lease().is_none() {
+            // Ownership next (plan 49g G1), claimed under the same identity check and write lock
+            // (plan 49h H1): a request that reaches the channel without it leaves its queue
+            // readable only as a lost pull, however healthy the hand-off is.
+            if !self.adopt_dispatch_lease(&mut pull_request, live.as_ref()) {
+                return Admission::Superseded;
+            }
+        } else if !self.progress.authorizes_dispatch(
+            pull_request.get_message_queue(),
+            pull_request.lease_epoch(),
+            pull_request.get_process_queue(),
+            live.as_ref(),
+        ) {
+            debug!(
+                queue = %pull_request.get_message_queue(),
+                "this request does not name the process queue this acquisition runs on, dropping it instead of owning work for another one"
+            );
             return Admission::Superseded;
+        } else if let Some(epoch) = pull_request.lease_epoch() {
+            // And from now on this acquisition answers for that exact object (plan 49h H1), so a
+            // later round cannot be quietly pointed at a process queue installed after
+            // it started.
+            self.progress.bind_dispatch(
+                pull_request.get_message_queue(),
+                epoch,
+                pull_request.get_process_queue(),
+            );
         }
         let cancellation = self.work.cancellation();
         service
@@ -1479,10 +1513,14 @@ impl DefaultMQPushConsumerImpl {
         // timer is this loop's own expectation, and work that will run must not read as a loop that
         // stopped. Adopting here also lets the wait below be recorded for the acquisition that owes
         // it.
+        // Identity and ownership are claimed together, judged by the binding this acquisition was
+        // installed with: this API is synchronous, so it must not reach for an unbounded
+        // asynchronous table lookup to decide what a timer has not yet run (plan 49h H1
+        // item 3).
         let mut pull_request = pull_request;
         if self.managed_lifecycle.load(Ordering::Acquire)
             && pull_request.lease().is_none()
-            && !self.adopt_dispatch_lease(&mut pull_request)
+            && !self.adopt_dispatch_lease(&mut pull_request, None)
         {
             return;
         }
@@ -1519,6 +1557,8 @@ impl DefaultMQPushConsumerImpl {
         let handle = client_instance.runtime_handle();
         let service = client_instance.pull_message_service.clone();
         let work = self.work.clone();
+        let progress = self.progress.clone();
+        let process_queue_table = self.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
         // An expired retry timer is dispatched like any other request: once its delay has passed it
         // needs room in the shared channel, and that wait is bounded and cancellable too
         // (plan 49f F2 item 3).
@@ -1527,6 +1567,26 @@ impl DefaultMQPushConsumerImpl {
             tokio::time::sleep(std::time::Duration::from_millis(time_delay)).await;
             if !managed {
                 service.execute_pull_request_immediately(pull_request).await;
+                return;
+            }
+            // A timer sleeps while the world changes, so the identity this continuation may work on
+            // is re-read here rather than trusted from when it was scheduled (plan 49h H1): a queue
+            // whose process queue was replaced or removed has no claim on the next admission.
+            let live = process_queue_table
+                .read()
+                .await
+                .get(pull_request.get_message_queue())
+                .cloned();
+            if !progress.authorizes_dispatch(
+                pull_request.get_message_queue(),
+                pull_request.lease_epoch(),
+                pull_request.get_process_queue(),
+                live.as_ref(),
+            ) {
+                debug!(
+                    queue = %pull_request.get_message_queue(),
+                    "a scheduled continuation no longer names the installed process queue, dropping it instead of resuming work for a retired one"
+                );
                 return;
             }
             let cancellation = work.cancellation();
@@ -1682,18 +1742,44 @@ impl DefaultMQPushConsumerImpl {
             return true;
         }
         let queue = pull_request.get_message_queue();
-        match (pull_request.lease_epoch(), self.progress.current_epoch(queue)) {
-            (Some(leased), Some(current)) => leased == current,
-            (None, Some(_)) => match self.progress.acquire_pull_lease(queue) {
-                Some(lease) => {
-                    pull_request.hold_lease(lease);
-                    true
-                }
-                None => false,
-            },
-            // Not assigned to this incarnation any more: end the loop instead of pulling a stranger's queue.
-            _ => false,
+        if pull_request.lease().is_some() {
+            // The same loop continuing: its epoch must still name the acquisition, and it must
+            // still carry the process queue that acquisition was installed with - epoch
+            // equality alone lets a foreign object through (plan 49h H1 item 2).
+            let authorized = self.progress.authorizes_dispatch(
+                queue,
+                pull_request.lease_epoch(),
+                pull_request.get_process_queue(),
+                None,
+            );
+            if !authorized {
+                debug!(
+                    queue = %queue,
+                    "this request no longer names the acquisition or process queue it was dispatched under, ending this loop"
+                );
+            }
+            return authorized;
         }
+        // Work that arrives owning nothing claims identity and ownership in one step, judged by the
+        // published binding (plan 49h H1 item 2).
+        self.adopt_dispatch_lease(pull_request, None)
+    }
+
+    /// The process queue rebalance currently holds for this queue (plan 49h H1).
+    ///
+    /// Read-only on purpose: proving that an installation exists must not create one, and a lookup
+    /// that timed out or found nothing is reported as nothing rather than as a guess.
+    async fn installed_process_queue(
+        &self,
+        queue: &MessageQueue,
+    ) -> Option<Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>> {
+        self.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .read()
+            .await
+            .get(queue)
+            .cloned()
     }
 
     /// Establish loop ownership **before** a request waits for anything (plan 49g G1).
@@ -1708,24 +1794,33 @@ impl DefaultMQPushConsumerImpl {
     /// ended acquisition, and a queue whose loop already holds the lease must not get a second
     /// pull stacked behind it - duplicate initial dispatch included. Both are refused, which
     /// drops just this request.
-    fn adopt_dispatch_lease(&self, pull_request: &mut PullRequest) -> bool {
-        if pull_request.get_process_queue().is_dropped() {
-            debug!(
-                queue = %pull_request.get_message_queue(),
-                "this dispatch named a process queue that has already been retired, dropping it instead of owning work nobody runs"
-            );
-            return false;
-        }
+    /// Proves that this request names the process queue the acquisition runs on **and takes its
+    /// loop lease in one step** (plan 49h H1 item 2), because checking first and claiming
+    /// second is what let a revocation or reinstallation slip between the two: the identity
+    /// proved was no longer the one the claim published. `live` is whatever the process queue
+    /// table held when the caller looked, or `None` where a synchronous caller judges by the
+    /// binding the installation published. Refusal drops exactly this request.
+    fn adopt_dispatch_lease(
+        &self,
+        pull_request: &mut PullRequest,
+        live: Option<&Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>>,
+    ) -> bool {
         let queue = pull_request.get_message_queue();
-        match self.progress.acquire_pull_lease(queue) {
-            Some(lease) => {
+        match self.progress.claim_pull_lease_for(
+            queue,
+            pull_request.lease_epoch(),
+            pull_request.get_process_queue(),
+            live,
+        ) {
+            Ok(lease) => {
                 pull_request.hold_lease(lease);
                 true
             }
-            None => {
+            Err(refusal) => {
                 debug!(
                     queue = %queue,
-                    "no acquisition of this queue is available to own the dispatch - it was revoked, or a loop already owes its next pull"
+                    ?refusal,
+                    "this request may not own this queue's next pull, dropping it instead of working for another process queue"
                 );
                 false
             }
@@ -2277,26 +2372,11 @@ impl DefaultMQPushConsumerImpl {
         let subscription_data = subscription_data.unwrap();
         let this = self.default_mqpush_consumer_impl.clone().unwrap();
         let Some(work) = self.work.enter() else { return };
-        // Plan 49d R1: **this** is where an attempt reaches the transport, after state, pause and
-        // every flow-control check, so its answer window starts here and nowhere earlier.
-        // Loop ownership (the lease) is untouched; a completed pull retires only its own
-        // attempt.
-        if let Some(epoch) = pull_request.lease_epoch() {
-            match self.progress.begin_pull_attempt(
-                &message_queue,
-                epoch,
-                std::time::Duration::from_millis(CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND + PULL_ANSWER_ALLOWANCE_MILLIS),
-            ) {
-                Some(attempt_id) => pull_request.set_attempt_id(attempt_id),
-                None => {
-                    debug!(
-                        queue = %message_queue,
-                        "this queue's acquisition ended before its pull was admitted, dropping the request"
-                    );
-                    return;
-                }
-            }
-        }
+        // Plan 49h H3: an attempt is no longer opened here. Everything between this point and the
+        // socket is route and broker preparation, so opening an answer window now charged that work
+        // to the RPC before it existed; `PullAPIWrapper::pull_kernel_impl` opens it at the
+        // real transport hand-off instead, through `PullCallback::admit_rpc`. Loop
+        // ownership (the lease) is untouched.
         let result = self
             .pull_api_wrapper
             .as_mut()
@@ -4375,7 +4455,8 @@ mod review49g {
             .write()
             .await
             .insert(q.clone(), pq.clone());
-        push.progress.note_queue_installed(&q);
+        // Plan 49h H1: the installation names the object this acquisition runs on.
+        push.progress.note_queue_installed_with(&q, &pq);
         push.progress
             .review49f_age_activity(&q, std::time::Duration::from_secs(31));
         Rebalance::dispatch_pull_request(push.rebalance_impl.as_ref(), vec![PullRequest::new(group, q, pq, 7)], 0)
@@ -4490,23 +4571,23 @@ mod review49g {
         push.client_instance = Some(client.clone());
 
         let q = MessageQueue::from_parts("T", "ready", 0);
+        // Plan 49h H1: a continuation is only ever work owed to the installed process queue, so
+        // this fixture carries that object (as rebalance does) instead of an unrelated one.
+        let pq = Arc::new(ProcessQueue::new());
         push.rebalance_impl
             .rebalance_impl_inner
             .process_queue_table
             .write()
             .await
-            .insert(q.clone(), Arc::new(ProcessQueue::new()));
-        push.progress.note_queue_installed(&q);
+            .insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
         push.progress.review49f_age_activity(&q, Duration::from_secs(31));
         let before = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
         assert_eq!(before.lost_pull_queues, 1, "the fixture starts lost and silent");
 
         // No lease travels with a retry timer's request: ownership has to be taken at dispatch
         // entry.
-        push.execute_pull_request_later(
-            PullRequest::new(group.clone(), q.clone(), Arc::new(ProcessQueue::new()), 9),
-            250,
-        );
+        push.execute_pull_request_later(PullRequest::new(group.clone(), q.clone(), pq, 9), 250);
         let owned = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
         eprintln!(
             "delayed dispatch: lost={} leased={} waiting={}",
@@ -4825,5 +4906,469 @@ mod review49g {
         push.client_instance = Some(client.clone());
         drop(table);
         (push, client, capture, owned)
+    }
+}
+
+#[cfg(test)]
+mod review49h {
+    use super::*;
+    use crate::consumer::consumer_impl::consumer_lifecycle::LifecyclePolicy;
+    use crate::consumer::consumer_impl::consumer_lifecycle::RecoveryMachine;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
+    use crate::factory::route_refresh_guard::BeginRefresh;
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_foreign_process_queue_must_not_adopt_the_installed_acquisition() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49h-identity");
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        ));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-identity-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let installed = Arc::new(ProcessQueue::new());
+        let foreign = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), installed.clone());
+        // Plan 49h H1: rebalance publishes the object it installed, and that is what an acquisition
+        // answers for.
+        push.progress.note_queue_installed_with(&q, &installed);
+        assert!(!foreign.is_dropped());
+        push.execute_pull_request_immediately(PullRequest::new(group.clone(), q.clone(), foreign, 99))
+            .await;
+        let foreign_admitted = capture.len();
+        push.execute_pull_request_immediately(PullRequest::new(group, q, installed, 7))
+            .await;
+        let total = capture.len();
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        eprintln!(
+            "queue identity: foreign_admitted={foreign_admitted} total_after_valid={total} leased={}",
+            s.leased_queues
+        );
+        client.shutdown().await;
+        assert_eq!(
+            foreign_admitted, 0,
+            "a dropped flag is not proof that this ProcessQueue is the installed one"
+        );
+        assert_eq!(total, 1, "the installed queue's own initial request must still enter");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_preparation_must_not_spend_the_rpc_answer_window() {
+        let cc = ClientConfig {
+            mq_client_api_timeout: 60_000,
+            ..Default::default()
+        };
+        let group = CheetahString::from_static_str("review49h-route-window");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        push.subscribe(CheetahString::from_static_str("T"), CheetahString::from_static_str("*"))
+            .await
+            .unwrap();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-route-client", None);
+        push.client_instance = Some(client.clone());
+        push.pull_api_wrapper = Some(ArcMut::new(PullAPIWrapper::new(client.clone(), group.clone(), false)));
+        *push.service_state = ServiceState::Running;
+        let q = MessageQueue::from_parts("T", "missing-broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        // Plan 49h H1: the installation names the object this acquisition runs on.
+        push.progress.note_queue_installed_with(&q, &pq);
+        let mut request = PullRequest::new(group, q.clone(), pq, 7);
+        request.hold_lease(push.progress.acquire_pull_lease(&q).unwrap());
+        let lock = client.nameserver_lock();
+        let guard = lock.lock().await;
+        let mut loop_owner = push.clone();
+        let mut pulling = Box::pin(loop_owner.pull_message(request));
+        let started = tokio::time::Instant::now();
+        tokio::select! { _=&mut pulling=>panic!("the held route lookup must still be preparing the request"), _=tokio::time::sleep(std::time::Duration::from_secs(36))=>{} }
+        let s = push
+            .progress
+            .snapshot(std::time::Duration::from_secs(30), std::time::Duration::from_secs(35));
+        let still_preparing = matches!(
+            client.route_refresh_guard.begin(q.get_topic_cs()),
+            BeginRefresh::Joining
+        );
+        let claims = client.route_refresh_guard.claimed_flights();
+        let mut machine = RecoveryMachine::new(LifecyclePolicy::default(), 1);
+        machine.on_start_result(true, false, false, 0.5);
+        let (state, effects) = machine.on_tick(&s, std::time::Duration::from_secs(35), 0.5);
+        eprintln!(
+            "lookup preparation: elapsed={:?} still_preparing={still_preparing} claims={claims} lost={} \
+             state={state:?} effects={effects:?}",
+            started.elapsed(),
+            s.lost_pull_queues
+        );
+        drop(pulling);
+        drop(guard);
+        client.shutdown().await;
+        assert!(
+            still_preparing && claims == 1,
+            "this must be route preparation, before any broker pull RPC"
+        );
+        assert_eq!(
+            s.lost_pull_queues, 0,
+            "the 35s RPC window expired while the route lookup was still within its valid 63s allowance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review49h_stop {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_must_cancel_route_preparation_before_waiting_for_local_proof() {
+        let cc = ClientConfig {
+            mq_client_api_timeout: 60_000,
+            ..Default::default()
+        };
+        let group = CheetahString::from_static_str("review49h-stop-route");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        push.subscribe(CheetahString::from_static_str("T"), CheetahString::from_static_str("*"))
+            .await
+            .unwrap();
+        let client = MQClientInstance::new_arc(cc, 0, "review49h-stop-route-client", None);
+        push.client_instance = Some(client.clone());
+        push.pull_api_wrapper = Some(ArcMut::new(PullAPIWrapper::new(client.clone(), group.clone(), false)));
+        *push.service_state = ServiceState::Running;
+        let q = MessageQueue::from_parts("T", "missing-broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        // Plan 49h H1: the installation names the object this acquisition runs on.
+        push.progress.note_queue_installed_with(&q, &pq);
+        let mut request = PullRequest::new(group, q.clone(), pq, 7);
+        request.hold_lease(push.progress.acquire_pull_lease(&q).unwrap());
+        let lock = client.nameserver_lock();
+        let guard = lock.lock().await;
+        let mut loop_owner = push.clone();
+        let mut pulling = Box::pin(loop_owner.pull_message(request));
+        tokio::select! {_=&mut pulling=>panic!("fixture must be waiting in route preparation"),_=tokio::time::sleep(std::time::Duration::from_millis(20))=>{}}
+        assert_eq!(client.route_refresh_guard.claimed_flights(), 1);
+        let mut stopper = push.clone();
+        let mut stop =
+            Box::pin(stopper.shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_millis(150)));
+        let first = tokio::select! {proved=&mut stop=>proved,_=&mut pulling=>stop.await};
+        drop(pulling);
+        drop(guard);
+        let after_drop = push
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
+        eprintln!("stop during read-only lookup: first_proof={first} proof_after_caller_drops_lookup={after_drop}");
+        assert!(after_drop, "the same session must complete after the lookup is gone");
+        assert!(
+            first,
+            "consumer cancellation did not reach preparation, so its work token blocked local cleanup"
+        );
+    }
+}
+
+/// Plan 49h H1/H2: identity is re-read where the work actually starts, and a stop that arrives
+/// during preparation issues nothing.
+#[cfg(test)]
+mod review49h_identity {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
+
+    /// A timer sleeps while the world changes, so a continuation whose process queue was replaced
+    /// in the meantime must be dropped rather than resume work for a retired object - and the
+    /// queue's new owner must still be able to work (plan 49h H1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_whose_process_queue_was_replaced_is_dropped() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49h-timer");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-timer-client", None);
+        let mut capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+
+        let q = MessageQueue::from_parts("T", "ready", 0);
+        let retired = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), retired.clone());
+        push.progress.note_queue_installed_with(&q, &retired);
+
+        // Scheduled against the object installed right now.
+        push.execute_pull_request_later(PullRequest::new(group.clone(), q.clone(), retired.clone(), 9), 150);
+
+        // While that timer runs, rebalance replaces the process queue under the same key.
+        let replacement = Arc::new(ProcessQueue::new());
+        {
+            let mut table = push
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await;
+            table.insert(q.clone(), replacement.clone());
+        }
+        push.progress.note_queue_installed_with(&q, &replacement);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            capture.len(),
+            0,
+            "a continuation for a retired process queue resumed work as this acquisition"
+        );
+
+        // The replacement's own request still enters: rejecting the old one did not strand the
+        // queue.
+        push.execute_pull_request_immediately(PullRequest::new(group.clone(), q.clone(), replacement.clone(), 3))
+            .await;
+        assert_eq!(
+            capture.len(),
+            1,
+            "refusing a retired object's work also refused this acquisition's own"
+        );
+        while let Ok(request) = capture.try_recv() {
+            drop(request);
+        }
+
+        // And with nobody installing the key at all, the identity alone decides: work carrying the
+        // predecessor is still not this acquisition's work.
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .remove(&q);
+        push.execute_pull_request_immediately(PullRequest::new(group.clone(), q.clone(), retired, 4))
+            .await;
+        assert_eq!(
+            capture.len(),
+            0,
+            "an uninstalled key let any process queue adopt the acquisition"
+        );
+        push.execute_pull_request_immediately(PullRequest::new(group, q, replacement, 5))
+            .await;
+        assert_eq!(
+            capture.len(),
+            1,
+            "the bound object could no longer run its own acquisition"
+        );
+        while let Ok(request) = capture.try_recv() {
+            drop(request);
+        }
+        client.shutdown().await;
+    }
+    // A request that already owns the loop but names a different process queue must not be admitted
+    // at the channel either: epoch equality alone lets a foreign object through (plan 49h H1
+    // item 2, item 5). Refusal drops exactly that request and issues nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn work_naming_another_process_queue_is_not_admitted_at_the_channel() {
+        let cc = ClientConfig {
+            mq_client_api_timeout: 60_000,
+            ..Default::default()
+        };
+        let group = CheetahString::from_static_str("review49h-dequeue");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        push.subscribe(CheetahString::from_static_str("T"), CheetahString::from_static_str("*"))
+            .await
+            .unwrap();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-dequeue-client", None);
+        push.client_instance = Some(client.clone());
+        push.pull_api_wrapper = Some(ArcMut::new(PullAPIWrapper::new(client.clone(), group.clone(), false)));
+        *push.service_state = ServiceState::Running;
+        let q = MessageQueue::from_parts("T", "missing-broker", 0);
+        let installed = Arc::new(ProcessQueue::new());
+        let foreign = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), installed.clone());
+        push.progress.note_queue_installed_with(&q, &installed);
+
+        // Hold the NameServer lock so anything admitted would block in preparation: what the call
+        // does tells us whether the request was let through.
+        let lock = client.nameserver_lock();
+        let guard = lock.lock().await;
+
+        let mut request = PullRequest::new(group.clone(), q.clone(), foreign, 7);
+        let lease = push.progress.acquire_pull_lease(&q).unwrap();
+        let epoch = lease.epoch();
+        request.hold_lease(lease);
+        let mut loop_owner = push.clone();
+        tokio::time::timeout(Duration::from_millis(100), loop_owner.pull_message(request))
+            .await
+            .expect("a request naming another process queue was admitted to pull");
+        assert_eq!(
+            client.route_refresh_guard.claimed_flights(),
+            0,
+            "the refused request still started route work"
+        );
+        // The acquisition it claimed to continue is untouched, and still answers for the installed
+        // object.
+        assert_eq!(push.progress.current_epoch(&q), Some(epoch));
+        assert!(Arc::ptr_eq(
+            &push.progress.review49h_bound_to(&q).unwrap().upgrade().unwrap(),
+            &installed
+        ));
+
+        // Positive control: the same request carrying the installed object is admitted, and blocks
+        // in preparation behind the held lock.
+        let mut request = PullRequest::new(group, q.clone(), installed.clone(), 7);
+        request.hold_lease(push.progress.acquire_pull_lease(&q).unwrap());
+        let mut loop_task = push.clone();
+        let mut pulling = Box::pin(loop_task.pull_message(request));
+        tokio::select! {
+            _ = &mut pulling => panic!("the installed process queue should have been admitted and blocked in preparation"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert_eq!(client.route_refresh_guard.claimed_flights(), 1);
+        push.work.close();
+        let _ = tokio::time::timeout(Duration::from_secs(70), pulling).await;
+        drop(guard);
+    }
+
+    /// Stopping during preparation is neither an RPC nor a fault: nothing is issued, no retry is
+    /// scheduled behind the stop, and the loop retires what it owed (plan 49h H2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_while_preparing_issues_nothing_and_schedules_nothing() {
+        let cc = ClientConfig {
+            mq_client_api_timeout: 60_000,
+            ..Default::default()
+        };
+        let group = CheetahString::from_static_str("review49h-stop-prepare");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        push.subscribe(CheetahString::from_static_str("T"), CheetahString::from_static_str("*"))
+            .await
+            .unwrap();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49h-stop-prepare-client", None);
+        push.client_instance = Some(client.clone());
+        push.pull_api_wrapper = Some(ArcMut::new(PullAPIWrapper::new(client.clone(), group.clone(), false)));
+        *push.service_state = ServiceState::Running;
+        let q = MessageQueue::from_parts("T", "missing-broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
+        push.progress.review49f_age_activity(&q, Duration::from_secs(31));
+        let mut request = PullRequest::new(group, q.clone(), pq, 7);
+        let loop_owner = push.progress.acquire_pull_lease(&q).unwrap();
+        request.hold_lease(loop_owner.clone());
+
+        let lock = client.nameserver_lock();
+        let guard = lock.lock().await;
+        let mut loop_task = push.clone();
+        let mut pulling = Box::pin(loop_task.pull_message(request));
+        // Preparation is what the pull is doing: still inside its allowance, waiting on a lookup.
+        tokio::select! {
+            _ = &mut pulling => panic!("the fixture must still be preparing the request"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert_eq!(client.route_refresh_guard.claimed_flights(), 1);
+        // A queue that is silent for half a minute is kept out of repair by the lookup alone - it
+        // is the loop's own outstanding work, not an RPC whose answer window ran out.
+        let preparing = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(
+            preparing.lost_pull_queues, 0,
+            "preparation did not vouch for this queue inside its own allowance"
+        );
+
+        // Stop. Cancellation is what a stop does first, and preparation has to answer it.
+        let before = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        push.work.close();
+        let ended = tokio::time::timeout(Duration::from_millis(500), &mut pulling).await;
+        assert!(ended.is_ok(), "preparation did not answer this consumer's stop");
+
+        let after = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        eprintln!(
+            "stop during preparation: retries {} -> {}, leased {} -> {}",
+            before.retries_scheduled, after.retries_scheduled, before.leased_queues, after.leased_queues
+        );
+        assert_eq!(
+            after.retries_scheduled, before.retries_scheduled,
+            "a stop was reported as a failed pull and rescheduled behind it"
+        );
+        // Nothing is owed any more: the loop's own expectations went with it, so repair can reach
+        // the queue instead of waiting out a lookup that already stopped.
+        drop(loop_owner);
+        let gone = push.progress.snapshot(Duration::from_secs(30), Duration::from_secs(35));
+        assert_eq!(gone.leased_queues, 0);
+        assert_eq!(
+            gone.lost_pull_queues, 1,
+            "a stopped preparation kept this queue out of repair"
+        );
+        drop(pulling);
+        drop(guard);
+        client.shutdown().await;
     }
 }

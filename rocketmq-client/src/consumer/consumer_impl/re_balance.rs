@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
@@ -59,7 +60,10 @@ pub trait RebalanceLocal {
     /// Ownership begins here, before any pull is dispatched for that queue; waiting for an
     /// assignment callback
     /// - which waits for a heartbeat - would let the first pull arrive unowned (plan 49c C1).
-    async fn note_queue_installed(&mut self, mq: &MessageQueue);
+    ///
+    /// The object itself is part of the identity (plan 49h H1): work may only be issued against the
+    /// exact process queue this installation published, not merely one with the same key.
+    async fn note_queue_installed(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
 
     /// Ends the acquisition identity of a process queue that has left the table. Its epoch retires
     /// with it so a replacement installation cannot inherit an older loop's lease.

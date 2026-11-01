@@ -34,6 +34,7 @@ use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_rust::ArcMut;
 use rocketmq_rust::WeakArcMut;
 use tokio::sync::RwLock;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -49,6 +50,33 @@ use crate::factory::mq_client_instance::MQClientInstance;
 
 const TIMEOUT_CHECK_TIMES: u32 = 3;
 const QUERY_ASSIGNMENT_TIMEOUT: u64 = 3000;
+
+/// Whether this queue's table entry is still exactly this process queue (plan 49h H1). Dropping a
+/// queue is decided for one object; if rebalance installed another under the same key in the
+/// meantime, that replacement - including its offsets - is somebody else's work.
+async fn table_holds_process_queue(
+    table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    mq: &MessageQueue,
+    pq: &Arc<ProcessQueue>,
+) -> bool {
+    let table = table.read().await;
+    table.get(mq).is_some_and(|current| Arc::ptr_eq(current, pq))
+}
+
+/// Remove this queue's entry only while it is still exactly this process queue, reporting whether
+/// anything was removed (plan 49h H1). Revocation then follows a removal that really happened, so
+/// the pass that dropped a predecessor never retires an acquisition belonging to its replacement.
+async fn remove_process_queue_if_same(
+    table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    mq: &MessageQueue,
+    pq: &Arc<ProcessQueue>,
+) -> bool {
+    let mut table = table.write().await;
+    match table.get(mq) {
+        Some(current) if Arc::ptr_eq(current, pq) => table.remove(mq).is_some(),
+        _ => false,
+    }
+}
 
 pub(crate) struct RebalanceImpl<R> {
     pub(crate) process_queue_table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
@@ -483,16 +511,24 @@ where
         }
 
         for (mq, pq) in remove_queue_map {
+            // Plan 49h H1: this pass decided to drop that object. If the key now answers to a
+            // different process queue, its offsets are not this pass's to erase and its acquisition
+            // is not this pass's to end.
+            if !table_holds_process_queue(&self.process_queue_table, &mq, &pq).await {
+                debug!(
+                    "doRebalance, {:?}, leaving {} alone, it answers to another process queue than the one being \
+                     dropped",
+                    self.consumer_group, mq
+                );
+                continue;
+            }
             let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
                 sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
             } else {
                 false
             };
             if removed {
-                let removed = {
-                    let mut process_queue_table = self.process_queue_table.write().await;
-                    process_queue_table.remove(&mq).is_some()
-                };
+                let removed = remove_process_queue_if_same(&self.process_queue_table, &mq, &pq).await;
                 if removed {
                     // Same rule as the plain rebalance path: leaving the table ends the acquisition
                     // (plan 49c C1).
@@ -608,7 +644,7 @@ where
                             );
                             // Ownership is published before the request is queued for dispatch
                             // (plan 49c C1).
-                            sub_rebalance_impl.note_queue_installed(mq).await;
+                            sub_rebalance_impl.note_queue_installed(mq, &pq).await;
                             pull_request_list.push(PullRequest::new(
                                 self.consumer_group.as_ref().unwrap().clone(),
                                 mq.clone(),
@@ -715,16 +751,23 @@ where
         }
 
         for (mq, pq) in remove_queue_map {
+            // Plan 49h H1: same rule as the repair path above - only the object this pass decided
+            // to drop may be removed and revoked here.
+            if !table_holds_process_queue(&process_queue_table_cloned, &mq, &pq).await {
+                debug!(
+                    "doRebalance, {:?}, leaving {} alone, it answers to another process queue than the one being \
+                     dropped",
+                    self.consumer_group, mq
+                );
+                continue;
+            }
             let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
                 sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
             } else {
                 false
             };
             if removed {
-                let removed = {
-                    let mut process_queue_table = process_queue_table_cloned.write().await;
-                    process_queue_table.remove(&mq).is_some()
-                };
+                let removed = remove_process_queue_if_same(&process_queue_table_cloned, &mq, &pq).await;
                 if removed {
                     // Ownership ends with the table entry. Retiring the acquisition here - rather
                     // than in an assignment callback that has to wait for a heartbeat - means no
@@ -788,7 +831,7 @@ where
                         // would make a slow heartbeat drop the first pull of every new queue with
                         // no retry until the lost-pull detector fires (plan
                         // 49c C1).
-                        sub_rebalance_impl.note_queue_installed(mq).await;
+                        sub_rebalance_impl.note_queue_installed(mq, &pq).await;
                         pull_request_list.push(PullRequest::new(
                             self.consumer_group.as_ref().unwrap().clone(),
                             mq.clone(),
@@ -1241,5 +1284,43 @@ mod tests {
         rebalance.invalidate_rebalance_generation();
 
         assert!(!rebalance.is_rebalance_generation_current(generation));
+    }
+}
+
+/// Plan 49h H1: dropping a queue is decided for one process queue object, and only that object's
+/// removal ends its acquisition.
+#[cfg(test)]
+mod review49h {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replacement_entry_is_not_the_process_queue_being_dropped() {
+        let table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let old = Arc::new(ProcessQueue::new());
+        let replacement = Arc::new(ProcessQueue::new());
+        table.write().await.insert(q.clone(), old.clone());
+
+        // The object this pass decided to drop is still installed: it may be removed.
+        assert!(table_holds_process_queue(&table, &q, &old).await);
+        assert!(!table_holds_process_queue(&table, &q, &replacement).await);
+
+        // A replacement installed under the same key belongs to somebody else's work: neither the
+        // probe nor the removal may touch it.
+        table.write().await.insert(q.clone(), replacement.clone());
+        assert!(
+            !table_holds_process_queue(&table, &q, &old).await,
+            "a retired process queue was still treated as installed"
+        );
+        assert!(
+            !remove_process_queue_if_same(&table, &q, &old).await,
+            "the pass dropping a predecessor removed its replacement"
+        );
+        assert_eq!(table.read().await.len(), 1);
+
+        // The replacement's own pass removes exactly it.
+        assert!(remove_process_queue_if_same(&table, &q, &replacement).await);
+        assert!(table.read().await.is_empty());
+        assert!(!remove_process_queue_if_same(&table, &q, &replacement).await);
     }
 }

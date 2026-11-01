@@ -76,6 +76,10 @@ use crate::producer::producer_impl::topic_publish_info::TopicPublishInfo;
 
 const LOCK_TIMEOUT_MILLIS: u64 = 3000;
 
+/// What waiting for a route table or NameServer snapshot may cost on top of the SDK's own request
+/// timeout, so one allowance covers both (plan 49h H3).
+pub(crate) const LOOKUP_LOCK_ALLOWANCE: Duration = Duration::from_millis(LOCK_TIMEOUT_MILLIS);
+
 /// Cooldown applied to a successful miss-triggered route refresh (plan 49 section
 /// 4.1.4). Scheduled route refreshes are unaffected.
 pub(crate) const ROUTE_REFRESH_COOLDOWN: Duration = Duration::from_millis(1_000);
@@ -1632,8 +1636,7 @@ impl MQClientInstance {
                 // deadline covers lock, fetch and publish: giving up on time
                 // releases the flight as a failure, which is retried behind its own
                 // backoff instead of blocking every joiner forever.
-                let budget = Duration::from_millis(self.client_config.mq_client_api_timeout)
-                    + Duration::from_millis(LOCK_TIMEOUT_MILLIS);
+                let budget = Duration::from_millis(self.client_config.mq_client_api_timeout) + LOOKUP_LOCK_ALLOWANCE;
                 let outcome = self
                     .update_topic_route_info_within(topic, Instant::now() + budget)
                     .await;

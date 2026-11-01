@@ -158,9 +158,9 @@ impl Rebalance for RebalancePushImpl {
         }
     }
 
-    async fn note_queue_installed(&mut self, mq: &MessageQueue) {
+    async fn note_queue_installed(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>) {
         if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
-            impl_.note_queue_installed(mq);
+            impl_.note_queue_installed(mq, process_queue);
         }
     }
 
