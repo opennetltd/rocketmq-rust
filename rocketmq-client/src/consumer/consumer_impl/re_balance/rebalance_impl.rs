@@ -45,6 +45,7 @@ use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::queue_transitions::QueueTransitions;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::factory::mq_client_instance::MQClientInstance;
 
@@ -54,7 +55,7 @@ const QUERY_ASSIGNMENT_TIMEOUT: u64 = 3000;
 /// Whether this queue's table entry is still exactly this process queue (plan 49h H1). Dropping a
 /// queue is decided for one object; if rebalance installed another under the same key in the
 /// meantime, that replacement - including its offsets - is somebody else's work.
-async fn table_holds_process_queue(
+pub(crate) async fn table_holds_process_queue(
     table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
     mq: &MessageQueue,
     pq: &Arc<ProcessQueue>,
@@ -66,7 +67,7 @@ async fn table_holds_process_queue(
 /// Remove this queue's entry only while it is still exactly this process queue, reporting whether
 /// anything was removed (plan 49h H1). Revocation then follows a removal that really happened, so
 /// the pass that dropped a predecessor never retires an acquisition belonging to its replacement.
-async fn remove_process_queue_if_same(
+pub(crate) async fn remove_process_queue_if_same(
     table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
     mq: &MessageQueue,
     pq: &Arc<ProcessQueue>,
@@ -90,6 +91,10 @@ pub(crate) struct RebalanceImpl<R> {
     pub(crate) sub_rebalance_impl: Option<WeakArcMut<R>>,
     pub(crate) topic_broker_rebalance: Arc<RwLock<HashMap<CheetahString, CheetahString>>>,
     pub(crate) topic_client_rebalance: Arc<RwLock<HashMap<CheetahString, CheetahString>>>,
+    /// Which queue is in the middle of being retired (plan 49i I2 item 1). Installation and
+    /// retirement of one key take turns here without either holding the process queue table
+    /// across persistence.
+    pub(crate) queue_transitions: Arc<QueueTransitions>,
     rebalance_generation: Arc<AtomicU64>,
 }
 
@@ -115,6 +120,7 @@ where
             sub_rebalance_impl: None,
             topic_broker_rebalance: Arc::new(RwLock::new(HashMap::with_capacity(64))),
             topic_client_rebalance: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            queue_transitions: QueueTransitions::new(),
             rebalance_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -510,7 +516,20 @@ where
             }
         }
 
+        // One queue is retired by one pass at a time (plan 49i I2 item 1): a pass that reaches a
+        // key already retiring defers that queue and keeps working the others, because
+        // waiting behind slow local persistence would stall every other queue in the same
+        // pass. A retirement that turned an installation away asks for another rebalance
+        // when it ends.
+        let mut deferred_transition = false;
         for (mq, pq) in remove_queue_map {
+            let Some(guard) = self.queue_transitions.try_retire(&mq, &pq) else {
+                debug!(
+                    "doRebalance, {:?}, leaving {} alone, another pass is already retiring it",
+                    self.consumer_group, mq
+                );
+                continue;
+            };
             // Plan 49h H1: this pass decided to drop that object. If the key now answers to a
             // different process queue, its offsets are not this pass's to erase and its acquisition
             // is not this pass's to end.
@@ -520,6 +539,7 @@ where
                      dropped",
                     self.consumer_group, mq
                 );
+                deferred_transition |= guard.release();
                 continue;
             }
             let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
@@ -531,9 +551,11 @@ where
                 let removed = remove_process_queue_if_same(&self.process_queue_table, &mq, &pq).await;
                 if removed {
                     // Same rule as the plain rebalance path: leaving the table ends the acquisition
-                    // (plan 49c C1).
+                    // (plan 49c C1) - and it names the object this pass retired, so a replacement
+                    // installed while persistence ran is not ended by its predecessor (plan 49i I2
+                    // item 3).
                     if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        sub_rebalance.note_queue_revoked(&mq).await;
+                        sub_rebalance.note_queue_revoked(&mq, &pq).await;
                     }
                     changed = true;
                     info!(
@@ -543,6 +565,7 @@ where
                     );
                 }
             }
+            deferred_transition |= guard.release();
         }
 
         let mut remove_queue_map = HashMap::with_capacity(64);
@@ -609,6 +632,18 @@ where
                     !process_queue_table.contains_key(mq)
                 };
                 if missing {
+                    // A retirement of this very key may be waiting on persistence right now (plan
+                    // 49i I2 item 1): publishing an installation into that
+                    // window would let the pass still finishing erase its
+                    // offset, so this queue waits for it and the retiring pass
+                    // asks for another round. Other queues are untouched.
+                    if self.queue_transitions.install_deferred(mq) {
+                        debug!(
+                            "doRebalance, {:?}, deferring {} until the retirement in flight ends",
+                            self.consumer_group, mq
+                        );
+                        continue;
+                    }
                     if is_order && !self.lock(mq).await {
                         warn!(
                             "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -674,7 +709,7 @@ where
                 }
             }
 
-            if !all_mq_locked {
+            if !all_mq_locked || deferred_transition {
                 self.client_instance.as_mut().unwrap().rebalance_later(500);
             }
             sub_rebalance_impl.dispatch_pull_request(pull_request_list, 500).await;
@@ -750,7 +785,17 @@ where
             }
         }
 
+        // The same transition rule as the repair path above (plan 49i I2 item 1): one retirement
+        // per queue, others keep progressing, and an installation turned away is retried.
+        let mut deferred_transition = false;
         for (mq, pq) in remove_queue_map {
+            let Some(guard) = self.queue_transitions.try_retire(&mq, &pq) else {
+                debug!(
+                    "doRebalance, {:?}, leaving {} alone, another pass is already retiring it",
+                    self.consumer_group, mq
+                );
+                continue;
+            };
             // Plan 49h H1: same rule as the repair path above - only the object this pass decided
             // to drop may be removed and revoked here.
             if !table_holds_process_queue(&process_queue_table_cloned, &mq, &pq).await {
@@ -759,6 +804,7 @@ where
                      dropped",
                     self.consumer_group, mq
                 );
+                deferred_transition |= guard.release();
                 continue;
             }
             let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
@@ -772,9 +818,10 @@ where
                     // Ownership ends with the table entry. Retiring the acquisition here - rather
                     // than in an assignment callback that has to wait for a heartbeat - means no
                     // later dispatch, and no replacement installation of the same queue, can
-                    // inherit this loop's identity (plan 49c C1).
+                    // inherit this loop's identity (plan 49c C1). The object is named so that only
+                    // this pass's own acquisition ends (plan 49i I2 item 3).
                     if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        sub_rebalance.note_queue_revoked(&mq).await;
+                        sub_rebalance.note_queue_revoked(&mq, &pq).await;
                     }
                     changed = true;
                     info!(
@@ -784,6 +831,7 @@ where
                     );
                 }
             }
+            deferred_transition |= guard.release();
         }
         // Add new message queue
         let mut all_mq_locked = true;
@@ -799,6 +847,17 @@ where
                 !process_queue_table.contains_key(mq)
             };
             if missing {
+                // An installation must not be published into a retirement of the same key that is
+                // still waiting on persistence (plan 49i I2 item 1): the retiring pass would erase
+                // the offset this one just prepared. Defer the queue and let its completion ask for
+                // another pass.
+                if self.queue_transitions.install_deferred(mq) {
+                    debug!(
+                        "doRebalance, {:?}, deferring {} until the retirement in flight ends",
+                        self.consumer_group, mq
+                    );
+                    continue;
+                }
                 if is_order && !self.lock(mq).await {
                     warn!(
                         "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -865,7 +924,7 @@ where
             }
         }
 
-        if !all_mq_locked {
+        if !all_mq_locked || deferred_transition {
             self.client_instance.as_mut().unwrap().rebalance_later(500);
         }
         sub_rebalance_impl.dispatch_pull_request(pull_request_list, 500).await;
@@ -1322,5 +1381,404 @@ mod review49h {
         assert!(remove_process_queue_if_same(&table, &q, &replacement).await);
         assert!(table.read().await.is_empty());
         assert!(!remove_process_queue_if_same(&table, &q, &replacement).await);
+    }
+}
+
+#[cfg(test)]
+mod review49i {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+    use rocketmq_common::common::consumer::consume_from_where::ConsumeFromWhere;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retirement_waiting_on_io_must_not_erase_a_replacements_offset() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-retirement");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-retirement-client", None);
+        let path = std::env::temp_dir().join(format!("review49i-offsets-{}.json", std::process::id()));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        let store = push.offset_store.as_ref().unwrap().clone();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let old = Arc::new(ProcessQueue::new());
+        let replacement = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), old.clone());
+        push.note_queue_installed(&q, &old);
+        store.update_offset(&q, 7, false).await;
+        let guard = io.lock().await;
+        let mut rebalance = push.rebalance_impl.clone();
+        let empty = HashSet::new();
+        let mut retiring = Box::pin(
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &empty, false),
+        );
+        tokio::select! { _=&mut retiring => panic!("old retirement should wait for the local writer"), _=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        assert!(old.is_dropped(), "fixture did not enter the actual retirement loop");
+        table.write().await.insert(q.clone(), replacement.clone());
+        push.note_queue_installed(&q, &replacement);
+        let epoch = push.progress.current_epoch(&q).unwrap();
+        store.update_offset(&q, 99, false).await;
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromMemory).await, 99);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), &mut retiring)
+            .await
+            .expect("the old writer did not finish");
+        drop(retiring);
+        let replacement_present = table
+            .read()
+            .await
+            .get(&q)
+            .is_some_and(|pq| Arc::ptr_eq(pq, &replacement));
+        let current_epoch = push.progress.current_epoch(&q);
+        let offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "old retirement: replacement_present={replacement_present} epoch={epoch} current_epoch={current_epoch:?} \
+             replacement_offset={offset}"
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        assert!(replacement_present);
+        assert_eq!(current_epoch, Some(epoch));
+        assert_eq!(
+            offset, 99,
+            "identity-safe table removal ran after a key-only offset deletion"
+        );
+    }
+
+    /// The control for the test above: when nothing replaced the queue, retirement still erases its
+    /// own offsets, drops its own entry and ends its own acquisition (plan 49i I2 item 5).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retirement_of_the_same_process_queue_still_clears_its_own_acquisition() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-own-retirement");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-own-retirement-client", None);
+        let path = std::env::temp_dir().join(format!("review49i-own-offsets-{}.json", std::process::id()));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        let store = push.offset_store.as_ref().unwrap().clone();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let owned = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), owned.clone());
+        push.note_queue_installed(&q, &owned);
+        store.update_offset(&q, 7, false).await;
+
+        let guard = io.lock().await;
+        let mut rebalance = push.rebalance_impl.clone();
+        let empty = HashSet::new();
+        let mut retiring = Box::pin(
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &empty, false),
+        );
+        tokio::select! { _=&mut retiring => panic!("retirement should wait for the local writer"), _=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), &mut retiring)
+            .await
+            .expect("the retirement of its own queue never finished");
+        drop(retiring);
+
+        let offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        let epoch = push.progress.current_epoch(&q);
+        let entries = table.read().await.len();
+        eprintln!(
+            "same-owner retirement: offset={offset} epoch={epoch:?} entries={entries} dropped={}\n",
+            owned.is_dropped()
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        assert_eq!(
+            offset, -1,
+            "a retirement that owned its queue stopped erasing the offsets it always erased"
+        );
+        assert_eq!(
+            epoch, None,
+            "the acquisition of the retired process queue survived its own retirement"
+        );
+        assert_eq!(entries, 0, "the retired process queue stayed in the table");
+    }
+
+    /// A retirement that stopped owning its key before it ever reached the offset store asks once
+    /// and stays its hands off - the same question re-asked after persistence is not the only
+    /// guard (plan 49i I2 item 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retirement_that_stopped_owing_the_queue_leaves_its_offsets_alone() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-stale-retirement");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-stale-retirement-client", None);
+        let path = std::env::temp_dir().join(format!("review49i-stale-offsets-{}.json", std::process::id()));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let _io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        let store = push.offset_store.as_ref().unwrap().clone();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let stale = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), stale.clone());
+        push.note_queue_installed(&q, &stale);
+        store.update_offset(&q, 7, false).await;
+
+        // A replacement owns the key before this retirement touches the offset store at all.
+        let replacement = Arc::new(ProcessQueue::new());
+        table.write().await.insert(q.clone(), replacement.clone());
+        push.note_queue_installed(&q, &replacement);
+
+        let mut rebalance = push.rebalance_impl.clone();
+        let _ = std::fs::remove_file(&path);
+        let erased = rebalance.remove_unnecessary_message_queue(&q, &stale).await;
+        let offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        let persisted = std::path::Path::new(&path).exists();
+        // The owner of the key still erases its own offsets.
+        let owned_erased = rebalance.remove_unnecessary_message_queue(&q, &replacement).await;
+        let owned_offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        let owned_persisted = std::path::Path::new(&path).exists();
+        eprintln!(
+            "stale retirement: erased={erased} offset_after={offset} persisted={persisted}; owner: \
+             erased={owned_erased} offset_after={owned_offset} persisted={owned_persisted}"
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        assert!(
+            !erased,
+            "a retirement that no longer owned the key reported clearing it"
+        );
+        assert_eq!(offset, 7, "a stale retirement erased its replacement's offset");
+        assert!(
+            !persisted,
+            "a retirement that no longer owned the key still persisted through the offset store"
+        );
+        assert!(owned_persisted, "the control never wrote the offsets it owns");
+        assert!(owned_erased);
+        assert_eq!(
+            owned_offset, -1,
+            "the owning retirement stopped clearing its own offsets"
+        );
+    }
+
+    /// One queue's transition must not hold up the others: an installation of a key whose
+    /// retirement is in flight waits for it, while an unrelated queue is assigned normally and
+    /// the deferred one is assigned as soon as the retirement ends (plan 49i I2 item 1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_installation_waits_only_behind_a_retirement_of_its_own_key() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-deferred-install");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            // Offsets are prepared from the local store only; no broker is asked for a max offset.
+            consume_from_where: ConsumeFromWhere::ConsumeFromFirstOffset,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-deferred-client", None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        // An assignment pass names its consumer group when it publishes an installation.
+        push.rebalance_impl.rebalance_impl_inner.consumer_group =
+            Some(CheetahString::from_static_str("review49i-deferred-install"));
+        let path = std::env::temp_dir().join(format!("review49i-deferred-{}.json", std::process::id()));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let _io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+
+        let deferred_q = MessageQueue::from_parts("T", "broker", 0);
+        let sibling_q = MessageQueue::from_parts("T", "broker", 1);
+        let retiring_pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+
+        // A retirement of the first key is in flight - its persistence has not returned.
+        let claim = transitions
+            .try_retire(&deferred_q, &retiring_pq)
+            .expect("nothing retires this queue yet");
+
+        let mut assigned = HashSet::new();
+        assigned.insert(deferred_q.clone());
+        assigned.insert(sibling_q.clone());
+        let mut rebalance = push.rebalance_impl.clone();
+        rebalance
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance("T", &assigned, false)
+            .await;
+
+        {
+            let table = table.read().await;
+            assert!(
+                !table.contains_key(&deferred_q),
+                "an installation was published into a retirement of the same key"
+            );
+            assert!(
+                table.contains_key(&sibling_q),
+                "a retirement of one queue stopped an unrelated queue from being assigned"
+            );
+        }
+        assert_eq!(
+            push.progress.current_epoch(&deferred_q),
+            None,
+            "the deferred queue's acquisition was published anyway"
+        );
+
+        // The retirement ends; the next pass assigns the deferred queue like any other.
+        claim.release();
+        rebalance
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance("T", &assigned, false)
+            .await;
+        let installed = table.read().await.contains_key(&deferred_q);
+        let epoch = push.progress.current_epoch(&deferred_q);
+        eprintln!(
+            "deferred install: installed={installed} epoch={epoch:?} sibling_installed={}\n",
+            table.read().await.contains_key(&sibling_q)
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        assert!(
+            installed,
+            "the queue deferred behind a retirement was never assigned once it ended"
+        );
+        assert!(epoch.is_some(), "the deferred installation published no identity");
+    }
+
+    /// A second caller reaching a key whose retirement is already in flight does nothing at all: it
+    /// neither repeats the side effects nor acts on an installation it never owned (plan 49i I2
+    /// item 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_retirement_of_one_queue_does_not_stack_behind_the_first() {
+        use crate::consumer::consumer_impl::re_balance::Rebalance;
+
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-double-retire");
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-double-retire-client", None);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49i-double-{}.json", std::process::id()));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let _io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        let store = push.offset_store.as_ref().unwrap().clone();
+
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let installed = Arc::new(ProcessQueue::new());
+        let other = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), installed.clone());
+        push.note_queue_installed(&q, &installed);
+        store.update_offset(&q, 7, false).await;
+
+        // Somebody else is already retiring this key.
+        let claim = push
+            .rebalance_impl
+            .rebalance_impl_inner
+            .queue_transitions
+            .try_retire(&q, &installed)
+            .expect("nothing retires this queue yet");
+
+        // A second retirement of the same key - even one naming a different object - leaves
+        // everything alone instead of stacking its own round of persistence and offset
+        // removal.
+        let mut rebalance = push.rebalance_impl.clone();
+        tokio::time::timeout(Duration::from_millis(200), rebalance.remove_process_queue(&q, &other))
+            .await
+            .expect("a second retirement waited behind the first instead of deferring this queue");
+        {
+            let table = table.read().await;
+            assert!(
+                table.get(&q).is_some_and(|pq| Arc::ptr_eq(pq, &installed)),
+                "a second retirement changed what the first one owns"
+            );
+        }
+        assert!(push.progress.current_epoch(&q).is_some());
+
+        // The same is true of the object that already owns the transition: it is not retired twice.
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            rebalance.remove_process_queue(&q, &installed),
+        )
+        .await
+        .expect("repeated retirement of the same process queue waited behind itself");
+        let offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "stacked retirement: offset={offset} dropped={}\n",
+            installed.is_dropped()
+        );
+        assert_eq!(
+            offset, 7,
+            "a queued second retirement erased offsets the first one had not touched yet"
+        );
+        assert!(!installed.is_dropped(), "a deferred retirement still dropped the queue");
+
+        claim.release();
+        // With the transition free, the retirement runs for real.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            rebalance.remove_process_queue(&q, &installed),
+        )
+        .await
+        .expect("the retirement never ran once the transition was free");
+        let offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        let epoch = push.progress.current_epoch(&q);
+        let entries = table.read().await.len();
+        eprintln!("unblocked retirement: offset={offset} epoch={epoch:?} entries={entries}\n",);
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        assert_eq!(offset, -1, "the retirement that finally ran left its offsets behind");
+        assert_eq!(
+            epoch, None,
+            "the retired acquisition still answers to its process queue"
+        );
+        assert_eq!(entries, 0, "the retired queue stayed in the table");
     }
 }

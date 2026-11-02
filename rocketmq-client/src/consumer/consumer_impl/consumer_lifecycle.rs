@@ -635,31 +635,24 @@ impl QueueStanding {
 impl QueueProgress {
     /// Whether `process_queue` is the object this acquisition runs on (plan 49h H1).
     ///
-    /// The live table entry wins when there is one - it says what rebalance installed for this key
-    /// right now - and otherwise the binding published with the acquisition decides. A missing or
-    /// expired binding fails closed: identity is never inferred from a key alone.
+    /// The binding published by installation decides, and a table snapshot may only say **no**
+    /// (plan 49i I1): an `Arc` cloned out of the table at some earlier moment is not proof that the
+    /// table still holds it, so letting one stand in for the binding let a request that read the
+    /// table before a reinstallation claim the replacement's acquisition. A snapshot therefore adds
+    /// a rejection condition and nothing more. A missing or expired binding fails closed: identity
+    /// is never inferred from a key alone.
     fn identity_matches(&self, process_queue: &Arc<ProcessQueue>, live: Option<&Arc<ProcessQueue>>) -> bool {
+        let bound = self
+            .bound
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|bound| Arc::ptr_eq(&bound, process_queue));
+        if !bound {
+            return false;
+        }
         match live {
             Some(live) => Arc::ptr_eq(live, process_queue),
-            None => self
-                .bound
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .is_some_and(|bound| Arc::ptr_eq(&bound, process_queue)),
-        }
-    }
-
-    /// Binds this acquisition to `process_queue`, but only ever to *complete* a binding: an
-    /// acquisition bound to one live object is never quietly pointed at another, because that would
-    /// hand work owed to a retired process queue to its replacement. A real replacement arrives as
-    /// a new installation with a newer epoch (plan 49h H1).
-    fn complete_binding(&mut self, process_queue: &Arc<ProcessQueue>) {
-        let rebind = match self.bound.as_ref().and_then(Weak::upgrade) {
             None => true,
-            Some(bound) => Arc::ptr_eq(&bound, process_queue),
-        };
-        if rebind {
-            self.bound = Some(Arc::downgrade(process_queue));
         }
     }
 
@@ -1282,8 +1275,9 @@ impl ConsumerProgress {
         // Taking the lease says one loop owns this queue; it starts no RPC timer, and a wait
         // scheduled before the claim is no longer an expectation anyone owes (plan 49d R1).
         entry.wait_until_ms = 0;
-        // From now on this acquisition answers for exactly this object.
-        QueueProgress::complete_binding(entry, process_queue);
+        // Nothing here re-points the acquisition: identity was published by installation and a
+        // request that reached this line already matched it, so admission cannot create or move a
+        // binding (plan 49i I1 item 2).
         let epoch = entry.epoch;
         drop(queues);
         Ok(Arc::new(PullLease {
@@ -1301,24 +1295,44 @@ impl ConsumerProgress {
         }
     }
 
-    /// Records the exact process queue an admitted request runs on (plan 49h H1), so a later round
-    /// of the same acquisition is judged against that object and not against whatever answers to
-    /// the key next. Only the acquisition's own epoch may be bound.
-    pub(crate) fn bind_dispatch(&self, queue: &MessageQueue, epoch: u64, process_queue: &Arc<ProcessQueue>) {
-        let mut queues = self.queues.write();
-        if let Some(entry) = queues.get_mut(queue) {
-            if entry.epoch != epoch {
-                return;
-            }
-            entry.complete_binding(process_queue);
-        }
-    }
-
     /// Ends one queue's acquisition because its process queue left the table. Its epoch is retired
     /// with it, so a replacement installation receives a strictly newer identity even when the
     /// desired allocation never changed.
     pub(crate) fn note_queue_revoked(&self, queue: &MessageQueue) {
         self.note_revocation(std::slice::from_ref(queue));
+    }
+
+    /// Ends the acquisition of one **exact** process queue, reporting whether anything was retired
+    /// (plan 49i I2 item 3).
+    ///
+    /// Revocation by key alone is a gap: a retirement that removed its table entry and only then
+    /// ended "its" acquisition would retire whatever installation answered to the key in the
+    /// meantime, taking its lease and expectations with it. Naming the object makes a predecessor's
+    /// completion a no-op against its successor, and repeated retirement of the same object
+    /// idempotent.
+    pub(crate) fn note_queue_revoked_for(&self, queue: &MessageQueue, expected: &Arc<ProcessQueue>) -> bool {
+        let mut queues = self.queues.write();
+        if !queues
+            .get(queue)
+            .is_some_and(|entry| QueueProgress::identity_matches(entry, expected, None))
+        {
+            return false;
+        }
+        queues.remove(queue);
+        drop(queues);
+        self.bump(&self.revocations);
+        true
+    }
+
+    /// Whether this queue's acquisition still answers to exactly `process_queue` (plan 49i I2).
+    ///
+    /// Retirement asks this before each shared side effect, because waiting on local persistence is
+    /// exactly the window in which another installation can appear under the same key.
+    pub(crate) fn bound_matches(&self, queue: &MessageQueue, process_queue: &Arc<ProcessQueue>) -> bool {
+        let queues = self.queues.read();
+        queues
+            .get(queue)
+            .is_some_and(|entry| QueueProgress::identity_matches(entry, process_queue, None))
     }
 
     fn acquire_queue(
@@ -4474,16 +4488,23 @@ mod review49h {
         let lease = progress.acquire_pull_lease(&q).unwrap();
         assert_eq!(lease.epoch(), epoch_first);
 
-        // Binding only ever *completes* a binding: work naming another object - whatever identity
-        // it carries - may not re-point this acquisition, and re-binding its own object is
-        // idempotent.
-        progress.bind_dispatch(&q, epoch_first + 1, &second);
-        progress.bind_dispatch(&q, epoch_first, &second);
+        // Nothing at admission time re-points an acquisition (plan 49i I1 item 2): identity is
+        // published by installation and by nothing else, so work naming another object - whatever
+        // epoch it carries - is refused and leaves the binding exactly where installation left it.
+        let wrong_epoch = progress.claim_pull_lease_for(&q, Some(epoch_first + 1), &second, None);
+        let foreign = progress.claim_pull_lease_for(&q, Some(epoch_first), &second, None);
+        assert!(
+            matches!(wrong_epoch.err(), Some(DispatchRefusal::NotAssigned)),
+            "work carrying an epoch this queue never handed out was not refused"
+        );
+        assert!(
+            matches!(foreign.err(), Some(DispatchRefusal::ForeignQueue)),
+            "work naming another process queue was not refused"
+        );
         assert!(
             Arc::ptr_eq(&progress.review49h_bound_to(&q).unwrap().upgrade().unwrap(), &first),
             "an acquisition was quietly re-pointed at another process queue"
         );
-        progress.bind_dispatch(&q, epoch_first, &first);
 
         // Rebalance installs another object under the same key: that is a new acquisition, with a
         // strictly newer identity.
@@ -4691,5 +4712,98 @@ mod review49h {
         drop(lease);
         let owed = progress.review49g_owed(&q).unwrap();
         assert_eq!((owed.0, owed.4), (false, 0), "a dropped loop kept a preparation open");
+    }
+}
+
+#[cfg(test)]
+mod review49i {
+    use super::*;
+
+    #[test]
+    fn a_stale_table_snapshot_must_not_override_the_current_binding() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let old = Arc::new(ProcessQueue::new());
+        let replacement = Arc::new(ProcessQueue::new());
+        progress.note_queue_installed_with(&q, &old);
+        let old_epoch = progress.current_epoch(&q).unwrap();
+        // dispatch_pull_request clones the table entry, then releases its read lock.
+        let live_snapshot = old.clone();
+        progress.note_queue_installed_with(&q, &replacement);
+        let current_epoch = progress.current_epoch(&q).unwrap();
+        assert!(current_epoch > old_epoch);
+        let authorized = progress.authorizes_dispatch(&q, None, &old, Some(&live_snapshot));
+        let stale = progress.claim_pull_lease_for(&q, None, &old, Some(&live_snapshot));
+        let stolen_epoch = stale.as_ref().ok().map(|lease| lease.epoch());
+        let valid = progress.claim_pull_lease_for(&q, None, &replacement, Some(&replacement));
+        let valid_refusal = valid.as_ref().err().copied();
+        eprintln!(
+            "stale snapshot: authorized={authorized} old_epoch={old_epoch} current_epoch={current_epoch} \
+             stolen_epoch={stolen_epoch:?} valid_refusal={valid_refusal:?}"
+        );
+        drop(valid);
+        drop(stale);
+        assert!(
+            progress.claim_pull_lease_for(&q, None, &replacement, None).is_ok(),
+            "installed-object control failed after stale ownership was released"
+        );
+        assert!(
+            !authorized,
+            "an old cloned table entry overrode the replacement binding"
+        );
+        assert_eq!(stolen_epoch, None, "the old object claimed a newer acquisition");
+    }
+
+    /// Retirement names the process queue it retires (plan 49i I2 item 3): a predecessor whose side
+    /// effects finished late ends its own acquisition and nothing else. Without this, the last step
+    /// of an old retirement would silently end the loop that replaced it - which is exactly
+    /// what a pull answer from the retired queue then has no owner for.
+    #[test]
+    fn a_predecessor_completion_does_not_revoke_its_successors_acquisition() {
+        let progress = ConsumerProgress::new();
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let predecessor = Arc::new(ProcessQueue::new());
+        let successor = Arc::new(ProcessQueue::new());
+
+        progress.note_queue_installed_with(&q, &predecessor);
+        let lease = progress
+            .claim_pull_lease_for(&q, None, &predecessor, None)
+            .unwrap_or_else(|refusal| panic!("the installed object was refused its own acquisition: {refusal:?}"));
+
+        // Rebalance replaces the queue while the predecessor's retirement is still at persistence.
+        progress.note_queue_installed_with(&q, &successor);
+        let epoch = progress.current_epoch(&q).unwrap();
+
+        assert!(
+            !progress.bound_matches(&q, &predecessor),
+            "the retired object was still the bound one"
+        );
+        assert!(
+            !progress.note_queue_revoked_for(&q, &predecessor),
+            "a predecessor retired an acquisition it no longer owned"
+        );
+        assert_eq!(
+            progress.current_epoch(&q),
+            Some(epoch),
+            "the successor's epoch ended with its predecessor"
+        );
+        assert!(
+            progress.bound_matches(&q, &successor),
+            "a predecessor completion erased the successor's binding"
+        );
+
+        // The successor still runs its own work once the predecessor's loop has really released it.
+        drop(lease);
+        assert!(
+            progress.claim_pull_lease_for(&q, None, &successor, None).is_ok(),
+            "the successor could not claim work on its own acquisition"
+        );
+
+        // Naming the object that owns the acquisition ends it.
+        assert!(
+            progress.note_queue_revoked_for(&q, &successor),
+            "the owning process queue could not retire its own acquisition"
+        );
+        assert_eq!(progress.current_epoch(&q), None);
     }
 }

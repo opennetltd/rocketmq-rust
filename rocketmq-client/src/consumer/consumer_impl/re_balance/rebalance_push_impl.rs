@@ -33,6 +33,7 @@ use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_rust::ArcMut;
 use rocketmq_rust::WeakArcMut;
 use tokio::sync::RwLock;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -44,6 +45,7 @@ use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::rebalance_impl::remove_process_queue_if_same;
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::RebalanceImpl;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::consumer::default_mq_push_consumer::ConsumerConfig;
@@ -120,13 +122,19 @@ impl RebalancePushImpl {
         self.rebalance_impl_inner.sub_rebalance_impl = Some(rebalance_impl);
     }
 
-    async fn try_remove_order_message_queue(&mut self, mq: &MessageQueue, pq: &ProcessQueue) -> bool {
+    async fn try_remove_order_message_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool {
         let default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_mut().unwrap();
 
         let force_unlock =
             pq.is_dropped() && (get_current_millis() > pq.get_last_lock_timestamp() + *UNLOCK_DELAY_TIME_MILLS);
         let consume_lock = pq.consume_lock.try_write_timeout(Duration::from_millis(500)).await;
         if force_unlock || consume_lock.is_some() {
+            // Waiting for the consume lock is another window in which this key can be installed by
+            // a newer acquisition (plan 49i I2 item 2), and its offsets are not this
+            // retirement's to erase.
+            if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
+                return false;
+            }
             let offset_store = default_mqpush_consumer_impl.offset_store.as_mut().unwrap();
             offset_store.persist(mq).await;
             offset_store.remove_offset(mq).await;
@@ -164,9 +172,11 @@ impl Rebalance for RebalancePushImpl {
         }
     }
 
-    async fn note_queue_revoked(&mut self, mq: &MessageQueue) {
+    async fn note_queue_revoked(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>) {
         if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
-            impl_.note_queue_revoked(mq);
+            // Only the acquisition named by this retirement ends; a replacement installed while
+            // this pass was at persistence keeps its own identity (plan 49i I2 item 3).
+            impl_.note_queue_revoked_for(mq, process_queue);
         }
     }
 
@@ -229,17 +239,38 @@ impl Rebalance for RebalancePushImpl {
         }
     }
 
-    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &ProcessQueue) -> bool {
+    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool {
         let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
         let consume_orderly = default_mqpush_consumer_impl.is_consume_orderly();
-        let offset_store = default_mqpush_consumer_impl.offset_store.as_mut().unwrap();
 
-        if consume_orderly && MessageModel::Clustering == self.consumer_config.message_model {
+        // Offsets are stored by key, so they belong to whoever owns the queue when each step runs,
+        // not to the pass that decided to retire it (plan 49i I2 item 2). Asking once at the top is
+        // not enough: persisting this queue's offsets is exactly the wait during which a
+        // replacement installation appears, and erasing by key afterwards would delete the
+        // progress its owner has just prepared.
+        if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
+            return false;
+        }
+        {
+            let offset_store = default_mqpush_consumer_impl.offset_store.as_mut().unwrap();
             offset_store.persist(mq).await;
+        }
+        if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
+            debug!(
+                "leaving the offsets of {} alone, this retirement no longer owns that queue",
+                mq
+            );
+            return false;
+        }
+        if consume_orderly && MessageModel::Clustering == self.consumer_config.message_model {
             self.try_remove_order_message_queue(mq, pq).await
         } else {
-            offset_store.persist(mq).await;
-            offset_store.remove_offset(mq).await;
+            default_mqpush_consumer_impl
+                .offset_store
+                .as_mut()
+                .unwrap()
+                .remove_offset(mq)
+                .await;
             true
         }
     }
@@ -414,21 +445,30 @@ impl Rebalance for RebalancePushImpl {
         PopProcessQueue::new()
     }
 
-    async fn remove_process_queue(&mut self, mq: &MessageQueue) {
-        let mut process_queue_table = self.rebalance_impl_inner.process_queue_table.write().await;
-        let prev = process_queue_table.remove(mq);
-        drop(process_queue_table);
-        if prev.is_some() {
-            // The queue left the table, so its acquisition ends here: a pull answer that arrives
-            // later for this queue can no longer publish into whoever installs next (plan 49c C1).
-            if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
-                impl_.note_queue_revoked(mq);
-            }
-        }
-        if let Some(pq) = prev {
+    async fn remove_process_queue(&mut self, mq: &MessageQueue, expected: &Arc<ProcessQueue>) {
+        // One retirement per queue (plan 49i I2 item 1): a caller reaching a key whose retirement
+        // is already in flight does nothing, rather than stacking a second round of
+        // persistence and offset removal - or ending an acquisition it never owned.
+        let Some(guard) = self.rebalance_impl_inner.queue_transitions.try_retire(mq, expected) else {
+            return;
+        };
+        // The entry is dropped only while it still names the object this caller scheduled (plan 49h
+        // H1): a replacement installed meanwhile keeps its table entry and everything hanging off
+        // it.
+        let pq = expected.clone();
+        if remove_process_queue_if_same(&self.rebalance_impl_inner.process_queue_table, mq, &pq).await {
             let droped = pq.is_dropped();
             pq.set_dropped(true);
+            // Side effects first, while this object still owns the queue; revocation afterwards,
+            // because it is what stops further work on this identity.
             self.remove_unnecessary_message_queue(mq, &pq).await;
+            if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+                // The queue left the table, so its acquisition ends here - naming the object that
+                // just left it, so a pull answer arriving later cannot publish into whoever
+                // installs next (plan 49c C1) and the successor's own identity
+                // survives (plan 49i I2 item 3).
+                impl_.note_queue_revoked_for(mq, &pq);
+            }
             info!(
                 "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
                 self.rebalance_impl_inner.consumer_group.as_ref().unwrap(),
@@ -436,6 +476,7 @@ impl Rebalance for RebalancePushImpl {
                 droped
             );
         }
+        guard.release();
     }
 
     async fn unlock(&mut self, mq: &MessageQueue, oneway: bool) {

@@ -2796,7 +2796,9 @@ mod review49g {
             .write()
             .await
             .insert(q.clone(), pq.clone());
-        progress.note_queue_installed(&q);
+        // The installation publishes the object this acquisition runs on (plan 49i I1): a key-only
+        // observation no longer authorizes managed work for an arbitrary process queue.
+        progress.note_queue_installed_with(&q, &pq);
         progress.review49f_age_activity(&q, Duration::from_secs(31));
         let mut request = PullRequest::new(group, q, pq, 7);
         request.hold_lease(progress.acquire_pull_lease(request.get_message_queue()).unwrap());

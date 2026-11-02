@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::future::Future;
@@ -51,7 +52,9 @@ use rocketmq_remoting::rpc::topic_request_header::TopicRequestHeader;
 use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::time::Instant as TokioInstant;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -647,6 +650,59 @@ pub(crate) fn validate_consumer_config(
     }
 
     Ok(())
+}
+
+/// Read the process queue table **inside the allowance this hand-off already runs under**, and only
+/// ever to refuse work (plan 49i I3 item 2).
+///
+/// `Ok(())` says nothing in the table objects to this hand-off, so the caller may go on to channel
+/// admission with the deadline it already holds. Anything else ends it: a consumer that stopped, an
+/// allowance that passed while the table was locked, or an entry answering to **another** process
+/// queue. An absent entry is not an objection - assignment belongs to the acquisition's own
+/// binding, which every removal path has already retired (plan 49i I1), and a snapshot that had to
+/// be there would make the table authoritative again. A stop is polled ahead of the lookup -
+/// readiness to end the consumer wins over a read that could change nothing (plan 49h H2's rule) -
+/// and the wait counts as owned submitting work for as long as it runs, because getting past this
+/// table is part of getting the request into the shared service; a hand-off that ends here forgets
+/// it again.
+async fn table_still_names_process_queue(
+    table: &Arc<RwLock<HashMap<MessageQueue, Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>>>>,
+    queue: &MessageQueue,
+    process_queue: &Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>,
+    deadline: TokioInstant,
+    cancellation: &CancellationToken,
+    lease: Option<&Arc<crate::consumer::consumer_impl::consumer_lifecycle::PullLease>>,
+) -> Result<(), crate::consumer::consumer_impl::pull_message_service::Admission> {
+    use crate::consumer::consumer_impl::pull_message_service::Admission;
+    let remaining = {
+        let now = TokioInstant::now();
+        if deadline > now {
+            deadline - now
+        } else {
+            std::time::Duration::ZERO
+        }
+    };
+    let submitting = lease.map(|lease| lease.note_submitting(remaining));
+    if matches!(submitting, Some(false)) {
+        // Its acquisition ended before this request could even start its hand-off.
+        return Err(Admission::Superseded);
+    }
+    let ended = |admission: crate::consumer::consumer_impl::pull_message_service::Admission| {
+        if let Some(lease) = lease {
+            lease.forget_submitting();
+        }
+        admission
+    };
+    let read = table.read();
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ended(Admission::Cancelled)),
+        _ = tokio::time::sleep_until(deadline) => Err(ended(Admission::TimedOut)),
+        current = read => match current.get(queue) {
+            Some(held) if !Arc::ptr_eq(held, process_queue) => Err(ended(Admission::Superseded)),
+            _ => Ok(()),
+        },
+    }
 }
 
 impl DefaultMQPushConsumerImpl {
@@ -1466,43 +1522,57 @@ impl DefaultMQPushConsumerImpl {
             service.execute_pull_request_immediately(pull_request).await;
             return Admission::Accepted;
         }
-        // Identity before anything else (plan 49h H1): a dropped flag and a matching key are
-        // properties an unrelated process queue can have too, and admitting one would let its
-        // answers publish into this acquisition. The live table entry decides, and
-        // rejecting leaves no trace in progress state.
-        let live = self.installed_process_queue(pull_request.get_message_queue()).await;
+        // One allowance for the whole hand-off (plan 49i I3 item 2), computed before anything is
+        // awaited: identity validation and the wait for channel capacity are the same bounded step,
+        // so a contended table read can neither outlive it nor restart it with a fresh budget.
+        let deadline = tokio::time::Instant::now() + budget;
+        let cancellation = self.work.cancellation();
         let mut pull_request = pull_request;
+        // Identity and ownership first, judged by the binding this acquisition was installed with
+        // (plan 49i I1): what authorizes work is the object installation published - not an `Arc`
+        // cloned out of the table at some earlier moment - so nothing waits for the table before
+        // the queue's loop lease is taken. Rejecting leaves no trace in progress state.
         if pull_request.lease().is_none() {
             // Ownership next (plan 49g G1), claimed under the same identity check and write lock
             // (plan 49h H1): a request that reaches the channel without it leaves its queue
             // readable only as a lost pull, however healthy the hand-off is.
-            if !self.adopt_dispatch_lease(&mut pull_request, live.as_ref()) {
+            if !self.adopt_dispatch_lease(&mut pull_request, None) {
                 return Admission::Superseded;
             }
         } else if !self.progress.authorizes_dispatch(
             pull_request.get_message_queue(),
             pull_request.lease_epoch(),
             pull_request.get_process_queue(),
-            live.as_ref(),
+            None,
         ) {
             debug!(
                 queue = %pull_request.get_message_queue(),
                 "this request does not name the process queue this acquisition runs on, dropping it instead of owning work for another one"
             );
             return Admission::Superseded;
-        } else if let Some(epoch) = pull_request.lease_epoch() {
-            // And from now on this acquisition answers for that exact object (plan 49h H1), so a
-            // later round cannot be quietly pointed at a process queue installed after
-            // it started.
-            self.progress.bind_dispatch(
-                pull_request.get_message_queue(),
-                epoch,
-                pull_request.get_process_queue(),
-            );
         }
-        let cancellation = self.work.cancellation();
+        // The table is still consulted - but only ever to refuse work, and inside the allowance and
+        // cancellation this hand-off ends at (plan 49i I3 item 2). An unbounded read there let a
+        // held table lock outlive both the dispatch budget and a consumer that had already stopped.
+        if let Err(admission) = table_still_names_process_queue(
+            &self.rebalance_impl.rebalance_impl_inner.process_queue_table,
+            pull_request.get_message_queue(),
+            pull_request.get_process_queue(),
+            deadline,
+            &cancellation,
+            pull_request.lease(),
+        )
+        .await
+        {
+            debug!(
+                queue = %pull_request.get_message_queue(),
+                ?admission,
+                "this hand-off ended before the shared pull service saw it"
+            );
+            return admission;
+        }
         service
-            .admit_pull_request(pull_request, tokio::time::Instant::now() + budget, Some(&cancellation))
+            .admit_pull_request(pull_request, deadline, Some(&cancellation))
             .await
     }
     pub fn execute_pull_request_later(&mut self, pull_request: PullRequest, time_delay: u64) {
@@ -1569,19 +1639,15 @@ impl DefaultMQPushConsumerImpl {
                 service.execute_pull_request_immediately(pull_request).await;
                 return;
             }
-            // A timer sleeps while the world changes, so the identity this continuation may work on
-            // is re-read here rather than trusted from when it was scheduled (plan 49h H1): a queue
-            // whose process queue was replaced or removed has no claim on the next admission.
-            let live = process_queue_table
-                .read()
-                .await
-                .get(pull_request.get_message_queue())
-                .cloned();
+            // A timer sleeps while the world changes, so this continuation is judged again once it
+            // becomes due - by the binding its installation published (plan 49i I1), which a
+            // replacement or revocation has already moved on from. An `Arc` read out of the table
+            // here would authorize nothing anyway.
             if !progress.authorizes_dispatch(
                 pull_request.get_message_queue(),
                 pull_request.lease_epoch(),
                 pull_request.get_process_queue(),
-                live.as_ref(),
+                None,
             ) {
                 debug!(
                     queue = %pull_request.get_message_queue(),
@@ -1589,13 +1655,29 @@ impl DefaultMQPushConsumerImpl {
                 );
                 return;
             }
+            // The hand-off allowance starts when the timer becomes due (plan 49i I3 item 2), and the
+            // table check below shares it rather than spending a fresh budget after waiting.
+            let deadline = tokio::time::Instant::now() + PULL_ADMISSION_ALLOWANCE;
             let cancellation = work.cancellation();
+            if let Err(admission) = table_still_names_process_queue(
+                &process_queue_table,
+                pull_request.get_message_queue(),
+                pull_request.get_process_queue(),
+                deadline,
+                &cancellation,
+                pull_request.lease(),
+            )
+            .await
+            {
+                debug!(
+                    queue = %pull_request.get_message_queue(),
+                    ?admission,
+                    "a scheduled continuation ended before the shared pull service saw it"
+                );
+                return;
+            }
             match service
-                .admit_pull_request(
-                    pull_request,
-                    tokio::time::Instant::now() + PULL_ADMISSION_ALLOWANCE,
-                    Some(&cancellation),
-                )
+                .admit_pull_request(pull_request, deadline, Some(&cancellation))
                 .await
             {
                 crate::consumer::consumer_impl::pull_message_service::Admission::Accepted => {}
@@ -1765,21 +1847,38 @@ impl DefaultMQPushConsumerImpl {
         self.adopt_dispatch_lease(pull_request, None)
     }
 
-    /// The process queue rebalance currently holds for this queue (plan 49h H1).
+    /// Whether this incarnation's acquisition for `mq` still answers to exactly `process_queue`
+    /// (plan 49i I2).
     ///
-    /// Read-only on purpose: proving that an installation exists must not create one, and a lookup
-    /// that timed out or found nothing is reported as nothing rather than as a guess.
-    async fn installed_process_queue(
+    /// Retirement asks this before each shared side effect, because the wait on local persistence
+    /// is precisely when another installation can appear under the same key: erasing "its"
+    /// offset by key after that would delete the replacement's progress. Consumers that do not
+    /// track their own assignment have no acquisition to name, so nothing here blocks their
+    /// long-standing behaviour.
+    pub(crate) fn owns_process_queue(
         &self,
-        queue: &MessageQueue,
-    ) -> Option<Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>> {
-        self.rebalance_impl
-            .rebalance_impl_inner
-            .process_queue_table
-            .read()
-            .await
-            .get(queue)
-            .cloned()
+        mq: &MessageQueue,
+        process_queue: &Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>,
+    ) -> bool {
+        if !self.tracks_assignment() {
+            return true;
+        }
+        self.progress.bound_matches(mq, process_queue)
+    }
+
+    /// Ends the acquisition of one **exact** process queue, reporting whether anything was retired
+    /// (plan 49i I2 item 3). A predecessor's completion never retires its successor: after a
+    /// replacement is installed this is a no-op. Untracked consumers have no acquisition to end and
+    /// report `true` so their retirement proceeds as it always did.
+    pub(crate) fn note_queue_revoked_for(
+        &self,
+        mq: &MessageQueue,
+        process_queue: &Arc<crate::consumer::consumer_impl::process_queue::ProcessQueue>,
+    ) -> bool {
+        if !self.tracks_assignment() {
+            return true;
+        }
+        self.progress.note_queue_revoked_for(mq, process_queue)
     }
 
     /// Establish loop ownership **before** a request waits for anything (plan 49g G1).
@@ -5370,5 +5469,262 @@ mod review49h_identity {
         drop(pulling);
         drop(guard);
         client.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod review49i {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::pull_message_service::Admission;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_identity_lookup_must_share_the_deadline_and_cancellation() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-dispatch");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-dispatch-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
+        let guard = table.write().await;
+        let mut dispatching =
+            Box::pin(push.dispatch_pull_request(PullRequest::new(group, q, pq, 7), Duration::from_millis(40)));
+        tokio::select! { _=&mut dispatching => panic!("the table lookup should wait for this guard"), _=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        push.work.close();
+        let observed = tokio::time::timeout(Duration::from_millis(100), &mut dispatching).await;
+        let returned_while_locked = observed.is_ok();
+        let admitted = capture.len();
+        eprintln!(
+            "identity lookup: returned_while_locked={returned_while_locked} consumer_cancelled={} admitted={admitted}",
+            push.work.is_closed()
+        );
+        drop(dispatching);
+        drop(guard);
+        client.shutdown().await;
+        assert_eq!(admitted, 0);
+        assert!(
+            returned_while_locked,
+            "the identity read outlived both the dispatch allowance and consumer cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_uncontended_identity_lookup_still_admits_the_installed_queue() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-control");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-control-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
+        let result = push
+            .dispatch_pull_request(PullRequest::new(group, q, pq, 7), Duration::from_millis(40))
+            .await;
+        let admitted = capture.len();
+        client.shutdown().await;
+        assert_eq!(result, Admission::Accepted);
+        assert_eq!(admitted, 1);
+    }
+
+    /// The bound alone ends a hand-off that cannot finish inside its allowance - no consumer stop
+    /// required (plan 49i I3 item 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_table_lock_ends_the_hand_off_at_its_own_deadline() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-deadline");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-deadline-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
+
+        let guard = table.write().await;
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            push.dispatch_pull_request(
+                PullRequest::new(group, q.clone(), pq.clone(), 7),
+                Duration::from_millis(40),
+            ),
+        )
+        .await
+        .expect("a hand-off kept waiting past its own allowance with nothing else to wake it");
+        let elapsed = started.elapsed();
+        let admitted = capture.len();
+        // Whatever the hand-off decided, it must have left the queue's lease behind: a request that
+        // never reached the shared service cannot be the loop that owes the next pull.
+        let reclaimable = push
+            .progress
+            .claim_pull_lease_for(&q, None, &pq, None)
+            .is_ok_and(|lease| {
+                drop(lease);
+                true
+            });
+        eprintln!(
+            "deadline-only: result={result:?} elapsed_ms={} admitted={admitted} reclaimable={reclaimable}",
+            elapsed.as_millis()
+        );
+        drop(guard);
+        client.shutdown().await;
+        assert_eq!(result, Admission::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "the allowance was spent somewhere other than the step it bounds: {elapsed:?}"
+        );
+        assert_eq!(admitted, 0);
+        assert!(reclaimable, "an expired hand-off kept the queue's loop lease");
+    }
+
+    /// A consumer that stops while a table read is blocked ends the hand-off at once, without
+    /// waiting out an allowance measured in tens of seconds (plan 49i I3 item 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopping_consumer_ends_a_locked_table_hand_off_at_once() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-cancel");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-cancel-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        push.progress.note_queue_installed_with(&q, &pq);
+
+        let guard = table.write().await;
+        // An allowance this consumer will never reach on its own; only cancellation can end this.
+        let mut dispatching = Box::pin(push.dispatch_pull_request(
+            PullRequest::new(group, q.clone(), pq.clone(), 7),
+            Duration::from_secs(30),
+        ));
+        tokio::select! { _=&mut dispatching => panic!("the table read should wait for this guard"), _=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        push.work.close();
+        let observed = tokio::time::timeout(Duration::from_millis(300), &mut dispatching).await;
+        let result = observed.expect("a stopped consumer did not end the hand-off it owned");
+        let admitted = capture.len();
+        eprintln!("cancellation-only: result={result:?} admitted={admitted}");
+        drop(dispatching);
+        drop(guard);
+        client.shutdown().await;
+        assert_eq!(result, Admission::Cancelled);
+        assert_eq!(admitted, 0);
+    }
+
+    /// The table may still refuse work - and only that (plan 49i I1 item 1, I3 item 2). An entry
+    /// answering to another process queue ends this hand-off without taking anything from the
+    /// acquisition whose binding it is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_table_entry_answering_to_another_process_queue_ends_the_hand_off() {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_static_str("review49i-foreign-entry");
+        let mut push = DefaultMQPushConsumerImpl::new(
+            cc.clone(),
+            ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            }),
+            None,
+        );
+        push.mark_managed_lifecycle();
+        let mut client = MQClientInstance::new_arc(cc, 0, "review49i-foreign-entry-client", None);
+        let capture = client.pull_message_service.review49e_capture();
+        push.client_instance = Some(client.clone());
+        let q = MessageQueue::from_parts("T", "broker", 0);
+        let bound = Arc::new(ProcessQueue::new());
+        let foreign = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        // The installation this request belongs to is bound; the key answers to a different object.
+        table.write().await.insert(q.clone(), foreign.clone());
+        push.progress.note_queue_installed_with(&q, &bound);
+
+        let result = push
+            .dispatch_pull_request(
+                PullRequest::new(group.clone(), q.clone(), bound.clone(), 7),
+                Duration::from_millis(40),
+            )
+            .await;
+        let refused = capture.len();
+        // A request naming the object the key really holds is no better off: identity comes from
+        // the published binding, not from what the table happens to contain.
+        let foreign_result = push
+            .dispatch_pull_request(
+                PullRequest::new(group.clone(), q.clone(), foreign.clone(), 8),
+                Duration::from_millis(40),
+            )
+            .await;
+        // Once the key names this acquisition's own process queue, its work goes through: refusing
+        // it earlier left nothing claimed.
+        table.write().await.insert(q.clone(), bound.clone());
+        let admitted_result = push
+            .dispatch_pull_request(PullRequest::new(group, q, bound, 9), Duration::from_millis(40))
+            .await;
+        let admitted = capture.len();
+        eprintln!(
+            "foreign entry: refused={refused} result={result:?} foreign_result={foreign_result:?} \
+             admitted_result={admitted_result:?} admitted={admitted}"
+        );
+        client.shutdown().await;
+        assert_eq!(result, Admission::Superseded);
+        assert_eq!(
+            refused, 0,
+            "a request the table refused still reached the shared service"
+        );
+        assert_eq!(
+            foreign_result,
+            Admission::Superseded,
+            "an unbound process queue adopted the acquisition from a table entry"
+        );
+        assert_eq!(admitted_result, Admission::Accepted);
+        assert_eq!(admitted, 1, "the bound object could no longer hand off its own work");
     }
 }

@@ -394,7 +394,7 @@ impl PullCallback for DefaultPullCallback {
                 offset_store.persist(pull_request.get_message_queue()).await;
                 push_consumer_impl
                     .rebalance_impl
-                    .remove_process_queue(pull_request.get_message_queue())
+                    .remove_process_queue(pull_request.get_message_queue(), &pull_request.process_queue)
                     .await;
                 push_consumer_impl
                     .rebalance_impl

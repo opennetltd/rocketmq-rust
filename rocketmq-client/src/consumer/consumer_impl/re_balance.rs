@@ -24,6 +24,7 @@ use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
 
+pub(crate) mod queue_transitions;
 pub(crate) mod rebalance_impl;
 pub(crate) mod rebalance_push_impl;
 pub(crate) mod rebalance_service;
@@ -65,21 +66,22 @@ pub trait RebalanceLocal {
     /// exact process queue this installation published, not merely one with the same key.
     async fn note_queue_installed(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
 
-    /// Ends the acquisition identity of a process queue that has left the table. Its epoch retires
-    /// with it so a replacement installation cannot inherit an older loop's lease.
-    async fn note_queue_revoked(&mut self, mq: &MessageQueue);
+    /// Ends the acquisition identity of one **exact** process queue that has left the table. Its
+    /// epoch retires with it so a replacement installation cannot inherit an older loop's lease,
+    /// and naming the object means a predecessor finishing late cannot end what replaced it
+    /// (plan 49i I2 item 3).
+    async fn note_queue_revoked(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
 
-    /// Removes an unnecessary message queue.
+    /// Erase the local offsets of a queue this pass retired.
     ///
-    /// # Arguments
-    ///
-    /// * `mq` - The message queue to be removed.
-    /// * `pq` - The process queue associated with the message queue.
+    /// The object is named because those offsets are shared by key: an installation that appeared
+    /// while this was waiting on persistence owns them now, and this call must leave them alone
+    /// (plan 49i I2 item 2).
     ///
     /// # Returns
     ///
-    /// A boolean indicating whether the message queue was removed.
-    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &ProcessQueue) -> bool;
+    /// Whether the queue's offsets were erased - `false` when a newer installation owns them.
+    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool;
 
     /// Removes an unnecessary pop message queue.
     ///
@@ -171,12 +173,15 @@ pub trait RebalanceLocal {
     /// A new pop process queue.
     fn create_pop_process_queue(&self) -> PopProcessQueue;
 
-    /// Removes a process queue.
+    /// Removes one **exact** process queue: the table entry is dropped only while it still names
+    /// `expected`, and its transition is claimed first so a second caller reaching the same key
+    /// does not repeat the side effects or act on an installation it never owned (plan 49i I2).
     ///
     /// # Arguments
     ///
-    /// * `mq` - The message queue for which the process queue should be removed.
-    async fn remove_process_queue(&mut self, mq: &MessageQueue);
+    /// * `mq` - The message queue whose process queue should be removed.
+    /// * `expected` - The process queue this caller believes holds the key.
+    async fn remove_process_queue(&mut self, mq: &MessageQueue, expected: &Arc<ProcessQueue>);
 
     /// Unlocks a message queue.
     ///
