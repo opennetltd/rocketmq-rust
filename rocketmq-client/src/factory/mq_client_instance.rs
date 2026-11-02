@@ -1570,6 +1570,14 @@ impl MQClientInstance {
         }
     }
 
+    /// Test seam (plan 49j): wakeups this client has been asked for, so a regression can prove that
+    /// a queue whose transition was busy is asked about again instead of left alone until the
+    /// next scheduled pass. Never compiled into anything that ships.
+    #[cfg(test)]
+    pub(crate) fn review49j_rebalance_wakes(&self) -> u64 {
+        self.rebalance_service.wakeup_count()
+    }
+
     /// Test seam (plan 49c C5): the handle for the nameserver lock, so a test can hold it and make
     /// a route lookup wait exactly as it would behind a stalled fetch. Never compiled into
     /// anything that ships.

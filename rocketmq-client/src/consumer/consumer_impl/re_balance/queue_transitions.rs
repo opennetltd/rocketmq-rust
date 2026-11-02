@@ -1,6 +1,6 @@
 /*
  * [File description]: one queue's installation/retirement transition, owned by one pass at a time
- * (plan 49i I2).
+ * (plan 49i I2, plan 49j J1).
  *
  * Retirement is not a single instruction. A pass decides to drop a process queue, then waits on
  * local persistence, then erases the queue's offset, then removes the table entry and finally
@@ -9,6 +9,13 @@
  * one queue's transition somebody's job at a time - without ever making a competing pass wait on
  * it, because a rebalance pass that blocks behind slow disk I/O stops making progress for every
  * other queue too.
+ *
+ * An installation is not a single instruction either (plan 49j J1): it prepares an offset, then
+ * publishes a table entry, then publishes the acquisition that authorises dispatch. Checking
+ * that nothing was retiring and only then preparing let two installers of one absent queue
+ * arrive at publication together, so the loser replaced the winner's entry while its binding
+ * named another object. The claim below is therefore taken before preparation and held through
+ * publication.
  */
 
 use std::collections::HashMap;
@@ -19,10 +26,17 @@ use rocketmq_common::common::message::message_queue::MessageQueue;
 
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 
-/// One key's transition state: who is retiring it, and whether an installation was turned away.
+/// Who holds one key's transition right now (plan 49j J1 item 2): the pass preparing and publishing
+/// an installation, or the pass retiring a named process queue.
+enum Owner {
+    Installing,
+    Retiring(Arc<ProcessQueue>),
+}
+
+/// One key's transition state: who owns it, and whether an installation was turned away.
 #[derive(Default)]
 struct Transition {
-    retiring: Option<Arc<ProcessQueue>>,
+    owner: Option<Owner>,
     deferred_install: bool,
 }
 
@@ -64,10 +78,10 @@ impl QueueTransitions {
     ) -> Option<RetirementGuard> {
         let mut queues = self.queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = queues.entry(queue.clone()).or_default();
-        if entry.retiring.is_some() {
+        if entry.owner.is_some() {
             return None;
         }
-        entry.retiring = Some(Arc::clone(process_queue));
+        entry.owner = Some(Owner::Retiring(Arc::clone(process_queue)));
         Some(RetirementGuard {
             transitions: Arc::clone(self),
             queue: queue.clone(),
@@ -75,13 +89,38 @@ impl QueueTransitions {
         })
     }
 
-    /// Whether an installation of `queue` must wait for the retirement in flight, recording the
-    /// deferral so that completion asks for another pass (plan 49i I2 item 1). Returns `false` when
-    /// nothing is being retired and the installation may publish normally.
+    /// Take the right to install `queue` (plan 49j J1 item 2): preparation and publication happen
+    /// under this claim, so no retirement can begin between them and no second installer reaches
+    /// publication for the same key. A pass that is turned away records the deferral - the answer
+    /// is never "nothing changed", because a queue left uninstalled until something else happens to
+    /// trigger a pass stays uninstalled.
+    pub(crate) fn try_install(self: &Arc<Self>, queue: &MessageQueue) -> Option<InstallationGuard> {
+        let mut queues = self.queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = queues.entry(queue.clone()).or_default();
+        if entry.owner.is_some() {
+            entry.deferred_install = true;
+            return None;
+        }
+        entry.owner = Some(Owner::Installing);
+        Some(InstallationGuard {
+            transitions: Arc::clone(self),
+            queue: queue.clone(),
+            released: false,
+        })
+    }
+
+    /// Whether an installation of `queue` would have to wait for the transition in flight,
+    /// recording the deferral so that whoever holds the key asks for another pass (plan 49i I2
+    /// item 1).
+    ///
+    /// Test-only observation: a production installer claims with [`Self::try_install`] and learns
+    /// the same thing by being turned away, rather than looking and then acting on stale
+    /// information.
+    #[cfg(test)]
     pub(crate) fn install_deferred(&self, queue: &MessageQueue) -> bool {
         let mut queues = self.queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match queues.get_mut(queue) {
-            Some(entry) if entry.retiring.is_some() => {
+            Some(entry) if entry.owner.is_some() => {
                 entry.deferred_install = true;
                 true
             }
@@ -94,7 +133,9 @@ impl QueueTransitions {
     #[cfg(test)]
     pub(crate) fn retiring(&self, queue: &MessageQueue) -> bool {
         let queues = self.queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        queues.get(queue).is_some_and(|entry| entry.retiring.is_some())
+        queues
+            .get(queue)
+            .is_some_and(|entry| matches!(entry.owner, Some(Owner::Retiring(_))))
     }
 
     fn finish(&self, queue: &MessageQueue) -> bool {
@@ -113,6 +154,33 @@ impl RetirementGuard {
     pub(crate) fn release(mut self) -> bool {
         self.released = true;
         self.transitions.finish(&self.queue)
+    }
+}
+
+/// One queue's installation, held from offset preparation through publication (plan 49j J1 item 2).
+/// Releasing it ends the claim; dropping it without releasing - a pass that gave up between
+/// preparation and publication - ends the claim too, so nothing strands the key.
+pub(crate) struct InstallationGuard {
+    transitions: Arc<QueueTransitions>,
+    queue: MessageQueue,
+    released: bool,
+}
+
+impl InstallationGuard {
+    /// End this installation's claim, reporting whether another installation of the same key was
+    /// turned away while it ran and must be retried.
+    pub(crate) fn release(mut self) -> bool {
+        self.released = true;
+        self.transitions.finish(&self.queue)
+    }
+}
+
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = self.transitions.finish(&self.queue);
     }
 }
 
@@ -179,6 +247,61 @@ mod tests {
             !transitions.install_deferred(&q),
             "an installation was still deferred behind a retirement that had ended"
         );
+    }
+
+    /// An installation owns its key from claim to publication, and nothing else may take that key
+    /// in between - not a second installer, and not a retirement that would erase what the
+    /// installation is about to publish (plan 49j J1 item 2).
+    #[test]
+    fn one_queue_is_installed_by_one_pass_at_a_time() {
+        let transitions = QueueTransitions::new();
+        let q = queue(4);
+        let other_q = queue(5);
+        let pq = Arc::new(ProcessQueue::new());
+
+        let installation = transitions
+            .try_install(&q)
+            .expect("nothing owns this queue's transition yet");
+        assert!(
+            transitions.try_install(&q).is_none(),
+            "a second installer claimed a key whose installation is already in flight"
+        );
+        assert!(
+            transitions.try_retire(&q, &pq).is_none(),
+            "a retirement began underneath an installation of the same key"
+        );
+        transitions
+            .try_install(&other_q)
+            .expect("an unrelated queue was held up by another key's installation")
+            .release();
+
+        assert!(
+            installation.release(),
+            "the installer that was turned away was not reported for another pass"
+        );
+        transitions
+            .try_install(&q)
+            .expect("the key stayed claimed after its installation ended");
+    }
+
+    /// A retirement cannot slip in while an installation is preparing, and the key is free again
+    /// once that installation gives up - a pass that abandons its claim must never strand it
+    /// (plan 49j J1 item 2).
+    #[test]
+    fn an_abandoned_installation_ends_its_own_claim() {
+        let transitions = QueueTransitions::new();
+        let q = queue(6);
+        let pq = Arc::new(ProcessQueue::new());
+
+        let installation = transitions.try_install(&q).unwrap();
+        drop(installation);
+        assert!(
+            !transitions.install_deferred(&q),
+            "an abandoned installation kept its key closed"
+        );
+        transitions
+            .try_retire(&q, &pq)
+            .expect("a retirement could not take a key whose installer gave up");
     }
 
     /// Only the queue being retired waits; an unrelated queue installs normally, and the deferral

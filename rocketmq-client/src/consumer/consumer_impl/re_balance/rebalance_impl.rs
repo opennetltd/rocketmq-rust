@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
@@ -76,6 +77,26 @@ pub(crate) async fn remove_process_queue_if_same(
     match table.get(mq) {
         Some(current) if Arc::ptr_eq(current, pq) => table.remove(mq).is_some(),
         _ => false,
+    }
+}
+
+/// Publish an installation without ever replacing the entry that is already there (plan 49j J1 item
+/// 3). The first pass to reach the table owns the key and publishes the acquisition naming that
+/// very object; a second installer that prepared an offset meanwhile reports "nothing changed"
+/// instead of swapping in an object no binding names, which would leave dispatch either failing
+/// closed forever or pulling on a queue nobody owns.
+pub(crate) async fn insert_process_queue_if_absent(
+    table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    mq: &MessageQueue,
+    pq: &Arc<ProcessQueue>,
+) -> bool {
+    let mut table = table.write().await;
+    match table.entry(mq.clone()) {
+        Entry::Vacant(slot) => {
+            slot.insert(Arc::clone(pq));
+            true
+        }
+        Entry::Occupied(_) => false,
     }
 }
 
@@ -525,9 +546,14 @@ where
         for (mq, pq) in remove_queue_map {
             let Some(guard) = self.queue_transitions.try_retire(&mq, &pq) else {
                 debug!(
-                    "doRebalance, {:?}, leaving {} alone, another pass is already retiring it",
+                    "doRebalance, {:?}, leaving {} alone, another transition owns it",
                     self.consumer_group, mq
                 );
+                // A busy key may be held by an installation as well as a retirement (plan 49j J1
+                // item 2), and neither one retires this queue on this pass's behalf. Asking for
+                // another pass is what keeps the wait bounded instead of leaving a dropped queue
+                // until the next scheduled rebalance.
+                deferred_transition = true;
                 continue;
             };
             // Plan 49h H1: this pass decided to drop that object. If the key now answers to a
@@ -632,18 +658,22 @@ where
                     !process_queue_table.contains_key(mq)
                 };
                 if missing {
-                    // A retirement of this very key may be waiting on persistence right now (plan
-                    // 49i I2 item 1): publishing an installation into that
-                    // window would let the pass still finishing erase its
-                    // offset, so this queue waits for it and the retiring pass
-                    // asks for another round. Other queues are untouched.
-                    if self.queue_transitions.install_deferred(mq) {
+                    // One installation per key, claimed before any of its work rather than merely
+                    // checked for it (plan 49j J1 item 2): a retirement waiting on persistence and
+                    // a second installer of the same absent queue both keep
+                    // this pass out, and the claim is held through publication
+                    // so neither can slip between preparation and publishing.
+                    // Being turned away is recorded as a deferred transition, because a
+                    // queue skipped in silence stays uninstalled until something else wakes
+                    // rebalance.
+                    let Some(installation) = self.queue_transitions.try_install(mq) else {
                         debug!(
-                            "doRebalance, {:?}, deferring {} until the retirement in flight ends",
+                            "doRebalance, {:?}, deferring {} until the transition in flight ends",
                             self.consumer_group, mq
                         );
+                        deferred_transition = true;
                         continue;
-                    }
+                    };
                     if is_order && !self.lock(mq).await {
                         warn!(
                             "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -651,6 +681,7 @@ where
                             mq.get_topic()
                         );
                         all_mq_locked = false;
+                        deferred_transition |= installation.release();
                         continue;
                     }
 
@@ -664,13 +695,14 @@ where
                         sub_rebalance_impl
                             .note_allocation_pass(topic, AllocationOutcome::OffsetPreparationFailed)
                             .await;
+                        deferred_transition |= installation.release();
                         continue;
                     };
                     if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
-                        let inserted = {
-                            let mut process_queue_table = process_queue_table_clone.write().await;
-                            process_queue_table.insert(mq.clone(), pq.clone()).is_none()
-                        };
+                        // Publication adds, it never replaces (plan 49j J1 item 3): an entry that
+                        // appeared while this pass prepared its offset belongs to the pass that
+                        // published it, including its acquisition.
+                        let inserted = insert_process_queue_if_absent(&process_queue_table_clone, mq, &pq).await;
                         if inserted {
                             info!(
                                 "doRebalance, {:?}, add a new mq, {}",
@@ -706,6 +738,9 @@ where
                                 .await;
                         }
                     }
+                    // The claim ends only once publication is settled - table entry and the
+                    // acquisition naming it are then one object, or this pass installed nothing.
+                    deferred_transition |= installation.release();
                 }
             }
 
@@ -791,9 +826,12 @@ where
         for (mq, pq) in remove_queue_map {
             let Some(guard) = self.queue_transitions.try_retire(&mq, &pq) else {
                 debug!(
-                    "doRebalance, {:?}, leaving {} alone, another pass is already retiring it",
+                    "doRebalance, {:?}, leaving {} alone, another transition owns it",
                     self.consumer_group, mq
                 );
+                // Same as the repair path: a key held by an installation is retired when that
+                // installation ends, so ask for the pass that will do it (plan 49j J1 item 2).
+                deferred_transition = true;
                 continue;
             };
             // Plan 49h H1: same rule as the repair path above - only the object this pass decided
@@ -851,13 +889,18 @@ where
                 // still waiting on persistence (plan 49i I2 item 1): the retiring pass would erase
                 // the offset this one just prepared. Defer the queue and let its completion ask for
                 // another pass.
-                if self.queue_transitions.install_deferred(mq) {
+                // The same claim as the repair path above (plan 49j J1 item 2): preparation and
+                // publication happen under one installation, so no retirement begins in that window
+                // and a competing installer of this key is turned away rather than replacing what
+                // this pass publishes.
+                let Some(installation) = self.queue_transitions.try_install(mq) else {
                     debug!(
-                        "doRebalance, {:?}, deferring {} until the retirement in flight ends",
+                        "doRebalance, {:?}, deferring {} until the transition in flight ends",
                         self.consumer_group, mq
                     );
+                    deferred_transition = true;
                     continue;
-                }
+                };
                 if is_order && !self.lock(mq).await {
                     warn!(
                         "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -865,6 +908,7 @@ where
                         mq.get_topic()
                     );
                     all_mq_locked = false;
+                    deferred_transition |= installation.release();
                     continue;
                 }
 
@@ -873,10 +917,8 @@ where
                 pq.set_locked(true);
                 let next_offset = sub_rebalance_impl.compute_pull_from_where(mq).await;
                 if next_offset >= 0 && self.is_rebalance_generation_current(generation) {
-                    let inserted = {
-                        let mut process_queue_table = process_queue_table_cloned.write().await;
-                        process_queue_table.insert(mq.clone(), pq.clone()).is_none()
-                    };
+                    // Adds, never replaces (plan 49j J1 item 3).
+                    let inserted = insert_process_queue_if_absent(&process_queue_table_cloned, mq, &pq).await;
                     if inserted {
                         info!(
                             "doRebalance, {:?}, add a new mq, {}",
@@ -921,6 +963,8 @@ where
                             .await;
                     }
                 }
+                // Claim held through publication (plan 49j J1 item 2).
+                deferred_transition |= installation.release();
             }
         }
 
@@ -1780,5 +1824,784 @@ mod review49i {
             "the retired acquisition still answers to its process queue"
         );
         assert_eq!(entries, 0, "the retired queue stayed in the table");
+    }
+}
+
+#[cfg(test)]
+mod review49j {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use std::time::Duration;
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        io: Arc<tokio::sync::Mutex<()>>,
+        path: std::path::PathBuf,
+        q: MessageQueue,
+    }
+    fn fixture(label: &str) -> Fixture {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49j-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let client = MQClientInstance::new_arc(cc, 0, format!("review49j-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49j-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        Fixture {
+            push,
+            client,
+            io,
+            path,
+            q: MessageQueue::from_parts("T", "broker", 0),
+        }
+    }
+    async fn cleanup(mut f: Fixture) {
+        f.push.work.close();
+        f.client.shutdown().await;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
+    }
+    async fn installation_race(two: bool) {
+        let mut f = fixture(if two { "two-installers" } else { "one-installer" });
+        let store = f.push.offset_store.as_mut().unwrap();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+        let io_guard = f.io.lock().await;
+        let mut first = f.push.rebalance_impl.clone();
+        let mut second = f.push.rebalance_impl.clone();
+        let table = first.rebalance_impl_inner.process_queue_table.clone();
+        let desired = HashSet::from([f.q.clone()]);
+        let mut installers = Box::pin(async {
+            if two {
+                let (a, b) = tokio::join!(
+                    first
+                        .rebalance_impl_inner
+                        .update_process_queue_table_in_rebalance("T", &desired, false),
+                    second
+                        .rebalance_impl_inner
+                        .update_process_queue_table_in_rebalance("T", &desired, false)
+                );
+                (a, Some(b))
+            } else {
+                (
+                    first
+                        .rebalance_impl_inner
+                        .update_process_queue_table_in_rebalance("T", &desired, false)
+                        .await,
+                    None,
+                )
+            }
+        });
+        tokio::select! { _=&mut installers=>panic!("offset preparation must wait behind the held file lock"), _=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        let table_guard = table.write().await;
+        drop(io_guard);
+        tokio::select! { _=&mut installers=>panic!("publication must wait behind the held table lock"), _=tokio::time::sleep(Duration::from_millis(50))=>{} }
+        drop(table_guard);
+        let outcomes = tokio::time::timeout(Duration::from_secs(2), &mut installers)
+            .await
+            .expect("installation did not finish");
+        drop(installers);
+        let installed = table
+            .read()
+            .await
+            .get(&f.q)
+            .cloned()
+            .expect("no installation was published");
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        let same = Arc::ptr_eq(&installed, &bound);
+        let epoch = f.push.progress.current_epoch(&f.q);
+        eprintln!(
+            "installation publication: two={two} outcomes={outcomes:?} table_matches_binding={same} epoch={epoch:?}"
+        );
+        cleanup(f).await;
+        assert!(
+            same,
+            "the losing installer replaced the winner's table entry without publishing a binding"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_installers_must_not_replace_the_published_winner() {
+        installation_race(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_installer_publishes_matching_table_and_binding() {
+        installation_race(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn retirement_writer_window(cancel: bool) {
+        use std::io::Write;
+        let f = fixture(if cancel { "cancelled-writer" } else { "owned-writer" });
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        f.push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .update_offset(&f.q, 7, false)
+            .await;
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        // The real blocking writer will wait for EOF here while owning the file-I/O mutex.
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Some(Box::pin(rebalance.remove_process_queue(&f.q, &old)));
+        tokio::select! { _=retiring.as_mut().unwrap()=>panic!("retirement must wait for its blocking writer"), _=tokio::time::sleep(Duration::from_millis(30))=>{} }
+        let owner_before = transitions.retiring(&f.q);
+        let deferred_before = transitions.install_deferred(&f.q);
+        if cancel {
+            drop(retiring.take());
+        }
+        let writer_still_owned = f.io.try_lock().is_err();
+        let owner_after = transitions.retiring(&f.q);
+        let deferred_after = transitions.install_deferred(&f.q);
+        let table_missing = !table.read().await.contains_key(&f.q);
+        eprintln!(
+            "retirement cancellation={cancel}: owner_before={owner_before} deferred_before={deferred_before} \
+             writer_still_owned={writer_still_owned} owner_after={owner_after} deferred_after={deferred_after} \
+             table_missing={table_missing}"
+        );
+        // Replace the path before waking the FIFO reader so backup/write use a regular file.
+        std::fs::remove_file(&f.path).unwrap();
+        let empty = br#"{"offsetTable":{}}"#;
+        std::fs::write(&f.path, empty).unwrap();
+        pipe.write_all(empty).unwrap();
+        drop(pipe);
+        let writer_done = tokio::time::timeout(Duration::from_secs(2), f.io.lock()).await.is_ok();
+        if let Some(owner) = retiring.as_mut() {
+            tokio::time::timeout(Duration::from_secs(2), owner)
+                .await
+                .expect("retirement bookkeeping did not finish");
+        }
+        drop(retiring);
+        cleanup(f).await;
+        assert!(writer_done, "fixture did not release the real blocking writer");
+        assert!(
+            owner_before && deferred_before && writer_still_owned && table_missing,
+            "fixture missed the owned writer window"
+        );
+        assert!(
+            owner_after && deferred_after,
+            "cancelling the waiter authorized installation while its writer still owned the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_retirement_must_keep_its_transition_while_the_writer_runs() {
+        retirement_writer_window(true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owned_retirement_keeps_its_transition_until_the_writer_finishes() {
+        retirement_writer_window(false).await;
+    }
+
+    /// Unblock the fixture's blocking offset writer: a regular file for it to read, then EOF for
+    /// the pipe it is parked on. Every test that parks that writer calls this before asserting,
+    /// because a panic with a blocking task still waiting on the pipe would hang when its
+    /// runtime is dropped.
+    #[cfg(unix)]
+    fn release_offset_writer(path: &std::path::Path, pipe: std::fs::File) {
+        use std::io::Write;
+        let empty = br#"{"offsetTable":{}}"#;
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::write(path, empty);
+        let mut pipe = pipe;
+        let _ = pipe.write_all(empty);
+        // Closing the write end is what gives the parked reader EOF and lets its write finish.
+        drop(pipe);
+    }
+
+    /// Cleanup joins a retirement it did not start (plan 49j J2 item 3): closing admission must not
+    /// let shutdown pass an operation whose local writer is still running, because that write is
+    /// part of the proof this consumer makes before it goes away.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unfinished_retirement_keeps_the_drain_open() {
+        let f = fixture("retirement-drain");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        f.push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .update_offset(&f.q, 7, false)
+            .await;
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Some(Box::pin(rebalance.remove_process_queue(&f.q, &old)));
+        let parked = tokio::select! {
+            _ = retiring.as_mut().unwrap() => false,
+            _ = tokio::time::sleep(Duration::from_millis(30)) => true,
+        };
+        drop(retiring);
+
+        f.push.work.close();
+        let still_running = tokio::time::timeout(Duration::from_millis(50), f.push.work.wait())
+            .await
+            .is_err();
+
+        release_offset_writer(&f.path, pipe);
+        let drained = tokio::time::timeout(Duration::from_secs(2), f.push.work.wait())
+            .await
+            .is_ok();
+
+        assert!(parked, "retirement must wait for its blocking writer");
+        assert!(
+            still_running,
+            "cleanup passed a retirement whose writer was still running"
+        );
+        assert!(drained, "the drain stayed open after its retirement finished");
+        cleanup(f).await;
+    }
+
+    /// Publication adds, it never replaces (plan 49j J1 item 3): the first installer's object stays
+    /// in the table, so the acquisition published beside it still names what dispatch will find.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_adds_but_never_replaces() {
+        let table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let q = MessageQueue::from_parts("T", "broker", 9);
+        let winner = Arc::new(ProcessQueue::new());
+        let loser = Arc::new(ProcessQueue::new());
+
+        assert!(
+            insert_process_queue_if_absent(&table, &q, &winner).await,
+            "an absent queue was not installed"
+        );
+        assert!(
+            !insert_process_queue_if_absent(&table, &q, &loser).await,
+            "a losing installer reported an installation it did not make"
+        );
+        let held = table.read().await.get(&q).cloned().unwrap();
+        assert!(
+            Arc::ptr_eq(&held, &winner),
+            "the table no longer names the object whose acquisition was published"
+        );
+    }
+
+    /// An installation holds its key while it publishes, not merely while it checks (plan 49j J1
+    /// item 2): parked behind the table lock it is still the only pass that may transition that
+    /// queue, so no retirement can begin between preparation and the acquisition naming the
+    /// published object.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_installer_holds_its_key_through_publication() {
+        let mut f = fixture("installer-holds-key");
+        let store = f.push.offset_store.as_mut().unwrap();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+
+        let io_guard = f.io.lock().await;
+        let mut installer = f.push.rebalance_impl.clone();
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        let desired = HashSet::from([f.q.clone()]);
+        let mut pass = Box::pin(
+            installer
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &desired, false),
+        );
+        // Parked in offset preparation.
+        tokio::select! {
+            _ = pass.as_mut() => panic!("offset preparation must wait behind the held file lock"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let table_guard = table.write().await;
+        drop(io_guard);
+        // Parked at publication, with nothing in the table yet.
+        tokio::select! {
+            _ = pass.as_mut() => panic!("publication must wait behind the held table lock"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // Reading the table here would need the very lock this pass is waiting on; what the fixture
+        // can prove from outside is that the key is still claimed while publication is pending.
+        assert!(
+            transitions.install_deferred(&f.q),
+            "an installation stopped owning its queue before it published"
+        );
+        drop(table_guard);
+        tokio::time::timeout(Duration::from_secs(2), pass)
+            .await
+            .expect("installation did not finish");
+
+        let installed = table
+            .read()
+            .await
+            .get(&f.q)
+            .cloned()
+            .expect("no installation was published");
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        assert!(
+            Arc::ptr_eq(&installed, &bound),
+            "the published table entry and acquisition name different objects"
+        );
+        cleanup(f).await;
+    }
+
+    /// The repair path asks for another pass when a key it wanted to retire was busy (plan 49j J1
+    /// item 2), exactly as the plain rebalance path does: whoever holds the key is not retiring
+    /// this queue, and a removal request that ends in silence stays unretired until something
+    /// wakes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_repair_path_asks_for_another_pass_when_a_key_is_busy() {
+        let f = fixture("busy-key-repair");
+        let installed = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), installed.clone());
+        f.push.note_queue_installed(&f.q, &installed);
+        let claim = transitions
+            .try_install(&f.q)
+            .expect("nothing transitions this queue yet");
+
+        let wakes = f.client.review49j_rebalance_wakes();
+        // Nothing is assigned any more: the repair pass wants this queue retired and finds its key
+        // held by an installation.
+        let mut repair = f.push.rebalance_impl.clone();
+        let topic = CheetahString::from_static_str("T");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            repair
+                .rebalance_impl_inner
+                .update_message_queue_assignment(&topic, &HashSet::new(), false),
+        )
+        .await
+        .expect("the repair pass did not finish");
+
+        assert!(
+            table.read().await.contains_key(&f.q),
+            "a repair pass retired a queue whose installation was in flight"
+        );
+        for _ in 0..80 {
+            if f.client.review49j_rebalance_wakes() > wakes {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            f.client.review49j_rebalance_wakes() > wakes,
+            "a repair pass that could not retire a busy key reported itself as finished"
+        );
+        let _ = claim.release();
+        cleanup(f).await;
+    }
+
+    /// The broker-assigned repair path makes the same two promises as the plain rebalance path
+    /// (plan 49j J1 items 2-3): it holds its key from preparation through publication, and what it
+    /// publishes adds to the table rather than replacing an entry that appeared meanwhile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_repair_path_holds_its_key_and_adds_but_never_replaces() {
+        let mut f = fixture("repair-loses-race");
+        let store = f.push.offset_store.as_mut().unwrap();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+
+        let io_guard = f.io.lock().await;
+        let assignment = MessageQueueAssignment {
+            message_queue: Some(f.q.clone()),
+            // Anything but Pop is a push assignment (plan 49g's repair path).
+            mode: MessageRequestMode::Pull,
+            attachments: None,
+        };
+        let assignments = HashSet::from([assignment]);
+        let mut repair = f.push.rebalance_impl.clone();
+        let topic = CheetahString::from_static_str("T");
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        let mut pass = Box::pin(repair.rebalance_impl_inner.update_message_queue_assignment(
+            &topic,
+            &assignments,
+            false,
+        ));
+        // Parked in offset preparation.
+        tokio::select! {
+            _ = pass.as_mut() => panic!("offset preparation must wait behind the held file lock"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let mut table_guard = table.write().await;
+        drop(io_guard);
+        // Parked at publication, and still the only pass allowed to transition this key.
+        tokio::select! {
+            _ = pass.as_mut() => panic!("publication must wait behind the held table lock"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert!(
+            transitions.install_deferred(&f.q),
+            "a repair installation stopped owning its queue before it published"
+        );
+        // A competing installer finishes while this one waits at publication.
+        let winner = Arc::new(ProcessQueue::new());
+        f.push.note_queue_installed(&f.q, &winner);
+        table_guard.insert(f.q.clone(), winner.clone());
+        drop(table_guard);
+        tokio::time::timeout(Duration::from_secs(2), pass)
+            .await
+            .expect("the repair pass did not finish");
+
+        let held = table.read().await.get(&f.q).cloned().expect("the queue vanished");
+        assert!(
+            Arc::ptr_eq(&held, &winner),
+            "a losing repair installation replaced the published winner"
+        );
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        assert!(
+            Arc::ptr_eq(&held, &bound),
+            "the table entry and acquisition name different objects"
+        );
+        cleanup(f).await;
+    }
+
+    /// A retirement that could not begin still has to happen (plan 49j J1 item 2). The key was held
+    /// by an installation publishing this very queue, so the caller asks for another pass
+    /// instead of leaving a dropped queue until some unrelated event wakes rebalance.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_retirement_asks_for_another_pass() {
+        let f = fixture("refused-retire");
+        let installed = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), installed.clone());
+        f.push.note_queue_installed(&f.q, &installed);
+        // An installation of this key is in flight; a retirement must not publish over it.
+        let claim = transitions
+            .try_install(&f.q)
+            .expect("nothing transitions this queue yet");
+
+        let wakes = f.client.review49j_rebalance_wakes();
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            rebalance.remove_process_queue(&f.q, &installed),
+        )
+        .await
+        .expect("a retirement must not wait behind the transition it lost");
+
+        assert!(
+            table.read().await.contains_key(&f.q),
+            "a refused retirement still removed the queue"
+        );
+        assert!(!transitions.retiring(&f.q), "the loser claimed a busy key");
+        for _ in 0..80 {
+            if f.client.review49j_rebalance_wakes() > wakes {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            f.client.review49j_rebalance_wakes() > wakes,
+            "a retirement turned away by an in-flight installation never asked for another pass"
+        );
+        let _ = claim.release();
+        cleanup(f).await;
+    }
+
+    /// The same promise on the rebalance side (plan 49j J1 item 2): a pass that reaches an
+    /// unassigned queue whose key is busy defers that queue and asks to be back, rather than
+    /// reporting a clean pass and leaving the queue assigned for another full rebalance
+    /// interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_that_cannot_retire_a_busy_key_asks_for_another_pass() {
+        let f = fixture("busy-key-pass");
+        let installed = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), installed.clone());
+        f.push.note_queue_installed(&f.q, &installed);
+        let claim = transitions
+            .try_install(&f.q)
+            .expect("nothing transitions this queue yet");
+
+        let wakes = f.client.review49j_rebalance_wakes();
+        // Nothing is assigned any more: the pass wants this queue retired and finds its key busy.
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &HashSet::new(), false),
+        )
+        .await
+        .expect("the pass did not finish");
+
+        assert!(
+            table.read().await.contains_key(&f.q),
+            "a pass retired a queue whose installation was in flight"
+        );
+        for _ in 0..80 {
+            if f.client.review49j_rebalance_wakes() > wakes {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            f.client.review49j_rebalance_wakes() > wakes,
+            "a pass that could not retire a busy key reported itself as finished"
+        );
+        let _ = claim.release();
+        cleanup(f).await;
+    }
+
+    /// A pass that found a queue missing can find it installed by the time it publishes, because
+    /// another installer claimed, published and released in between (plan 49j J1 item 3).
+    /// Publication must then add nothing: replacing the winner would leave the acquisition
+    /// naming an object that no table entry holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_installer_does_not_replace_a_competing_publication() {
+        let mut f = fixture("installer-loses-race");
+        let store = f.push.offset_store.as_mut().unwrap();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+
+        let io_guard = f.io.lock().await;
+        let mut installer = f.push.rebalance_impl.clone();
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let desired = HashSet::from([f.q.clone()]);
+        let mut pass = Box::pin(
+            installer
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &desired, false),
+        );
+        tokio::select! {
+            _ = pass.as_mut() => panic!("offset preparation must wait behind the held file lock"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let mut table_guard = table.write().await;
+        drop(io_guard);
+        // The competing installer finishes while this one waits at publication: its object owns the
+        // key and its acquisition names that same object.
+        let winner = Arc::new(ProcessQueue::new());
+        f.push.note_queue_installed(&f.q, &winner);
+        table_guard.insert(f.q.clone(), winner.clone());
+        drop(table_guard);
+        tokio::time::timeout(Duration::from_secs(2), pass)
+            .await
+            .expect("installation did not finish");
+
+        let held = table.read().await.get(&f.q).cloned().expect("the queue vanished");
+        assert!(
+            Arc::ptr_eq(&held, &winner),
+            "a losing installer replaced the published winner"
+        );
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        assert!(
+            Arc::ptr_eq(&held, &bound),
+            "the table entry and acquisition name different objects"
+        );
+        cleanup(f).await;
+    }
+
+    /// Exclusion is per key (plan 49j J1 items 1-2): a queue whose retirement is in flight waits,
+    /// every other queue installs, and the turned-away installation is reported so another pass is
+    /// scheduled rather than left to whatever wakes rebalance next.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unrelated_queue_installs_while_another_key_retires() {
+        let mut f = fixture("unrelated-install");
+        let store = f.push.offset_store.as_mut().unwrap();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+
+        let retiring_q = f.q.clone();
+        let sibling = MessageQueue::from_parts("T", "broker", 1);
+        store.update_offset(&sibling, 7, false).await;
+        store.persist(&sibling).await;
+
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        // A retirement of the first key is in flight: its entry has left the table and its side
+        // effects have not finished, which is exactly the window an installation must not publish
+        // into. Claiming it here keeps the test on the window rather than on a disk wait.
+        let retiring = Arc::new(ProcessQueue::new());
+        let guard = transitions
+            .try_retire(&retiring_q, &retiring)
+            .expect("nothing retires this queue yet");
+
+        let desired = HashSet::from([retiring_q.clone(), sibling.clone()]);
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &desired, false),
+        )
+        .await
+        .expect("the installation pass never finished");
+
+        let installed = table
+            .read()
+            .await
+            .get(&sibling)
+            .cloned()
+            .expect("an unrelated queue was held up by another key's retirement");
+        let bound = f
+            .push
+            .progress
+            .review49h_bound_to(&sibling)
+            .unwrap()
+            .upgrade()
+            .expect("the sibling's installation published no acquisition");
+        assert!(
+            Arc::ptr_eq(&installed, &bound),
+            "the sibling's table entry and acquisition name different objects"
+        );
+        assert!(
+            !table.read().await.contains_key(&retiring_q),
+            "an installation was published into a retirement of the same key"
+        );
+        assert!(
+            guard.release(),
+            "the turned-away installation was not reported for another pass"
+        );
+        cleanup(f).await;
+    }
+
+    /// Cancelling the waiter is not cancelling the retirement (plan 49j J2 items 1-3): while the
+    /// operation's own writer still owns the offset file, an installation of that key stays turned
+    /// away; once the SDK-owned task has finished its bookkeeping, the next pass installs normally.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_waiter_keeps_its_key_closed_to_installation() {
+        let f = fixture("cancelled-writer-install");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        f.push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .update_offset(&f.q, 7, false)
+            .await;
+
+        // The real offset writer blocks here, holding the file-I/O mutex it must keep to finish.
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Some(Box::pin(rebalance.remove_process_queue(&f.q, &old)));
+        let parked = tokio::select! {
+            _ = retiring.as_mut().unwrap() => false,
+            _ = tokio::time::sleep(Duration::from_millis(30)) => true,
+        };
+        drop(retiring);
+
+        // The caller is gone; the retirement is not. An installation pass for this key now finds
+        // the transition claimed and defers, rather than preparing an offset behind that
+        // writer. Bounded, because a pass that prepared instead of deferring would wait on
+        // exactly that writer.
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let desired = HashSet::from([f.q.clone()]);
+        let deferred_cleanly = tokio::time::timeout(
+            Duration::from_secs(2),
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &desired, false),
+        )
+        .await
+        .is_ok();
+        let installed_early = table.read().await.contains_key(&f.q);
+        let still_claimed = transitions.retiring(&f.q);
+
+        release_offset_writer(&f.path, pipe);
+        let writer = tokio::time::timeout(Duration::from_secs(2), f.io.lock()).await;
+        let writer_done = writer.is_ok();
+        drop(writer);
+        // The SDK-owned task ends its claim only after its own bookkeeping, so waiting for that is
+        // waiting for the whole operation.
+        for _ in 0..200 {
+            if !transitions.retiring(&f.q) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(parked, "retirement must wait for its blocking writer");
+        assert!(
+            deferred_cleanly,
+            "an installation waited on the offset file of a retiring queue instead of deferring"
+        );
+        assert!(
+            !installed_early,
+            "an installation was authorized while the cancelled retirement's writer owned the file"
+        );
+        assert!(still_claimed, "the cancelled waiter ended its retirement");
+        assert!(writer_done, "fixture did not release the real blocking writer");
+        assert!(
+            !transitions.retiring(&f.q),
+            "the retirement never finished its bookkeeping"
+        );
+
+        // With the operation done, the same pass installs the queue and publishes a matching
+        // binding.
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance("T", &desired, false),
+        )
+        .await
+        .expect("installation never finished once its retirement ended");
+        let installed = table
+            .read()
+            .await
+            .get(&f.q)
+            .cloned()
+            .expect("the queue stayed uninstalled after its retirement ended");
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        assert!(
+            Arc::ptr_eq(&installed, &bound),
+            "the reinstalled queue's table entry and acquisition name different objects"
+        );
+        cleanup(f).await;
     }
 }

@@ -1911,6 +1911,45 @@ mod tests {
         assert_eq!(consumer.cleanup_session_ceiling(), Duration::from_secs(12));
     }
 
+    /// Admit work that will not finish until the returned gate is released, so a cleanup pass can
+    /// be held at its drain while a test reads its phases. An incarnation with nothing to clean
+    /// up runs to its end between two statements, and asserting "still running" or "cannot have
+    /// proved yet" against detached work then depends on how busy the machine is rather than on
+    /// behaviour.
+    fn hold_the_drain(consumer: &mut DefaultMQPushConsumer) -> tokio::sync::oneshot::Sender<()> {
+        let (gate, released) = tokio::sync::oneshot::channel::<()>();
+        consumer
+            .default_mqpush_consumer_impl
+            .as_mut()
+            .unwrap()
+            .work
+            .spawn_draining(&tokio::runtime::Handle::current(), async move {
+                let _ = released.await;
+            });
+        gate
+    }
+
+    /// Wait for the one pass to reach a terminal phase, so a held drain is never left blocked when
+    /// the test returns.
+    async fn await_terminal_phase(
+        consumer: &DefaultMQPushConsumer,
+    ) -> crate::consumer::cleanup_session::CleanupProgress {
+        let mut progress = consumer
+            .cleanup_progress_changes()
+            .expect("a session exists once cleanup began");
+        for _ in 0..200 {
+            let running = progress.borrow_and_update().running;
+            if !running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let snapshot = progress.borrow();
+            (*snapshot).clone()
+        }
+    }
+
     /// An observer whose wait has already elapsed must not shrink the pass it just joined: giving
     /// up on watching cannot take away the consumer's chance to persist offsets and unregister.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1922,6 +1961,9 @@ mod tests {
         let mut consumer = spec()
             .build_incarnation(Arc::new(ConsumerProgress::default()), &policy)
             .expect("a valid spec builds an incarnation");
+        // The pass must still have work left when the observer gives up, otherwise "could not
+        // prove" is a coin flip about scheduling rather than a property of an elapsed wait.
+        let gate = hold_the_drain(&mut consumer);
         let settled = consumer.shutdown_until(tokio::time::Instant::now()).await;
         assert!(
             matches!(
@@ -1931,6 +1973,10 @@ mod tests {
             "an elapsed wait cannot prove cleanup"
         );
         assert_eq!(consumer.cleanup_session_ceiling(), Duration::from_secs(12));
+        // The pass the abandoned observer left behind keeps going on its own and finishes.
+        drop(gate);
+        let done = await_terminal_phase(&consumer).await;
+        assert!(!done.running, "the pass never reached a terminal phase: {done:?}");
     }
 
     /// Admission closes at once and the pass is detached from the caller that asked for it, so
@@ -1941,6 +1987,9 @@ mod tests {
             .build_incarnation(Arc::new(ConsumerProgress::default()), &LifecyclePolicy::default())
             .expect("a valid spec builds an incarnation");
         assert!(consumer.cleanup_progress_changes().is_none(), "no stop requested yet");
+        // Hold the pass at its drain so the phases below are read while it runs; see
+        // hold_the_drain.
+        let gate = hold_the_drain(&mut consumer);
         assert!(consumer.begin_cleanup(), "the pass is owned by the SDK");
         let mut first = consumer
             .cleanup_progress_changes()
@@ -1955,6 +2004,12 @@ mod tests {
         assert!(consumer.begin_cleanup());
         let progress = consumer.cleanup_progress().expect("still the same session");
         assert!(progress.running, "{progress:?}");
+
+        // With nothing left to drain, that one pass runs out to a terminal phase on its own.
+        drop(gate);
+        let done = await_terminal_phase(&consumer).await;
+        assert!(!done.running, "the pass never reached a terminal phase: {done:?}");
+        assert_eq!(done.attempts, 0, "one pass repeated a phase: {done:?}");
     }
 
     /// A managed incarnation built through the unmodified spec: subscriptions live only in the

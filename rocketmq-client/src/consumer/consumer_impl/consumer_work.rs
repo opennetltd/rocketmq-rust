@@ -2,9 +2,11 @@
 // Licensed under the Apache License, Version 2.0.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::TaskTracker;
@@ -44,6 +46,29 @@ impl ConsumerWork {
             let _token = token;
             future.await;
         });
+    }
+
+    /// Register work that cleanup must drain, and report whether it was admitted at all (plan 49j
+    /// J2 item 1). Unlike [`Self::spawn_draining`], an operation the caller cannot afford to
+    /// lose is handed back rather than dropped when admission has already closed, so the caller
+    /// keeps ownership of everything inside it - including a queue's transition claim - and
+    /// performs it itself.
+    ///
+    /// The task belongs to this SDK, not to whoever asked for the work: a caller whose future is
+    /// cancelled leaves it running, and shutdown still joins it because the tracker token - not the
+    /// caller - is what the drain waits on.
+    pub(crate) fn spawn_draining_owned(
+        &self,
+        handle: &Handle,
+        future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<JoinHandle<()>, Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        let Some(token) = self.enter() else {
+            return Err(future);
+        };
+        Ok(handle.spawn(async move {
+            let _token = token;
+            future.await;
+        }))
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -200,6 +225,62 @@ mod tests {
             "started delivery drains to completion"
         );
         assert_eq!(slept.load(Ordering::SeqCst), 0, "a sleeping retry is cancelled");
+    }
+
+    /// An owned operation outlives the future that started it, and cleanup still waits for it
+    /// (plan 49j J2 items 1 and 3): cancelling the observer must not cancel work whose side effects
+    /// are already running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_caller_leaves_its_owned_operation_to_the_drain() {
+        let work = Arc::new(ConsumerWork::default());
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let flag = Arc::clone(&finished);
+        let operation = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            flag.fetch_add(1, Ordering::SeqCst);
+        });
+        let join = match work.spawn_draining_owned(&Handle::current(), operation) {
+            Ok(join) => join,
+            Err(_) => panic!("open admission takes owned work"),
+        };
+        // The caller gives up watching; the operation is not theirs to cancel.
+        drop(join);
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "fixture raced the operation");
+
+        work.close();
+        // Cleanup joins it: closing admission does not mean the work was done.
+        tokio::time::timeout(Duration::from_millis(20), work.wait())
+            .await
+            .expect_err("an owned operation must keep the drain open");
+        tokio::time::timeout(Duration::from_secs(1), work.wait())
+            .await
+            .expect("the drain completes once the owned operation finishes");
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    /// Work that cannot be admitted is handed back rather than dropped, together with everything it
+    /// owns - a queue's transition claim among it (plan 49j J2 item 1).
+    #[tokio::test]
+    async fn closed_admission_hands_an_owned_operation_back() {
+        let work = Arc::new(ConsumerWork::default());
+        work.close();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&finished);
+        let operation = Box::pin(async move {
+            flag.fetch_add(1, Ordering::SeqCst);
+        });
+        let returned = match work.spawn_draining_owned(&Handle::current(), operation) {
+            Ok(_) => panic!("closed admission took owned work"),
+            Err(operation) => operation,
+        };
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "the operation ran anyway");
+        returned.await;
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the caller was left unable to run it"
+        );
     }
 
     #[tokio::test]

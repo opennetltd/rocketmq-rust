@@ -32,6 +32,7 @@ use rocketmq_remoting::protocol::heartbeat::message_model::MessageModel;
 use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
 use rocketmq_rust::ArcMut;
 use rocketmq_rust::WeakArcMut;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::error;
@@ -45,6 +46,7 @@ use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::queue_transitions::RetirementGuard;
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::remove_process_queue_if_same;
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::RebalanceImpl;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
@@ -150,6 +152,52 @@ impl RebalancePushImpl {
         }
 
         false
+    }
+}
+
+/// The bookkeeping one retirement owns, from dropping the table entry through ending its
+/// acquisition (plan 49j J2 item 1), performed on a task this SDK holds.
+///
+/// It is written against an owned handle rather than against whoever asked for the queue to go
+/// away, because the caller's future may be cancelled halfway through: persistence for this queue
+/// can wait on a local writer that outlives that future, and cancelling then would end the
+/// transition claim - authorizing an installation to write the same offset file - while the
+/// retirement's own erase is still coming.
+async fn retire_owned_process_queue(
+    mut rebalance: ArcMut<RebalancePushImpl>,
+    mq: MessageQueue,
+    pq: Arc<ProcessQueue>,
+    guard: RetirementGuard,
+) {
+    // The entry is dropped only while it still names the object this retirement scheduled (plan 49h
+    // H1): a replacement installed meanwhile keeps its table entry and everything hanging off it.
+    if remove_process_queue_if_same(&rebalance.rebalance_impl_inner.process_queue_table, &mq, &pq).await {
+        let droped = pq.is_dropped();
+        pq.set_dropped(true);
+        // Side effects first, while this object still owns the queue; revocation afterwards,
+        // because it is what stops further work on this identity. Each step revalidates against
+        // this exact process queue (plan 49i I2 item 2), which is what makes it safe for the
+        // operation to outlive the caller that started it.
+        rebalance.remove_unnecessary_message_queue(&mq, &pq).await;
+        if let Some(impl_) = rebalance.default_mqpush_consumer_impl.as_ref() {
+            // The queue left the table, so its acquisition ends here - naming the object that just
+            // left it, so a pull answer arriving later cannot publish into whoever installs next
+            // (plan 49c C1) and a successor's own identity survives (plan 49i I2 item 3).
+            impl_.note_queue_revoked_for(&mq, &pq);
+        }
+        info!(
+            "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
+            rebalance.rebalance_impl_inner.consumer_group.as_ref().unwrap(),
+            mq,
+            droped
+        );
+    }
+    // The claim ends with the last piece of bookkeeping, and an installation turned away while it
+    // ran is asked for again rather than left to chance (plan 49i I2 item 1).
+    if guard.release() {
+        if let Some(client) = rebalance.rebalance_impl_inner.client_instance.as_mut() {
+            client.rebalance_later(500);
+        }
     }
 }
 
@@ -448,35 +496,52 @@ impl Rebalance for RebalancePushImpl {
     async fn remove_process_queue(&mut self, mq: &MessageQueue, expected: &Arc<ProcessQueue>) {
         // One retirement per queue (plan 49i I2 item 1): a caller reaching a key whose retirement
         // is already in flight does nothing, rather than stacking a second round of
-        // persistence and offset removal - or ending an acquisition it never owned.
+        // persistence and offset removal - or ending an acquisition it never owned. The claim is
+        // taken before the first await, so no later caller can join this one.
         let Some(guard) = self.rebalance_impl_inner.queue_transitions.try_retire(mq, expected) else {
+            // The key is held by another transition - possibly an installation that is publishing
+            // this very queue (plan 49j J1 item 2). Whoever holds it does not retire the queue on
+            // this caller's behalf, so ask for a later pass instead of leaving the request dropped
+            // on the floor.
+            if let Some(client) = self.rebalance_impl_inner.client_instance.as_mut() {
+                client.rebalance_later(500);
+            }
             return;
         };
-        // The entry is dropped only while it still names the object this caller scheduled (plan 49h
-        // H1): a replacement installed meanwhile keeps its table entry and everything hanging off
-        // it.
-        let pq = expected.clone();
-        if remove_process_queue_if_same(&self.rebalance_impl_inner.process_queue_table, mq, &pq).await {
-            let droped = pq.is_dropped();
-            pq.set_dropped(true);
-            // Side effects first, while this object still owns the queue; revocation afterwards,
-            // because it is what stops further work on this identity.
-            self.remove_unnecessary_message_queue(mq, &pq).await;
-            if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
-                // The queue left the table, so its acquisition ends here - naming the object that
-                // just left it, so a pull answer arriving later cannot publish into whoever
-                // installs next (plan 49c C1) and the successor's own identity
-                // survives (plan 49i I2 item 3).
-                impl_.note_queue_revoked_for(mq, &pq);
+        let Some(consumer) = self.default_mqpush_consumer_impl.clone() else {
+            // Nothing could own this work. End the claim rather than strand the key, and do not
+            // swallow an installation that was turned away while it was held.
+            if guard.release() {
+                if let Some(client) = self.rebalance_impl_inner.client_instance.as_mut() {
+                    client.rebalance_later(500);
+                }
             }
-            info!(
-                "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
-                self.rebalance_impl_inner.consumer_group.as_ref().unwrap(),
-                mq,
-                droped
-            );
+            return;
+        };
+
+        // A retirement is this SDK's work rather than its caller's (plan 49j J2 item 1). Handing it
+        // to a task the consumer owns, before this function's first await, means a caller that
+        // loses interest - an observer whose deadline passed, a pull answer that stopped
+        // caring - leaves the operation running with its transition claim and its blocking
+        // writer instead of ending both and authorizing an installation to write the same
+        // offset file. Cleanup joins it because it belongs to the consumer's drain (plan
+        // 49j J2 item 3).
+        let operation = Box::pin(retire_owned_process_queue(
+            consumer.rebalance_impl.clone(),
+            mq.clone(),
+            Arc::clone(expected),
+            guard,
+        ));
+        match consumer.work.spawn_draining_owned(&Handle::current(), operation) {
+            // A caller that is still there waits for the bookkeeping it asked for; a caller that
+            // gives up has only stopped watching, it has not stopped the work.
+            Ok(join) => match join.await {
+                Ok(()) => {}
+                Err(err) => warn!("retirement of {} was cut short by its runtime: {err}", mq),
+            },
+            // Work is already closed, so nothing may be left unowned: perform it right here.
+            Err(operation) => operation.await,
         }
-        guard.release();
     }
 
     async fn unlock(&mut self, mq: &MessageQueue, oneway: bool) {
