@@ -485,26 +485,24 @@ impl Rebalance for RebalancePushImpl {
         // leaves the operation running with its transition claim and its blocking writer instead of
         // ending both and authorizing an installation to write the same offset file. Cleanup joins
         // it because it belongs to the consumer's drain (plan 49j J2 item 3).
-        let operation = Box::pin(retire_owned_process_queue(
-            consumer.rebalance_impl.clone(),
-            mq.clone(),
-            Arc::clone(pq),
-            guard,
-        ));
-        // Admission normally succeeds; when it has already closed, the same operation goes to the
-        // drain instead of running on this caller's future (plan 49k K3 item 2). Either way the
-        // claim is inside that task and the watch below is only a report.
-        let join = match consumer.work.spawn_draining_owned(&Handle::current(), operation) {
-            Ok(join) => join,
-            Err(operation) => {
-                warn!(
-                    "retirement of {} found closed work; draining it as the consumer's own (its offset stays owned \
-                     here until that write lands)",
-                    mq
-                );
-                consumer.work.spawn_drained_after_close(&Handle::current(), operation)
-            }
+        // Admission is taken before the operation exists (plan 49l L1 item 2). A closed admission
+        // starts no file work at all: the queue keeps its table entry, its offset and its
+        // acquisition identity for whoever owns this consumer next, and only the claim goes back -
+        // through the completion path, never onto a drain that has already been proved empty.
+        let Some(permit) = consumer.work.admit_owned() else {
+            info!(
+                "retirement of {} found closed work and started nothing; its entry, offset and acquisition stay with \
+                 the consumer for a later pass",
+                mq
+            );
+            end_retirement(&mut self.rebalance_impl_inner, guard);
+            return false;
         };
+        let operation_owner = consumer.rebalance_impl.clone();
+        let task_queue = mq.clone();
+        let join = permit.spawn(&Handle::current(), move || {
+            retire_owned_process_queue(operation_owner, task_queue, Arc::clone(pq), guard)
+        });
 
         // A caller that is still there watches the bookkeeping it asked for - but only for a
         // bounded moment (plan 49k K3 item 1). Required persistence may wait on a local

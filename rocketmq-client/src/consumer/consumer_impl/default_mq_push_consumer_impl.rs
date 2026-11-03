@@ -1341,6 +1341,12 @@ impl DefaultMQPushConsumerImpl {
             }
         }
 
+        // Test-only observation of the boundary this plan is about: persistence has been proven and
+        // finalization has not started yet (plan 49l L1 item 5). A regression parks here to ask
+        // what a caller submitting fresh work at that moment can still make cleanup own.
+        #[cfg(test)]
+        review49l::after_persistence(&self.consumer_config.consumer_group).await;
+
         // No offset store means nothing was ever persisted, which is proved, not blocked.
         let queues = self
             .rebalance_impl
@@ -5727,5 +5733,253 @@ mod review49i {
         );
         assert_eq!(admitted_result, Admission::Accepted);
         assert_eq!(admitted, 1, "the bound object could no longer hand off its own work");
+    }
+}
+
+/// Plan 49l L1: cleanup's persistence boundary is a barrier, not a suggestion.
+///
+/// Both fixtures below drive the real cleanup pass of a real consumer with one real local offset
+/// writer. The difference between them is only whether that writer was admitted before close:
+/// work claimed while admission was open keeps cleanup pending until it drains; work arriving after
+/// persistence was proven is refused outright and opens no file at all.
+#[cfg(test)]
+mod review49l {
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use tokio::runtime::Handle;
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::local_file_offset_store::review49l as store_seam;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+
+    struct Gate {
+        group: CheetahString,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static GATE: StdMutex<Option<Gate>> = StdMutex::new(None);
+
+    /// Called once this consumer's persistence phases are proven and its finalization has not
+    /// started (plan 49l L1 item 5). A regression parks here to see what a fresh caller may still
+    /// make cleanup own.
+    pub(super) async fn after_persistence(group: &CheetahString) {
+        let gate = {
+            let mut slot = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.as_ref().is_some_and(|gate| &gate.group == group) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    struct Fixture {
+        group: CheetahString,
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        store: ArcMut<OffsetStore>,
+        /// The real local writer's guard, observed from outside the store.
+        io: Arc<tokio::sync::Mutex<()>>,
+        q: MessageQueue,
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let cc = ClientConfig::default();
+            let group = CheetahString::from_string(format!("review49l-{label}"));
+            let cfg = ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                message_model: MessageModel::Broadcasting,
+                ..Default::default()
+            });
+            let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+            let handle = push.clone();
+            push.set_default_mqpush_consumer_impl(handle);
+            push.mark_managed_lifecycle();
+            let client = MQClientInstance::new_arc(cc, 0, format!("review49l-{label}").as_str(), None);
+            push.client_instance = Some(client.clone());
+            let path = std::env::temp_dir().join(format!("review49l-{label}-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(&path);
+            let mut local = LocalFileOffsetStore::new(client.clone(), group.clone());
+            let io = local.review49e_path_and_lock(path.clone());
+            let store = ArcMut::new(OffsetStore::new_with_local(local));
+            push.offset_store = Some(store.clone());
+            // A queue of its own: the store's write hold is keyed by queue, and this file has other
+            // tests that use a conventional topic name.
+            let q = MessageQueue::from_parts(format!("review49l-{label}").as_str(), "broker", 0);
+            let pq = Arc::new(ProcessQueue::new());
+            push.rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await
+                .insert(q.clone(), pq.clone());
+            // Plan 49h H1: the installation names the object this acquisition runs on.
+            push.progress.note_queue_installed_with(&q, &pq);
+            store.update_offset(&q, 7, false).await;
+            Self {
+                group,
+                push,
+                client,
+                store,
+                io,
+                q,
+                path,
+            }
+        }
+
+        fn clean_up(&self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("json.bak"));
+        }
+    }
+
+    /// The pre-close control: work claimed while admission was open is cleanup's, and its proof
+    /// waits for it - both while that work owns the store's file I/O and afterwards, on the
+    /// drain alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_waits_for_work_admitted_before_close() {
+        let fixture = Fixture::new("early").await;
+        // One real local offset write, claimed while admission is open and parked inside the
+        // store's own snapshot with its file-I/O guard in hand.
+        let (entered, release) = store_seam::hold_next_write(&fixture.q);
+        let permit = fixture
+            .push
+            .work
+            .admit_owned()
+            .expect("admission is open until cleanup closes it");
+        let mut store = fixture.store.clone();
+        let queue = fixture.q.clone();
+        let writer = permit.spawn(&Handle::current(), move || async move {
+            store.persist_for_retirement(&queue).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .expect("the armed hold vanished before its writer parked")
+            .expect("the parked writer disappeared");
+        // A second unit of owned work that owns nothing but its drain permit, so the drain itself
+        // can still be judged once the file is free again.
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let idle_permit = fixture
+            .push
+            .work
+            .admit_owned()
+            .expect("admission is open until cleanup closes it");
+        let idle = idle_permit.spawn(&Handle::current(), move || async move {
+            let _ = finish_rx.await;
+        });
+
+        let mut push = fixture.push.clone();
+        let mut stopping = Box::pin(push.shutdown_until(TokioInstant::now() + Duration::from_secs(30)));
+        let while_writing = tokio::time::timeout(Duration::from_millis(150), &mut stopping).await;
+        let writer_held_the_store = fixture.io.try_lock().is_err();
+
+        // Let the write land, then watch again with only the permit left: cleanup may not prove
+        // while a task it admitted is still running, even one that touches no file.
+        drop(release);
+        let wrote = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        let store_free = fixture.io.try_lock().is_ok();
+        let while_draining = tokio::time::timeout(Duration::from_millis(150), &mut stopping).await;
+
+        drop(finish_tx);
+        let drained = tokio::time::timeout(Duration::from_secs(2), idle).await;
+        let proved = tokio::time::timeout(Duration::from_secs(5), &mut stopping)
+            .await
+            .expect("cleanup never finished once its admitted work drained");
+        drop(stopping);
+        eprintln!(
+            "admitted before close: while_writing={while_writing:?} writer_held_the_store={writer_held_the_store} \
+             wrote={wrote:?} store_free={store_free} while_draining={while_draining:?} drained={drained:?} \
+             proof={proved}"
+        );
+        fixture.clean_up();
+        assert!(writer_held_the_store, "the parked write owned no file I/O");
+        assert!(
+            while_writing.is_err(),
+            "cleanup proved completion while work it had admitted still wrote its offset file"
+        );
+        assert!(store_free, "the released writer kept the store busy forever");
+        assert!(
+            while_draining.is_err(),
+            "cleanup proved completion with an owned task it had admitted still running"
+        );
+        assert!(
+            proved,
+            "cleanup never completed after the writer it waited for finished"
+        );
+    }
+
+    /// The corrected late-submission fixture: at cleanup's persistence boundary a fresh caller is
+    /// refused before anything is constructed, so finalization stays monotonic. Refusal is the safe
+    /// outcome; what this plan forbids is a successful cleanup with newly admitted live work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nothing_is_admitted_once_cleanup_has_proven_its_persistence() {
+        let fixture = Fixture::new("late").await;
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Gate {
+            group: fixture.group.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let mut push = fixture.push.clone();
+        let mut stopping = Box::pin(push.shutdown_until(TokioInstant::now() + Duration::from_secs(30)));
+        tokio::select! {
+            r = &mut entered_rx => { r.expect("the boundary hook vanished"); }
+            proved = &mut stopping => panic!("cleanup did not pause after persistence (proved={proved})"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("the cleanup boundary was never reached"),
+        }
+
+        // Persistence is proven and finalization has not started. A caller that wants to retire a
+        // queue now must be turned away, and turning it away may not open the store's file.
+        let permit = fixture.push.work.admit_owned();
+        let refused = permit.is_none();
+        let store_busy = fixture.io.try_lock().is_err();
+        drop(permit);
+
+        // Let finalization run: the hook only exists to observe the boundary it pauses at.
+        drop(release_tx);
+        let proved = tokio::time::timeout(Duration::from_secs(5), &mut stopping)
+            .await
+            .expect("the refused caller left cleanup unfinished");
+        drop(stopping);
+        // Admission does not reopen for what finalization still has to do, and a second observer of
+        // the same session reports the terminal outcome rather than starting another pass.
+        let refused_after_boundary = fixture.push.work.admit_owned().is_none();
+        let mut reobserver = fixture.push.clone();
+        let repeated = tokio::time::timeout(
+            Duration::from_secs(5),
+            reobserver.shutdown_until(TokioInstant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("repeating a finished stop never reported");
+        eprintln!(
+            "at the boundary: refused={refused} store_busy={store_busy} proof={proved} \
+             refused_after_boundary={refused_after_boundary} repeated_stop={repeated}"
+        );
+        fixture.clean_up();
+        assert!(
+            refused,
+            "admission stayed open after cleanup proved its persistence phases"
+        );
+        assert!(!store_busy, "a refused caller started file work behind cleanup");
+        assert!(proved, "refusing a late caller left cleanup without its proof");
+        assert!(
+            refused_after_boundary,
+            "admission reopened while cleanup was finalizing"
+        );
+        assert_eq!(repeated, proved, "a second observer invented another cleanup outcome");
     }
 }

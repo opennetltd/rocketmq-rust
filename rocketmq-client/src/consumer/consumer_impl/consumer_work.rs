@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
 
 use tokio::runtime::Handle;
@@ -48,58 +47,14 @@ impl ConsumerWork {
         });
     }
 
-    /// Register work that cleanup must drain, and report whether it was admitted at all (plan 49j
-    /// J2 item 1). Unlike [`Self::spawn_draining`], an operation the caller cannot afford to
-    /// lose is handed back rather than dropped when admission has already closed, so the caller
-    /// keeps ownership of everything inside it - including a queue's transition claim - and
-    /// performs it itself.
-    ///
-    /// The task belongs to this SDK, not to whoever asked for the work: a caller whose future is
-    /// cancelled leaves it running, and shutdown still joins it because the tracker token - not the
-    /// caller - is what the drain waits on.
-    /// The same admission and drain guarantee for an operation that reports a result (plan 49k K3
-    /// item 1): a rebalance pass has to know whether the retirement it started really removed its
-    /// queue before it can report the assignment as changed.
-    pub(crate) fn spawn_draining_owned<T>(
-        &self,
-        handle: &Handle,
-        future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
-    ) -> Result<JoinHandle<T>, Pin<Box<dyn Future<Output = T> + Send + 'static>>>
-    where
-        T: Send + 'static,
-    {
-        let Some(token) = self.enter() else {
-            return Err(future);
-        };
-        Ok(handle.spawn(async move {
-            // Held until the operation has fully finished, including the moment its result is
-            // produced, so watching the result never means the drain stopped counting this task.
-            let _token = token;
-            future.await
-        }))
-    }
-
-    /// Hand work to the drain although admission has already closed (plan 49k K3 item 2).
-    ///
-    /// A retirement's persistence is required I/O for an offset this SDK still owns. Running it on
-    /// a future nobody tracks would lose the write the moment its caller was cancelled, and
-    /// dropping it would lose the offset outright, so neither answer is available here. Closing
-    /// admission stops new *optional* consumer work; the tracker keeps counting what it is
-    /// given afterwards, which is what lets a cleanup session that waits on `wait()` join this
-    /// task too.
-    pub(crate) fn spawn_drained_after_close<T>(
-        &self,
-        handle: &Handle,
-        future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
-    ) -> JoinHandle<T>
-    where
-        T: Send + 'static,
-    {
-        let token = self.tasks.token();
-        handle.spawn(async move {
-            let _token = token;
-            future.await
-        })
+    /// Claim a drain permit for one unit of SDK-owned work, or find that admission has closed
+    /// (plan 49l L1 item 3). Holding the permit keeps cleanup's drain open, so the caller can
+    /// decide what work it will carry and hand it over without ever running an obligation the
+    /// drain does not know about.
+    pub(crate) fn admit_owned(&self) -> Option<OwnedWork> {
+        // Admission and close share one lock (plan 49l L1 item 1): while this token is unclaimed
+        // cleanup cannot report an empty drain, and once close has run no token is handed out.
+        self.enter().map(|token| OwnedWork { token })
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -118,6 +73,40 @@ impl ConsumerWork {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.cancelled.is_cancelled()
+    }
+}
+
+/// One drain permit claimed while admission was still open (plan 49l L1).
+///
+/// The work is built only when the permit is spent, so a caller whose admission had closed never
+/// constructs it: no file is opened, no offset written, and everything the operation would have
+/// carried - including a queue's transition claim - stays where the caller can return it to the
+/// state that owns it. There is deliberately no way to register work after close: once cleanup has
+/// reached its boundary, finalization must stay monotonic (plan 49l L1 item 4).
+pub(crate) struct OwnedWork {
+    token: TaskTrackerToken,
+}
+
+impl OwnedWork {
+    /// Build this unit of work under the permit and register it with the drain. The task belongs to
+    /// this SDK rather than to whoever asked for it: a caller whose future is cancelled leaves it
+    /// running, because the tracker token - not the caller - is what cleanup waits on (plan 49j J2
+    /// item 1), and a rebalance pass can watch its result without owning it (plan 49k K3).
+    pub(crate) fn spawn<F>(self, handle: &Handle, build: impl FnOnce() -> F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        // Built with the permit already in hand (plan 49l L1 item 3): constructing the operation
+        // starts no I/O, and there is no window between admitting and registering it.
+        let future = build();
+        let OwnedWork { token } = self;
+        handle.spawn(async move {
+            // Held until the operation has fully finished, including the moment its result is
+            // produced, so watching the result never means the drain stopped counting this task.
+            let _token = token;
+            future.await
+        })
     }
 }
 
@@ -267,14 +256,14 @@ mod tests {
         let finished = Arc::new(AtomicUsize::new(0));
 
         let flag = Arc::clone(&finished);
-        let operation = Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            flag.fetch_add(1, Ordering::SeqCst);
+        let permit = work.admit_owned().expect("open admission admits owned work");
+        let join = permit.spawn(&Handle::current(), move || {
+            let flag = Arc::clone(&flag);
+            async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                flag.fetch_add(1, Ordering::SeqCst);
+            }
         });
-        let join = match work.spawn_draining_owned(&Handle::current(), operation) {
-            Ok(join) => join,
-            Err(_) => panic!("open admission takes owned work"),
-        };
         // The caller gives up watching; the operation is not theirs to cancel.
         drop(join);
         assert_eq!(finished.load(Ordering::SeqCst), 0, "fixture raced the operation");
@@ -290,28 +279,64 @@ mod tests {
         assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
-    /// Work that cannot be admitted is handed back rather than dropped, together with everything it
-    /// owns - a queue's transition claim among it (plan 49j J2 item 1).
+    /// A closed admission hands out no permit, so there is nothing that could be built and
+    /// registered afterwards (plan 49l L1 item 2): the drain cleanup already proved empty stays
+    /// empty, and a late caller cannot resurrect work on it. Constructing an operation is not what
+    /// justifies bypassing close, which is why refusal happens before construction.
     #[tokio::test]
-    async fn closed_admission_hands_an_owned_operation_back() {
+    async fn closed_admission_registers_no_owned_work() {
         let work = Arc::new(ConsumerWork::default());
         work.close();
+        assert!(
+            work.admit_owned().is_none(),
+            "closed admission handed out a drain permit"
+        );
+        tokio::time::timeout(Duration::from_millis(50), work.wait())
+            .await
+            .expect("a closed admission must not extend the drain");
+        assert!(work.admit_owned().is_none(), "admission reopened after close");
+    }
+
+    /// A permit claimed while admission was open keeps cleanup's drain open across close, and work
+    /// spent on it is joined before finalization (plan 49l L1 items 1 and 3). This is the window a
+    /// caller must never be able to fall through: admitted, not yet registered, drain observed
+    /// empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_permit_held_across_close_keeps_the_drain_open() {
+        let work = Arc::new(ConsumerWork::default());
+        let permit = work.admit_owned().expect("open admission admits owned work");
+
+        // Cleanup reaches its boundary while this caller still holds an unspent permit.
+        work.close();
+        assert!(work.enter().is_none(), "close stops new admissions");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), work.wait())
+                .await
+                .is_err(),
+            "cleanup passed a caller that still held a drain permit"
+        );
+
+        // Only now does the caller build and hand over its work; there was no unowned window.
         let finished = Arc::new(AtomicUsize::new(0));
         let flag = Arc::clone(&finished);
-        let operation = Box::pin(async move {
-            flag.fetch_add(1, Ordering::SeqCst);
+        let join = permit.spawn(&Handle::current(), move || {
+            let flag = flag;
+            async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                flag.fetch_add(1, Ordering::SeqCst);
+            }
         });
-        let returned = match work.spawn_draining_owned(&Handle::current(), operation) {
-            Ok(_) => panic!("closed admission took owned work"),
-            Err(operation) => operation,
-        };
-        assert_eq!(finished.load(Ordering::SeqCst), 0, "the operation ran anyway");
-        returned.await;
-        assert_eq!(
-            finished.load(Ordering::SeqCst),
-            1,
-            "the caller was left unable to run it"
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), work.wait())
+                .await
+                .is_err(),
+            "cleanup finalized while owned work still ran"
         );
+        join.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), work.wait())
+            .await
+            .expect("the drain completes once the owned operation finishes");
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

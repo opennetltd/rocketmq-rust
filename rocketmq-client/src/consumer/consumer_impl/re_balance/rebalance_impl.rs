@@ -2747,6 +2747,7 @@ mod review49k {
         f.client.shutdown().await;
         let _ = std::fs::remove_file(&f.path);
         let _ = std::fs::remove_dir(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("saved"));
         let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
     }
     async fn stale_absence(stale: bool) {
@@ -2861,15 +2862,26 @@ mod review49k {
                 rebalance.remove_process_queue(&f.q, &old).await;
             }
         });
-        tokio::select! {_=&mut retiring=>panic!("retirement missed the writer window"),_=tokio::time::sleep(Duration::from_millis(30))=>{}}
+        tokio::select! {_=&mut retiring=>{
+            // Only a retirement that closed admission refused to start: it never reaches the writer.
+            assert_eq!(mode, "closed", "retirement missed the writer window");
+        },_=tokio::time::sleep(Duration::from_millis(30))=>{}}
         let owned_before = transitions.retiring(&f.q);
         drop(retiring);
         let writer_alive = f.io.try_lock().is_err();
         let owner_after = transitions.retiring(&f.q);
         let deferred_after = transitions.install_deferred(&f.q);
+        let offset = f
+            .push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .read_offset(&f.q, ReadOffsetType::ReadFromMemory)
+            .await;
+        let epoch = f.push.progress.current_epoch(&f.q);
         eprintln!(
             "retirement mode={mode}: owned_before={owned_before} writer_alive={writer_alive} \
-             owner_after={owner_after} deferred_after={deferred_after}"
+             owner_after={owner_after} deferred_after={deferred_after} offset={offset} epoch={epoch:?}"
         );
         std::fs::remove_file(&f.path).unwrap();
         let empty = br#"{"offsetTable":{}}"#;
@@ -2878,6 +2890,22 @@ mod review49k {
         drop(pipe);
         let writer_done = tokio::time::timeout(Duration::from_secs(2), f.io.lock()).await.is_ok();
         cleanup(f).await;
+        if mode == "closed" {
+            // Plan 49l L1 replaced this plan 49k expectation: a retirement that arrives after the
+            // boundary started no longer registers behind it, so there is nothing to own. What must
+            // survive is the queue and its offset, untouched for whoever owns the key next.
+            assert!(writer_done);
+            assert!(
+                !owned_before && !owner_after && !deferred_after,
+                "a retirement after the boundary started work behind a drain that had proved empty"
+            );
+            assert_eq!(offset, 7, "a refused retirement still erased the offset");
+            assert!(
+                epoch.is_some(),
+                "a refused retirement ended an acquisition it never made"
+            );
+            return;
+        }
         assert!(owned_before && writer_alive && writer_done);
         assert!(
             owner_after && deferred_after,
@@ -2889,9 +2917,13 @@ mod review49k {
     async fn cancelling_a_plain_rebalance_must_keep_its_retirement_owner() {
         cancelled_retirement("plain").await;
     }
+    /// Plan 49l L1 adapted this plan 49k regression: a retirement that arrives once cleanup's
+    /// boundary has started is refused outright instead of registering behind the drain, so it
+    /// owns nothing and changes nothing. Its cancellation and drain-boundary structure is
+    /// unchanged (plan 49l 3.2).
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_after_work_closes_must_keep_its_retirement_owner() {
+    async fn a_retirement_arriving_after_work_closes_starts_nothing_and_owns_nothing() {
         cancelled_retirement("closed").await;
     }
     #[cfg(unix)]
@@ -3043,6 +3075,7 @@ mod review49k_extra {
         let path = std::env::temp_dir().join(format!("review49kx-{label}-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(path.with_extension("saved"));
         let mut local = LocalFileOffsetStore::new(client.clone(), group);
         let io = local.review49e_path_and_lock(path.clone());
         push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
@@ -3589,5 +3622,583 @@ mod review49k_extra {
         eprintln!("debt cleared: {idle}");
         assert_eq!(idle.attempted, 0, "a settled offset was written again and again");
         cleanup(f).await;
+    }
+}
+
+/// Permanent regressions for plan 49l: work that arrives at cleanup's boundary, and the debt a
+/// failed offset write leaves behind until one of its own writes lands.
+#[cfg(test)]
+mod review49l {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::consumer_impl::re_balance::rebalance_push_impl::review49k_cap_persist_attempts;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::offset_store::OffsetWrite;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        io: Arc<tokio::sync::Mutex<()>>,
+        path: std::path::PathBuf,
+        q: MessageQueue,
+    }
+
+    fn fixture(label: &str) -> Fixture {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49l-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let client = MQClientInstance::new_arc(cc, 0, format!("review49l-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49l-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        Fixture {
+            push,
+            client,
+            io,
+            path,
+            q: MessageQueue::from_parts(format!("review49l-{label}"), "broker", 0),
+        }
+    }
+
+    async fn cleanup(mut f: Fixture) {
+        f.push.work.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), f.push.work.wait()).await;
+        f.client.shutdown().await;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::remove_dir(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
+    }
+
+    /// Install `pq` under `mq` the way an installation would: table entry, published binding and
+    /// the acquisition identity that goes with them.
+    async fn install(f: &Fixture, mq: &MessageQueue, pq: &Arc<ProcessQueue>) {
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(mq.clone(), Arc::clone(pq));
+        f.push.note_queue_installed(mq, pq);
+    }
+
+    async fn installed(f: &Fixture, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool {
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let table = table.read().await;
+        table.get(mq).is_some_and(|held| Arc::ptr_eq(held, pq))
+    }
+
+    fn offsets(f: &Fixture) -> ArcMut<OffsetStore> {
+        f.push.offset_store.as_ref().unwrap().clone()
+    }
+
+    async fn memory_offset(f: &Fixture, mq: &MessageQueue) -> i64 {
+        offsets(f).read_offset(mq, ReadOffsetType::ReadFromMemory).await
+    }
+
+    async fn disk_offset(f: &Fixture, mq: &MessageQueue) -> i64 {
+        offsets(f).read_offset(mq, ReadOffsetType::ReadFromStore).await
+    }
+
+    async fn proof(f: &Fixture) -> bool {
+        offsets(f).local_writer_finished().await
+    }
+
+    // ---------------------------------------------------------------- plan 49l L1
+
+    /// A retirement that arrives after cleanup's boundary starts nothing at all (plan 49l L1 item
+    /// 2): no file work, no table change, no erased offset, and the queue keeps its acquisition
+    /// identity. The transition claim goes back through the completion path so a later pass is
+    /// not locked out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_admission_retires_nothing_and_touches_nothing() {
+        let f = fixture("closed-admission");
+        let old = Arc::new(ProcessQueue::new());
+        install(&f, &f.q, &old).await;
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        offsets(&f).update_offset(&f.q, 7, false).await;
+
+        // Cleanup's boundary: admission closed and its drain already proved empty.
+        f.push.work.close();
+        tokio::time::timeout(Duration::from_millis(100), f.push.work.wait())
+            .await
+            .expect("the drain had work it should not have");
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(Duration::from_millis(200), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .expect("a refused retirement must report at once rather than retry its way to a write");
+
+        let held = installed(&f, &f.q, &old).await;
+        let offset = memory_offset(&f, &f.q).await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        let clean = proof(&f).await;
+        let owned = transitions.retiring(&f.q);
+        let written = f.path.exists() || f.path.with_extension("json.bak").exists();
+        eprintln!(
+            "closed admission: installed={held} offset={offset} epoch={epoch:?} proof={clean} owned={owned} \
+             file_written={written}"
+        );
+        cleanup(f).await;
+
+        assert!(held, "a closed admission still edited the process-queue table");
+        assert_eq!(offset, 7, "a closed admission erased an offset it never wrote");
+        assert!(
+            !written,
+            "a closed admission started file work on a drain cleanup had already finished"
+        );
+        assert!(clean, "the store was left holding an unfinished write it never ran");
+        assert!(
+            epoch.is_some(),
+            "a retirement that never ran ended its queue's acquisition"
+        );
+        assert!(!owned, "refusal kept the key closed to whoever retires this queue next");
+    }
+
+    /// Work that arrives at cleanup's boundary is refused, and refusal touches nothing (plan 49l L1
+    /// items 2 to 4): the drain still waits for the write a retirement started before close, but a
+    /// second queue reaching its offset in that window neither starts file work nor loses its table
+    /// entry, memory copy or acquisition identity.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn work_arriving_at_the_boundary_is_refused_while_its_writer_runs() {
+        use std::io::Write;
+
+        let f = fixture("boundary-refusal");
+        let old = Arc::new(ProcessQueue::new());
+        install(&f, &f.q, &old).await;
+        let later = MessageQueue::from_parts(f.q.get_topic().to_string(), "broker", 1);
+        let late_pq = Arc::new(ProcessQueue::new());
+        install(&f, &later, &late_pq).await;
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+
+        let handle = offsets(&f);
+        handle.update_offset(&f.q, 7, false).await;
+        handle.update_offset(&later, 5, false).await;
+
+        // A real local writer that cannot finish until this test drains the FIFO on its offset
+        // path.
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        // Work admitted before the boundary: its persistence is now in flight.
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Some(Box::pin(rebalance.remove_process_queue(&f.q, &old)));
+        tokio::select! {_=retiring.as_mut().unwrap()=>{},_=tokio::time::sleep(Duration::from_millis(30))=>{}};
+        let in_flight = f.io.try_lock().is_err();
+
+        // Cleanup reaches its boundary. Admission closes first, so nothing new can be started, and
+        // the drain is what finalization waits on - which the in-flight write has not
+        // released yet.
+        f.push.work.close();
+        let refused_admission = f.push.work.enter().is_none();
+        let mut late_rebalance = f.push.rebalance_impl.clone();
+        late_rebalance.remove_process_queue(&later, &late_pq).await;
+
+        let late_held_now = installed(&f, &later, &late_pq).await;
+        let late_offset_now = memory_offset(&f, &later).await;
+        let still_running = tokio::time::timeout(Duration::from_millis(60), f.push.work.wait())
+            .await
+            .is_err();
+
+        // Release the in-flight write: only now may the drain finish.
+        let empty = br#"{"offsetTable":{}}"#;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::write(&f.path, empty);
+        pipe.write_all(empty).unwrap();
+        drop(pipe);
+        if let Some(owner) = retiring.as_mut() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), owner).await;
+        }
+        drop(retiring);
+        let drained = tokio::time::timeout(Duration::from_secs(2), f.push.work.wait())
+            .await
+            .is_ok();
+
+        let first_gone = !installed(&f, &f.q, &old).await;
+        let late_held = installed(&f, &later, &late_pq).await;
+        let late_offset = memory_offset(&f, &later).await;
+        let late_epoch = f.push.progress.current_epoch(&later);
+        let late_claimed = transitions.retiring(&later);
+        eprintln!(
+            "boundary refusal: in_flight={in_flight} refused_admission={refused_admission} \
+             still_running={still_running} drained={drained} first_gone={first_gone} late_held_now={late_held_now} \
+             late_offset_now={late_offset_now} late_held={late_held} late_offset={late_offset} \
+             late_epoch={late_epoch:?} late_claimed={late_claimed}"
+        );
+        cleanup(f).await;
+
+        assert!(in_flight, "the fixture did not keep a real local writer in flight");
+        assert!(refused_admission, "close admitted new work at its boundary");
+        assert!(still_running, "cleanup finalized while owned persistence ran");
+        assert!(drained, "cleanup never joined the owned work it was waiting on");
+        assert!(first_gone, "the admitted retirement did not finish its own queue");
+        assert!(
+            late_held_now && late_held,
+            "a refused retirement edited a queue it never owned"
+        );
+        assert_eq!(late_offset_now, 5);
+        assert_eq!(late_offset, 5, "a refused retirement erased an offset it never wrote");
+        assert!(
+            late_epoch.is_some(),
+            "a refused retirement ended another pass's acquisition"
+        );
+        assert!(
+            !late_claimed,
+            "refusal kept the key closed to whoever retires this queue next"
+        );
+    }
+
+    // ---------------------------------------------------------------- plan 49l L2
+
+    /// A volume that refuses every local offset write while the guard lives: the store's path
+    /// becomes a directory, so its whole-table write cannot land. This is plan 49k K2's fixture
+    /// technique for "the file did not take it", used here to make one queue fail inside
+    /// another queue's write. Whatever the file held before is put back when the guard dies, so
+    /// a test can still read what an earlier write landed.
+    struct BrokenVolume {
+        path: std::path::PathBuf,
+        saved: Option<std::path::PathBuf>,
+    }
+
+    impl Drop for BrokenVolume {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.path);
+            if let Some(saved) = &self.saved {
+                let _ = std::fs::rename(saved, &self.path);
+                let _ = std::fs::remove_file(saved);
+            }
+        }
+    }
+
+    fn break_volume(path: &std::path::Path) -> BrokenVolume {
+        let saved = path.with_extension("saved");
+        let moved = std::fs::rename(path, &saved).is_ok();
+        std::fs::create_dir(path).unwrap();
+        BrokenVolume {
+            path: path.to_path_buf(),
+            saved: moved.then_some(saved),
+        }
+    }
+
+    /// A whole-table write carries every outstanding obligation, so a pass that fails must settle
+    /// none of them - not even the ones belonging to other queues (plan 49l L2 item 1).
+    /// Otherwise one queue's bad volume silently drops another queue's retry, and its value
+    /// never reaches the file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_write_settles_no_other_queues_obligation() {
+        let f = fixture("settled-by-failure");
+        let other = MessageQueue::from_parts(f.q.get_topic().to_string(), "broker", 1);
+        let mut handle = offsets(&f);
+        handle.update_offset(&f.q, 3, false).await;
+        handle.update_offset(&other, 7, false).await;
+
+        // Two queues owe a value and both of their writes fail. The second pass carries the first
+        // queue's obligation as well, because an unproven offset is part of this table
+        // until it lands.
+        let broken = break_volume(&f.path);
+        let first_failed = handle.persist_for_retirement(&f.q).await;
+        let second_failed = handle.persist_for_retirement(&other).await;
+        drop(broken);
+        assert_eq!(first_failed, OffsetWrite::Deferred);
+        assert_eq!(second_failed, OffsetWrite::Deferred);
+
+        // The volume answers again. A pass naming no assigned queue still owes both values, so it
+        // offers both to the file and settles neither early.
+        let healed = tokio::time::timeout(Duration::from_secs(2), handle.persist_local(&HashSet::new()))
+            .await
+            .expect("the retry never finished")
+            .unwrap();
+        let clean = proof(&f).await;
+        let first_disk = disk_offset(&f, &f.q).await;
+        let second_disk = disk_offset(&f, &other).await;
+        eprintln!(
+            "settled by failure: healed={healed} proof={clean} disk_first={first_disk} disk_second={second_disk}"
+        );
+
+        assert_eq!(
+            healed.attempted, 2,
+            "a failed write dropped an obligation it carried for another queue"
+        );
+        assert_eq!(healed.succeeded, 2);
+        assert!(clean, "cleanup proof stayed closed after both owed offsets landed");
+        assert_eq!(first_disk, 3);
+        assert_eq!(second_disk, 7);
+        cleanup(f).await;
+    }
+
+    /// Poll a future exactly once - enough to complete what it does before its first real wait.
+    macro_rules! poll_once {
+        ($future:expr, $message:expr) => {
+            tokio::select! { biased; _ = &mut $future => panic!($message), _ = std::future::ready(()) => {} }
+        };
+    }
+
+    /// A successful write settles only the obligations its own snapshot carried (plan 49l L2 item
+    /// 1). An offset that fails while an earlier write is in flight stays owed, aggregate proof
+    /// stays false, and a later pass naming no assigned queue still lands it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unrelated_success_does_not_settle_another_queues_debt() {
+        let f = fixture("stale-debt");
+        let other = MessageQueue::from_parts(f.q.get_topic().to_string(), "broker", 1);
+        let mut writer_store = offsets(&f);
+        let mut failing_store = offsets(&f);
+        writer_store.update_offset(&f.q, 3, false).await;
+        writer_store.update_offset(&other, 7, false).await;
+
+        let failing_queue = other.clone();
+        // The first queue's write is held with its key set and obligation snapshot fixed: it
+        // carries no debt, because none existed when it looked.
+        let (entered, release) = hold_next_write(&f.q);
+        let held_keys = HashSet::from([f.q.clone()]);
+        let mut writer = tokio::spawn(async move { writer_store.persist_local(&held_keys).await });
+        tokio::time::timeout(Duration::from_millis(500), entered)
+            .await
+            .expect("the first write never reached its snapshot")
+            .expect("the armed hold vanished before its writer parked");
+
+        // The second queue publishes its obligation inside that window - it has not reached the
+        // writer yet, because the first one owns it - and will fail once it does.
+        let mut failing = Box::pin(async move { failing_store.persist_for_retirement(&failing_queue).await });
+        poll_once!(failing, "the second queue's write did not publish its obligation");
+        let (entered_b, release_b) = hold_next_write(&other);
+        let mut failing = tokio::spawn(failing);
+
+        // The first write lands while the volume answers; the second then parks in its own snapshot
+        // and finds a volume that no longer takes writes.
+        drop(release);
+        tokio::time::timeout(Duration::from_millis(500), entered_b)
+            .await
+            .expect("the second write never reached its snapshot")
+            .expect("the armed hold vanished before its writer parked");
+        let broken = break_volume(&f.path);
+        drop(release_b);
+
+        let summary = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .expect("the held write never finished")
+            .unwrap()
+            .unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(2), &mut failing)
+            .await
+            .expect("the failing write never reported")
+            .unwrap();
+        drop(broken);
+
+        let clean = proof(&f).await;
+        let memory = memory_offset(&f, &other).await;
+        let on_disk = disk_offset(&f, &other).await;
+        eprintln!("stale debt: write={summary} failed={failed:?} proof={clean} memory={memory} disk_other={on_disk}");
+
+        assert_eq!(summary.succeeded, 1, "the unrelated write did not land");
+        let landed = disk_offset(&f, &f.q).await;
+        assert_eq!(
+            landed, 3,
+            "the held write reported success without landing its own value"
+        );
+        assert_eq!(
+            failed,
+            OffsetWrite::Deferred,
+            "a write that never reached the file was reported as proven"
+        );
+        assert_eq!(memory, 7, "the failed queue lost its retryable memory copy");
+        assert!(
+            !clean,
+            "a successful write of another queue settled a debt it never carried"
+        );
+        assert_eq!(on_disk, -1, "an unwritten offset appeared in the file anyway");
+
+        // A later pass that names no assigned queue still carries the owed key.
+        let mut handle = offsets(&f);
+        let carried = tokio::time::timeout(Duration::from_secs(2), handle.persist_local(&HashSet::new()))
+            .await
+            .expect("the retry never finished")
+            .unwrap();
+        let healed = proof(&f).await;
+        let on_disk = disk_offset(&f, &other).await;
+        eprintln!("stale debt retry: {carried} proof={healed} disk_other={on_disk}");
+        assert!(
+            carried.attempted >= 1 && carried.succeeded >= 1,
+            "the owed offset was never offered to a later write: {carried}"
+        );
+        assert!(healed, "an unwritten offset stayed owed after its own successful write");
+        assert_eq!(on_disk, 7, "the retried write did not land the value it owed");
+        cleanup(f).await;
+    }
+
+    /// An older success cannot settle a *newer* obligation for the same queue (plan 49l L2 item 1),
+    /// and an awaiter abandoned mid-write still leaves its obligation published (item 3): what
+    /// memory holds stays owed until a write of that value is proven. Because the older write
+    /// succeeded, this is also where aggregate cleanup proof is shown to close on an
+    /// outstanding obligation alone rather than on busy or failed I/O (item 4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_older_success_does_not_settle_a_newer_failure() {
+        let f = fixture("debt-generation");
+        let mut first = offsets(&f);
+        first.update_offset(&f.q, 7, false).await;
+
+        // First obligation: this queue's write never reached the file.
+        let broken = break_volume(&f.path);
+        let failed = first.persist_for_retirement(&f.q).await;
+        drop(broken);
+        assert_eq!(failed, OffsetWrite::Deferred);
+
+        // Memory advances past the value that failed, and a write carrying the first obligation is
+        // held inside its snapshot - so it carries what was owed when it looked, not what
+        // is owed now.
+        first.update_offset(&f.q, 9, false).await;
+        let (entered, release) = hold_next_write(&f.q);
+        let mut racing = offsets(&f);
+        let race_keys = HashSet::from([f.q.clone()]);
+        let mut racer = tokio::spawn(async move { racing.persist_local(&race_keys).await });
+        tokio::time::timeout(Duration::from_millis(500), entered)
+            .await
+            .expect("the racing write never reached its snapshot")
+            .expect("the armed hold vanished before its writer parked");
+
+        // A newer obligation is published for the new value while that write is in flight, then
+        // abandoned before its own attempt could report. One poll publishes it; abandoning the
+        // future must not take the obligation with it (plan 49l L2 item 3).
+        let mut canceller = offsets(&f);
+        let cancel_queue = f.q.clone();
+        let mut cancelling = Box::pin(async move { canceller.persist_for_retirement(&cancel_queue).await });
+        poll_once!(cancelling, "the newer obligation was not published before its writer");
+        drop(cancelling);
+
+        // The older write lands its own value and may settle nothing.
+        drop(release);
+        let summary = tokio::time::timeout(Duration::from_secs(2), &mut racer)
+            .await
+            .expect("the held write never finished")
+            .unwrap()
+            .unwrap();
+
+        let clean = proof(&f).await;
+        let writer_idle = tokio::time::timeout(Duration::from_millis(500), offsets(&f).io_complete())
+            .await
+            .expect("the writer never came back to idle");
+        let memory = memory_offset(&f, &f.q).await;
+        eprintln!("debt generation: racer={summary} proof={clean} writer_idle={writer_idle} memory={memory}");
+
+        assert_eq!(summary.succeeded, 1, "the racing write did not land its own value");
+        // Both halves of cleanup proof are in play here: the raw local writer has finished and
+        // reported no failed I/O (plan 49k K2), so this is the outstanding obligation alone
+        // keeping cleanup from finalizing (plan 49l L2 item 4).
+        assert!(writer_idle, "the raw local writer proof never came clean");
+        assert!(
+            !clean,
+            "an older successful write settled an obligation published after it snapshotted"
+        );
+        assert_eq!(memory, 9, "an abandoned obligation lost the memory copy it protects");
+
+        let mut handle = offsets(&f);
+        let healed = tokio::time::timeout(Duration::from_secs(2), handle.persist_local(&HashSet::new()))
+            .await
+            .expect("the retry never finished")
+            .unwrap();
+        let clean = proof(&f).await;
+        let on_disk = disk_offset(&f, &f.q).await;
+        eprintln!("debt generation healed: {healed} proof={clean} disk={on_disk}");
+        assert!(clean, "the newer obligation outlived the write that finally settled it");
+        assert_eq!(on_disk, 9);
+        cleanup(f).await;
+    }
+
+    /// Aggregate cleanup proof needs both completed I/O and no outstanding required debt (plan 49l
+    /// L2 item 4). This is the first half: a failed write keeps the proof closed, a retirement
+    /// that gives up its attempts reports "not removed" rather than erasing that key, and only
+    /// one of its own writes landing reopens the proof. The second half - proof closed by an
+    /// outstanding obligation alone, with the raw writer provably idle - is
+    /// `an_older_success_does_not_settle_a_newer_failure`, because a whole-table write always
+    /// carries owed keys and so cannot leave one behind while it succeeds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_proof_waits_for_the_offset_that_failed() {
+        let f = fixture("proof-gate");
+        let mut handle = offsets(&f);
+        handle.update_offset(&f.q, 7, false).await;
+
+        // One failed write, and the writer is idle again afterwards.
+        let broken = break_volume(&f.path);
+        let failed = handle.persist_for_retirement(&f.q).await;
+        drop(broken);
+        let clean_while_owed = tokio::time::timeout(Duration::from_millis(500), handle.local_writer_finished())
+            .await
+            .expect("the writer never came back to idle");
+        eprintln!("proof gate: failed={failed:?} proof_while_owed={clean_while_owed}");
+        assert_eq!(failed, OffsetWrite::Deferred);
+        assert!(
+            !clean_while_owed,
+            "cleanup could finalize while an unwritten offset was still owed"
+        );
+
+        // A retirement that gives up its attempts leaves both the table entry and the memory copy
+        // for whoever owns this queue next (plan 49k K2 item 4), and the key stays owed.
+        review49k_cap_persist_attempts(&f.q, 1);
+        let old = Arc::new(ProcessQueue::new());
+        install(&f, &f.q, &old).await;
+        let broken = break_volume(&f.path);
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(Duration::from_secs(2), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .expect("the retirement never reported");
+        drop(broken);
+        let held = installed(&f, &f.q, &old).await;
+        let offset = memory_offset(&f, &f.q).await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+
+        // A later pass that names no assigned queue still carries the owed key; once its write
+        // lands, cleanup may finalize again.
+        let healed = tokio::time::timeout(Duration::from_secs(2), handle.persist_local(&HashSet::new()))
+            .await
+            .expect("the retry never finished")
+            .unwrap();
+        let clean = proof(&f).await;
+        let on_disk = disk_offset(&f, &f.q).await;
+        eprintln!(
+            "proof gate deferred: held={held} offset={offset} epoch={epoch:?} healed={healed} proof={clean} \
+             disk={on_disk}"
+        );
+        cleanup(f).await;
+
+        assert!(held, "a retirement whose write never landed erased its queue anyway");
+        assert_eq!(
+            offset, 7,
+            "an unproven write dropped the memory copy a later pass needs"
+        );
+        assert!(
+            epoch.is_some(),
+            "a retirement that did not finish ended its acquisition"
+        );
+        assert!(
+            healed.attempted >= 1 && healed.succeeded >= 1,
+            "the owed offset was never offered to a later write: {healed}"
+        );
+        assert!(clean, "cleanup proof stayed closed after every owed offset had landed");
+        assert_eq!(on_disk, 7);
     }
 }

@@ -155,10 +155,18 @@ impl OffsetStore {
         Some(store.persist_all_until(mqs, deadline).await)
     }
 
-    /// Whether this store's own local writer has finished. `false` means an unfinished write is
-    /// still owned here, which is what makes it this phase's work rather than someone else's.
+    /// Whether this store's local half may be called durable: its own writer has finished **and**
+    /// no offset it is required to persist is still unwritten (plan 49l L2 item 4).
+    ///
+    /// Both halves matter. `false` from the writer means an unfinished write is still owned here,
+    /// which is what makes it this phase's work rather than someone else's; outstanding debt means
+    /// a past attempt failed, and a successful write of some *other* queue says nothing about
+    /// the key that failed. Cleanup may not finalize on either one alone.
     pub(crate) async fn local_writer_finished(&self) -> bool {
-        self.io_complete().await
+        match &self.local_file_offset_store {
+            Some(store) => store.io_complete().await && !store.has_required_debt().await,
+            None => true,
+        }
     }
 
     pub(crate) async fn io_complete(&self) -> bool {
