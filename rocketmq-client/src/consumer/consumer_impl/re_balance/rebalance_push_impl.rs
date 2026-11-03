@@ -41,16 +41,20 @@ use tracing::warn;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::allocate_message_queue_strategy::AllocateMessageQueueStrategy;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::local_persist_backoff;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::MAX_LOCAL_PERSIST_RETRIES;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
 use crate::consumer::consumer_impl::re_balance::queue_transitions::RetirementGuard;
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::remove_process_queue_if_same;
+use crate::consumer::consumer_impl::re_balance::rebalance_impl::table_holds_process_queue;
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::RebalanceImpl;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+use crate::consumer::store::offset_store::OffsetWrite;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::factory::mq_client_instance::MQClientInstance;
 
@@ -155,50 +159,168 @@ impl RebalancePushImpl {
     }
 }
 
-/// The bookkeeping one retirement owns, from dropping the table entry through ending its
-/// acquisition (plan 49j J2 item 1), performed on a task this SDK holds.
+/// How many attempts one retirement makes at its own queue's offset write before it accepts that
+/// the value is not going to land. The bulk persistence pass uses the same bound and the same
+/// doubling backoff (plan 49k K2 item 4), so a transient volume fault is waited out by the one
+/// owner that already holds the queue rather than reported as a finished retirement.
+fn retirement_persist_attempts(mq: &MessageQueue) -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(attempts) = review49k_capped_attempts(mq) {
+            return attempts;
+        }
+    }
+    MAX_LOCAL_PERSIST_RETRIES
+}
+
+/// Test seam (plan 49k K2 item 5): cap one queue's retirement persistence attempts, so a permanent
+/// regression can watch a retirement give up without waiting out the production backoff schedule.
+/// Keyed by queue because these tests run concurrently; never compiled into anything that ships.
+#[cfg(test)]
+pub(crate) fn review49k_cap_persist_attempts(mq: &MessageQueue, attempts: u32) {
+    let mut caps = REVIEW49K_PERSIST_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    caps.insert(mq.clone(), attempts);
+}
+
+#[cfg(test)]
+fn review49k_capped_attempts(mq: &MessageQueue) -> Option<u32> {
+    let caps = REVIEW49K_PERSIST_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    caps.get(mq).copied()
+}
+
+#[cfg(test)]
+static REVIEW49K_PERSIST_ATTEMPTS: Lazy<std::sync::Mutex<HashMap<MessageQueue, u32>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Environment override for the watch budget below, in milliseconds.
+const ENV_REBALANCE_RETIREMENT_WATCH_MS: &str = "rocketmq.client.rebalance.retirementWatchMs";
+/// How long a retirement's caller watches the owned operation before leaving it to finish on its
+/// own (plan 49k K3 item 1). Bounded on purpose: waiting for required persistence in a rebalance
+/// loop would put every later queue in the same topic behind one slow local writer, which is what
+/// plan 49i I2 ruled out. A caller that stops watching has cancelled nothing.
+const DEFAULT_REBALANCE_RETIREMENT_WATCH_MS: u64 = 50;
+
+fn retirement_watch_budget() -> Duration {
+    static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var(ENV_REBALANCE_RETIREMENT_WATCH_MS)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            // A zero budget would defer every retirement, and an absurd one would put the stall back.
+            .filter(|ms| (1..=5_000).contains(ms))
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_REBALANCE_RETIREMENT_WATCH_MS))
+    })
+}
+
+/// End one retirement's claim on its queue (plan 49i I2 item 1): an installation that was turned
+/// away while it ran is asked for again rather than left to chance.
+fn end_retirement(rebalance_impl: &mut RebalanceImpl<RebalancePushImpl>, guard: RetirementGuard) {
+    if guard.release() {
+        if let Some(client) = rebalance_impl.client_instance.as_mut() {
+            client.rebalance_later(500);
+        }
+    }
+}
+
+/// The one retirement operation, performed on a task this SDK holds (plan 49j J2 item 1, plan 49k
+/// K3 item 1) and gated on its offset write's evidence (plan 49k K2).
 ///
 /// It is written against an owned handle rather than against whoever asked for the queue to go
 /// away, because the caller's future may be cancelled halfway through: persistence for this queue
 /// can wait on a local writer that outlives that future, and cancelling then would end the
 /// transition claim - authorizing an installation to write the same offset file - while the
 /// retirement's own erase is still coming.
+///
+/// The table entry leaves **after** the offset write is proven, not before. A queue whose offsets
+/// could not be written stays exactly where it is - entry, acquisition identity and the memory copy
+/// of the offset - so a later rebalance pass retries the retirement and this store keeps retrying
+/// the value; removing it first would leave that offset with no owner anywhere (plan 49k K2 item
+/// 2).
 async fn retire_owned_process_queue(
     mut rebalance: ArcMut<RebalancePushImpl>,
     mq: MessageQueue,
     pq: Arc<ProcessQueue>,
     guard: RetirementGuard,
-) {
-    // The entry is dropped only while it still names the object this retirement scheduled (plan 49h
-    // H1): a replacement installed meanwhile keeps its table entry and everything hanging off it.
-    if remove_process_queue_if_same(&rebalance.rebalance_impl_inner.process_queue_table, &mq, &pq).await {
-        let droped = pq.is_dropped();
-        pq.set_dropped(true);
-        // Side effects first, while this object still owns the queue; revocation afterwards,
-        // because it is what stops further work on this identity. Each step revalidates against
-        // this exact process queue (plan 49i I2 item 2), which is what makes it safe for the
-        // operation to outlive the caller that started it.
-        rebalance.remove_unnecessary_message_queue(&mq, &pq).await;
-        if let Some(impl_) = rebalance.default_mqpush_consumer_impl.as_ref() {
-            // The queue left the table, so its acquisition ends here - naming the object that just
-            // left it, so a pull answer arriving later cannot publish into whoever installs next
-            // (plan 49c C1) and a successor's own identity survives (plan 49i I2 item 3).
-            impl_.note_queue_revoked_for(&mq, &pq);
-        }
-        info!(
-            "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
-            rebalance.rebalance_impl_inner.consumer_group.as_ref().unwrap(),
-            mq,
-            droped
-        );
+) -> bool {
+    let table = rebalance.rebalance_impl_inner.process_queue_table.clone();
+    // The entry is acted on only while it still names the object this retirement scheduled (plan
+    // 49h H1): a replacement installed meanwhile keeps its table entry and everything hanging
+    // off it.
+    if !table_holds_process_queue(&table, &mq, &pq).await {
+        end_retirement(&mut rebalance.rebalance_impl_inner, guard);
+        return false;
     }
-    // The claim ends with the last piece of bookkeeping, and an installation turned away while it
-    // ran is asked for again rather than left to chance (plan 49i I2 item 1).
-    if guard.release() {
-        if let Some(client) = rebalance.rebalance_impl_inner.client_instance.as_mut() {
-            client.rebalance_later(500);
+    let droped = pq.is_dropped();
+    pq.set_dropped(true);
+
+    // Side effects first, while this object still owns the queue; revocation afterwards, because it
+    // is what stops further work on this identity. Each step revalidates against this exact process
+    // queue (plan 49i I2 item 2), which is what makes it safe for the operation to outlive the
+    // caller that started it.
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match rebalance.remove_unnecessary_message_queue(&mq, &pq).await {
+            Some(OffsetWrite::Proven) | Some(OffsetWrite::NoLocalState) => break,
+            Some(OffsetWrite::Deferred) if attempts < retirement_persist_attempts(&mq) => {
+                let backoff = local_persist_backoff(attempts - 1);
+                warn!(
+                    "retiring {} waits on its offset write (attempt {attempts}), retrying in {backoff:?}",
+                    mq
+                );
+                tokio::time::sleep(backoff).await;
+                // Waiting on persistence is exactly the window in which a replacement installation
+                // appears, and its offsets are not this retirement's to keep writing.
+                if !table_holds_process_queue(&table, &mq, &pq).await {
+                    debug!(
+                        "leaving {} alone mid-retirement, its table entry answers to another process queue",
+                        mq
+                    );
+                    end_retirement(&mut rebalance.rebalance_impl_inner, guard);
+                    return false;
+                }
+            }
+            _ => {
+                // Either a newer installation owns those offsets, or this queue's write stayed
+                // broken through its whole budget. Nothing is destroyed here: the
+                // entry stays in the table, its acquisition stays published, and
+                // the offset stays in the store carrying itself into every later
+                // write. The next rebalance pass - and cleanup's own persistence -
+                // find this queue exactly as it was left (plan 49k K2 item 2).
+                error!(
+                    "retiring {} is not proven after {attempts} offset write(s); leaving it installed",
+                    mq
+                );
+                end_retirement(&mut rebalance.rebalance_impl_inner, guard);
+                return false;
+            }
         }
     }
+
+    if !remove_process_queue_if_same(&table, &mq, &pq).await {
+        end_retirement(&mut rebalance.rebalance_impl_inner, guard);
+        return false;
+    }
+    if let Some(impl_) = rebalance.default_mqpush_consumer_impl.as_ref() {
+        // The queue left the table, so its acquisition ends here - naming the object that just
+        // left it, so a pull answer arriving later cannot publish into whoever installs next
+        // (plan 49c C1) and a successor's own identity survives (plan 49i I2 item 3).
+        impl_.note_queue_revoked_for(&mq, &pq);
+    }
+    info!(
+        "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
+        rebalance.rebalance_impl_inner.consumer_group.as_ref().unwrap(),
+        mq,
+        droped
+    );
+    // The claim ends with the last piece of bookkeeping (plan 49i I2 item 1).
+    end_retirement(&mut rebalance.rebalance_impl_inner, guard);
+    true
 }
 
 const UNLOCK_BATCH_MQ_TIMEOUT_MS: u64 = 1_000;
@@ -287,7 +409,11 @@ impl Rebalance for RebalancePushImpl {
         }
     }
 
-    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool {
+    async fn remove_unnecessary_message_queue(
+        &mut self,
+        mq: &MessageQueue,
+        pq: &Arc<ProcessQueue>,
+    ) -> Option<OffsetWrite> {
         let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
         let consume_orderly = default_mqpush_consumer_impl.is_consume_orderly();
 
@@ -297,29 +423,107 @@ impl Rebalance for RebalancePushImpl {
         // replacement installation appears, and erasing by key afterwards would delete the
         // progress its owner has just prepared.
         if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
-            return false;
+            return None;
         }
-        {
-            let offset_store = default_mqpush_consumer_impl.offset_store.as_mut().unwrap();
-            offset_store.persist(mq).await;
-        }
+        // Write first and keep the memory copy, because what this call is about to erase may be all
+        // that can still be retried (plan 49k K2 item 1). The old shape called the void persist API
+        // and erased whether or not anything landed.
+        let written = default_mqpush_consumer_impl
+            .offset_store
+            .as_mut()
+            .unwrap()
+            .persist_for_retirement(mq)
+            .await;
         if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
             debug!(
                 "leaving the offsets of {} alone, this retirement no longer owns that queue",
                 mq
             );
-            return false;
+            return None;
         }
         if consume_orderly && MessageModel::Clustering == self.consumer_config.message_model {
-            self.try_remove_order_message_queue(mq, pq).await
-        } else {
-            default_mqpush_consumer_impl
-                .offset_store
-                .as_mut()
-                .unwrap()
-                .remove_offset(mq)
-                .await;
-            true
+            // Orderly consumption keeps its own unlock-and-persist sequence unchanged; it is not a
+            // concurrent-PULL retirement and this plan does not rewrite its policy.
+            return match written {
+                OffsetWrite::Deferred => Some(OffsetWrite::Deferred),
+                _ => self.try_remove_order_message_queue(mq, pq).await.then_some(written),
+            };
+        }
+        match written {
+            // Proven on disk, or nothing local to prove: only now may this queue's offset go.
+            OffsetWrite::Proven | OffsetWrite::NoLocalState => {
+                default_mqpush_consumer_impl
+                    .offset_store
+                    .as_mut()
+                    .unwrap()
+                    .remove_offset(mq)
+                    .await;
+                Some(written)
+            }
+            // The write failed. The value stays in memory, carried by every later whole-table write,
+            // and the retirement that asked for this call keeps its queue (plan 49k K2 item 1).
+            OffsetWrite::Deferred => Some(OffsetWrite::Deferred),
+        }
+    }
+
+    async fn retire_process_queue(
+        &mut self,
+        mq: &MessageQueue,
+        pq: &Arc<ProcessQueue>,
+        guard: RetirementGuard,
+    ) -> bool {
+        let Some(consumer) = self.default_mqpush_consumer_impl.clone() else {
+            // Nothing could own this work. End the claim rather than strand the key, and do not
+            // swallow an installation that was turned away while it was held.
+            end_retirement(&mut self.rebalance_impl_inner, guard);
+            return false;
+        };
+
+        // A retirement is this SDK's work rather than its caller's (plan 49j J2 item 1). The claim
+        // moves into the task before this function's first await, so a caller that loses interest -
+        // an observer whose deadline passed, a rebalance pass that moved on to its next queue -
+        // leaves the operation running with its transition claim and its blocking writer instead of
+        // ending both and authorizing an installation to write the same offset file. Cleanup joins
+        // it because it belongs to the consumer's drain (plan 49j J2 item 3).
+        let operation = Box::pin(retire_owned_process_queue(
+            consumer.rebalance_impl.clone(),
+            mq.clone(),
+            Arc::clone(pq),
+            guard,
+        ));
+        // Admission normally succeeds; when it has already closed, the same operation goes to the
+        // drain instead of running on this caller's future (plan 49k K3 item 2). Either way the
+        // claim is inside that task and the watch below is only a report.
+        let join = match consumer.work.spawn_draining_owned(&Handle::current(), operation) {
+            Ok(join) => join,
+            Err(operation) => {
+                warn!(
+                    "retirement of {} found closed work; draining it as the consumer's own (its offset stays owned \
+                     here until that write lands)",
+                    mq
+                );
+                consumer.work.spawn_drained_after_close(&Handle::current(), operation)
+            }
+        };
+
+        // A caller that is still there watches the bookkeeping it asked for - but only for a
+        // bounded moment (plan 49k K3 item 1). Required persistence may wait on a local
+        // writer that outlives this pass, and holding a rebalance loop to it would stall
+        // every queue behind this one (plan 49i I2 item 1), so past the budget the caller
+        // reports "not removed" and moves on. Dropping the watch cancels nothing: the task
+        // belongs to the consumer's drain, keeps its transition claim, and finishes its
+        // offset write, table removal and acquisition end on its own - which is also what a
+        // cancelled observer leaves behind (plan 49j J2 item 1).
+        match tokio::time::timeout(retirement_watch_budget(), join).await {
+            Ok(Ok(removed)) => removed,
+            Ok(Err(err)) => {
+                warn!("retirement of {} was cut short by its runtime: {err}", mq);
+                false
+            }
+            Err(_) => {
+                debug!("retirement of {} is still running; its caller stops watching it", mq);
+                false
+            }
         }
     }
 
@@ -508,40 +712,10 @@ impl Rebalance for RebalancePushImpl {
             }
             return;
         };
-        let Some(consumer) = self.default_mqpush_consumer_impl.clone() else {
-            // Nothing could own this work. End the claim rather than strand the key, and do not
-            // swallow an installation that was turned away while it was held.
-            if guard.release() {
-                if let Some(client) = self.rebalance_impl_inner.client_instance.as_mut() {
-                    client.rebalance_later(500);
-                }
-            }
-            return;
-        };
-
-        // A retirement is this SDK's work rather than its caller's (plan 49j J2 item 1). Handing it
-        // to a task the consumer owns, before this function's first await, means a caller that
-        // loses interest - an observer whose deadline passed, a pull answer that stopped
-        // caring - leaves the operation running with its transition claim and its blocking
-        // writer instead of ending both and authorizing an installation to write the same
-        // offset file. Cleanup joins it because it belongs to the consumer's drain (plan
-        // 49j J2 item 3).
-        let operation = Box::pin(retire_owned_process_queue(
-            consumer.rebalance_impl.clone(),
-            mq.clone(),
-            Arc::clone(expected),
-            guard,
-        ));
-        match consumer.work.spawn_draining_owned(&Handle::current(), operation) {
-            // A caller that is still there waits for the bookkeeping it asked for; a caller that
-            // gives up has only stopped watching, it has not stopped the work.
-            Ok(join) => match join.await {
-                Ok(()) => {}
-                Err(err) => warn!("retirement of {} was cut short by its runtime: {err}", mq),
-            },
-            // Work is already closed, so nothing may be left unowned: perform it right here.
-            Err(operation) => operation.await,
-        }
+        // The retirement itself is the one operation every entry point uses (plan 49k K3 item 1),
+        // so a direct request and a rebalance removal loop cannot drift apart in what they
+        // guarantee.
+        self.retire_process_queue(mq, expected, guard).await;
     }
 
     async fn unlock(&mut self, mq: &MessageQueue, oneway: bool) {

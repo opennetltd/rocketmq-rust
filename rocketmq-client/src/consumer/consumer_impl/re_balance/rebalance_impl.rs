@@ -100,6 +100,30 @@ pub(crate) async fn insert_process_queue_if_absent(
     }
 }
 
+/// Ask for another rebalance pass because this one deferred something (plan 49k K3): once a
+/// retirement is owned elsewhere, "still running" becomes the ordinary outcome of a removal loop
+/// rather than something only a cancelled caller ever saw, so this line runs far more often than it
+/// used to. An instance with no scheduler wired cannot ask for a pass; logging that is all it can
+/// do, because panicking here would take the consumer's rebalance task down over a bookkeeping
+/// request.
+fn rebalance_later(client: &mut Option<ArcMut<MQClientInstance>>) {
+    match client.as_mut() {
+        Some(client) => client.rebalance_later(500),
+        None => debug!("no client instance to ask this consumer for another rebalance pass"),
+    }
+}
+
+/// Whether this key still has no process queue at all (plan 49k K1). An installation re-reads it
+/// under its claim: the probe that decided the work was needed happened while nobody held the key,
+/// and a pass that published in between owns that queue's entry, binding and offsets.
+async fn process_queue_is_absent(
+    table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    mq: &MessageQueue,
+) -> bool {
+    let table = table.read().await;
+    !table.contains_key(mq)
+}
+
 pub(crate) struct RebalanceImpl<R> {
     pub(crate) process_queue_table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
     pub(crate) pop_process_queue_table: Arc<RwLock<HashMap<MessageQueue, Arc<PopProcessQueue>>>>,
@@ -568,30 +592,31 @@ where
                 deferred_transition |= guard.release();
                 continue;
             }
-            let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
-            } else {
-                false
+            // The claim moves into the one retirement operation that every entry point uses (plan
+            // 49k K3 item 1). This pass deliberately does not wait for that operation's
+            // required I/O: a local writer that outlives the pass would stall every
+            // queue behind this one (plan 49i I2 item 1), so it watches for a bounded
+            // moment and reports anything still running as deferred. Giving up watching
+            // cancels nothing - the operation is owned by the consumer's drain, keeps
+            // its transition claim, and finishes its offset write, table removal and
+            // acquisition end whether or not this pass is still there (plan 49j J2 item 1).
+            let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() else {
+                // The consumer object this pass belongs to is gone, so nothing can own the
+                // retirement and no later pass will run either. Release rather than strand the key.
+                deferred_transition |= guard.release();
+                continue;
             };
+            let removed = sub_rebalance.retire_process_queue(&mq, &pq, guard).await;
             if removed {
-                let removed = remove_process_queue_if_same(&self.process_queue_table, &mq, &pq).await;
-                if removed {
-                    // Same rule as the plain rebalance path: leaving the table ends the acquisition
-                    // (plan 49c C1) - and it names the object this pass retired, so a replacement
-                    // installed while persistence ran is not ended by its predecessor (plan 49i I2
-                    // item 3).
-                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        sub_rebalance.note_queue_revoked(&mq, &pq).await;
-                    }
-                    changed = true;
-                    info!(
-                        "doRebalance, {:?}, remove unnecessary mq, {}",
-                        self.consumer_group,
-                        mq.get_topic()
-                    );
-                }
+                changed = true;
+                info!(
+                    "doRebalance, {:?}, remove unnecessary mq, {}",
+                    self.consumer_group,
+                    mq.get_topic()
+                );
+            } else {
+                deferred_transition = true;
             }
-            deferred_transition |= guard.release();
         }
 
         let mut remove_queue_map = HashMap::with_capacity(64);
@@ -658,6 +683,8 @@ where
                     !process_queue_table.contains_key(mq)
                 };
                 if missing {
+                    #[cfg(test)]
+                    review49k_extra::hold_after_probe(mq).await;
                     // One installation per key, claimed before any of its work rather than merely
                     // checked for it (plan 49j J1 item 2): a retirement waiting on persistence and
                     // a second installer of the same absent queue both keep
@@ -674,6 +701,19 @@ where
                         deferred_transition = true;
                         continue;
                     };
+                    // The absence probe above ran without this key claimed and is only an
+                    // optimization (plan 49k K1 item 1). Under the claim is the first moment this
+                    // pass may call the key its own, and a competing installer that published in
+                    // between keeps its entry, its binding and the offset its owner prepared:
+                    // preparing again would delete that offset for work this pass does not own.
+                    if !process_queue_is_absent(&process_queue_table_clone, mq).await {
+                        debug!(
+                            "doRebalance, {:?}, {} was installed while this pass asked for its key",
+                            self.consumer_group, mq
+                        );
+                        deferred_transition |= installation.release();
+                        continue;
+                    }
                     if is_order && !self.lock(mq).await {
                         warn!(
                             "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -745,7 +785,7 @@ where
             }
 
             if !all_mq_locked || deferred_transition {
-                self.client_instance.as_mut().unwrap().rebalance_later(500);
+                rebalance_later(&mut self.client_instance);
             }
             sub_rebalance_impl.dispatch_pull_request(pull_request_list, 500).await;
         }
@@ -845,31 +885,27 @@ where
                 deferred_transition |= guard.release();
                 continue;
             }
-            let removed = if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                sub_rebalance.remove_unnecessary_message_queue(&mq, &pq).await
-            } else {
-                false
+            // Same rule as the repair path above (plan 49k K3 item 1): the claim moves into that
+            // one retirement operation and this pass only watches it, so a direct
+            // removal request and a rebalance pass cannot drift apart in what they
+            // guarantee.
+            let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() else {
+                // The consumer object this pass belongs to is gone, so nothing can own the
+                // retirement and no later pass will run either. Release rather than strand the key.
+                deferred_transition |= guard.release();
+                continue;
             };
+            let removed = sub_rebalance.retire_process_queue(&mq, &pq, guard).await;
             if removed {
-                let removed = remove_process_queue_if_same(&process_queue_table_cloned, &mq, &pq).await;
-                if removed {
-                    // Ownership ends with the table entry. Retiring the acquisition here - rather
-                    // than in an assignment callback that has to wait for a heartbeat - means no
-                    // later dispatch, and no replacement installation of the same queue, can
-                    // inherit this loop's identity (plan 49c C1). The object is named so that only
-                    // this pass's own acquisition ends (plan 49i I2 item 3).
-                    if let Some(mut sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
-                        sub_rebalance.note_queue_revoked(&mq, &pq).await;
-                    }
-                    changed = true;
-                    info!(
-                        "doRebalance, {:?}, remove unnecessary mq, {}",
-                        self.consumer_group,
-                        mq.get_topic()
-                    );
-                }
+                changed = true;
+                info!(
+                    "doRebalance, {:?}, remove unnecessary mq, {}",
+                    self.consumer_group,
+                    mq.get_topic()
+                );
+            } else {
+                deferred_transition = true;
             }
-            deferred_transition |= guard.release();
         }
         // Add new message queue
         let mut all_mq_locked = true;
@@ -893,6 +929,8 @@ where
                 // publication happen under one installation, so no retirement begins in that window
                 // and a competing installer of this key is turned away rather than replacing what
                 // this pass publishes.
+                #[cfg(test)]
+                review49k::after_missing_probe(mq).await;
                 let Some(installation) = self.queue_transitions.try_install(mq) else {
                     debug!(
                         "doRebalance, {:?}, deferring {} until the transition in flight ends",
@@ -901,6 +939,16 @@ where
                     deferred_transition = true;
                     continue;
                 };
+                // Same rule as the repair path above (plan 49k K1 item 1): recheck under the claim,
+                // because the probe above proved nothing about a key this pass did not hold yet.
+                if !process_queue_is_absent(&process_queue_table_cloned, mq).await {
+                    debug!(
+                        "doRebalance, {:?}, {} was installed while this pass asked for its key",
+                        self.consumer_group, mq
+                    );
+                    deferred_transition |= installation.release();
+                    continue;
+                }
                 if is_order && !self.lock(mq).await {
                     warn!(
                         "doRebalance, {:?}, add a new mq failed, {}, because lock failed",
@@ -969,7 +1017,7 @@ where
         }
 
         if !all_mq_locked || deferred_transition {
-            self.client_instance.as_mut().unwrap().rebalance_later(500);
+            rebalance_later(&mut self.client_instance);
         }
         sub_rebalance_impl.dispatch_pull_request(pull_request_list, 500).await;
 
@@ -1616,14 +1664,16 @@ mod review49i {
         let owned_offset = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
         let owned_persisted = std::path::Path::new(&path).exists();
         eprintln!(
-            "stale retirement: erased={erased} offset_after={offset} persisted={persisted}; owner: \
-             erased={owned_erased} offset_after={owned_offset} persisted={owned_persisted}"
+            "stale retirement: erased={erased:?} offset_after={offset} persisted={persisted}; owner: \
+             erased={owned_erased:?} offset_after={owned_offset} persisted={owned_persisted}"
         );
         client.shutdown().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        // The API reports what its write proved (plan 49k K2 item 1); `None` is this test's old
+        // "did not clear", meaning a caller that no longer owns the key wrote and erased nothing.
         assert!(
-            !erased,
+            erased.is_none(),
             "a retirement that no longer owned the key reported clearing it"
         );
         assert_eq!(offset, 7, "a stale retirement erased its replacement's offset");
@@ -1632,7 +1682,7 @@ mod review49i {
             "a retirement that no longer owned the key still persisted through the offset store"
         );
         assert!(owned_persisted, "the control never wrote the offsets it owns");
-        assert!(owned_erased);
+        assert!(owned_erased.is_some());
         assert_eq!(
             owned_offset, -1,
             "the owning retirement stopped clearing its own offsets"
@@ -1984,11 +2034,17 @@ mod review49j {
         let writer_still_owned = f.io.try_lock().is_err();
         let owner_after = transitions.retiring(&f.q);
         let deferred_after = transitions.install_deferred(&f.q);
-        let table_missing = !table.read().await.contains_key(&f.q);
+        // Plan 49k K2 item 2 changed what this window looks like from the outside: a retirement
+        // whose local write has not been proven keeps the table entry it was asked to
+        // retire, because an entry that left early leaves its unwritten offset with no
+        // retry target. What this window has always proved is that the operation reached
+        // *this* queue's own writer and installed nothing of its own meanwhile - so the
+        // entry, if a reader looks now, still names the retiring object.
+        let held_by_retirement = table.read().await.get(&f.q).is_some_and(|pq| Arc::ptr_eq(pq, &old));
         eprintln!(
             "retirement cancellation={cancel}: owner_before={owner_before} deferred_before={deferred_before} \
              writer_still_owned={writer_still_owned} owner_after={owner_after} deferred_after={deferred_after} \
-             table_missing={table_missing}"
+             held_by_retirement={held_by_retirement}"
         );
         // Replace the path before waking the FIFO reader so backup/write use a regular file.
         std::fs::remove_file(&f.path).unwrap();
@@ -2006,7 +2062,7 @@ mod review49j {
         cleanup(f).await;
         assert!(writer_done, "fixture did not release the real blocking writer");
         assert!(
-            owner_before && deferred_before && writer_still_owned && table_missing,
+            owner_before && deferred_before && writer_still_owned && held_by_retirement,
             "fixture missed the owned writer window"
         );
         assert!(
@@ -2548,7 +2604,18 @@ mod review49j {
         )
         .await
         .is_ok();
-        let installed_early = table.read().await.contains_key(&f.q);
+        // Plan 49k K2 item 2: while its offset write is unproven the retirement holds the entry
+        // rather than dropping it, so "no installation happened" is no longer the same
+        // observation as "the key is absent". What must stay impossible is anyone else
+        // becoming this key's owner while that writer runs - which is what this test has
+        // always been about.
+        let published_by_another = {
+            let guard = table.read().await;
+            match guard.get(&f.q) {
+                None => false,
+                Some(pq) => !Arc::ptr_eq(pq, &old),
+            }
+        };
         let still_claimed = transitions.retiring(&f.q);
 
         release_offset_writer(&f.path, pipe);
@@ -2570,7 +2637,7 @@ mod review49j {
             "an installation waited on the offset file of a retiring queue instead of deferring"
         );
         assert!(
-            !installed_early,
+            !published_by_another,
             "an installation was authorized while the cancelled retirement's writer owned the file"
         );
         assert!(still_claimed, "the cancelled waiter ended its retirement");
@@ -2602,6 +2669,925 @@ mod review49j {
             Arc::ptr_eq(&installed, &bound),
             "the reinstalled queue's table entry and acquisition name different objects"
         );
+        cleanup(f).await;
+    }
+}
+
+#[cfg(test)]
+mod review49k {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+    use std::time::Duration;
+
+    struct ProbeGate {
+        queue: MessageQueue,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+    static PROBE: std::sync::Mutex<Option<ProbeGate>> = std::sync::Mutex::new(None);
+    pub(super) async fn after_missing_probe(q: &MessageQueue) {
+        let gate = {
+            let mut slot = PROBE.lock().unwrap();
+            if slot.as_ref().is_some_and(|gate| &gate.queue == q) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        io: Arc<tokio::sync::Mutex<()>>,
+        path: std::path::PathBuf,
+        q: MessageQueue,
+    }
+    fn fixture(label: &str) -> Fixture {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49k-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let client = MQClientInstance::new_arc(cc, 0, format!("review49k-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49k-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        Fixture {
+            push,
+            client,
+            io,
+            path,
+            q: MessageQueue::from_parts(format!("review49k-{label}"), "broker", 0),
+        }
+    }
+    async fn cleanup(mut f: Fixture) {
+        f.push.work.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), f.push.work.wait()).await;
+        f.client.shutdown().await;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::remove_dir(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
+    }
+    async fn stale_absence(stale: bool) {
+        let f = fixture(if stale { "stale-absence" } else { "fresh-absence" });
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        store.persist(&f.q).await;
+        let topic = f.q.get_topic().to_string();
+        let desired = HashSet::from([f.q.clone()]);
+        let mut late = f.push.rebalance_impl.clone();
+        let mut winner = f.push.rebalance_impl.clone();
+        let (entered, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        if stale {
+            *PROBE.lock().unwrap() = Some(ProbeGate {
+                queue: f.q.clone(),
+                entered,
+                release: release_rx,
+            });
+        }
+        let mut installing = Box::pin(
+            late.rebalance_impl_inner
+                .update_process_queue_table_in_rebalance(&topic, &desired, false),
+        );
+        if stale {
+            tokio::select! {r=&mut entered_rx=>r.unwrap(),_=&mut installing=>panic!("stale installer did not pause"),_=tokio::time::sleep(Duration::from_secs(1))=>panic!("missing probe was not reached")};
+        }
+        let winner_changed = winner
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance(&topic, &desired, false)
+            .await;
+        assert!(winner_changed);
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let installed = table.read().await.get(&f.q).cloned().unwrap();
+        store.update_offset(&f.q, 99, false).await;
+        if stale {
+            release.send(()).unwrap();
+        }
+        let late_changed = tokio::time::timeout(Duration::from_secs(2), &mut installing)
+            .await
+            .unwrap();
+        drop(installing);
+        let same = table
+            .read()
+            .await
+            .get(&f.q)
+            .is_some_and(|current| Arc::ptr_eq(current, &installed));
+        let bound_same = Arc::ptr_eq(
+            &f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap(),
+            &installed,
+        );
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "absence probe: stale={stale} late_changed={late_changed} table_same={same} binding_same={bound_same} \
+             offset={offset}"
+        );
+        cleanup(f).await;
+        assert!(same && bound_same);
+        assert!(!late_changed);
+        assert_eq!(
+            offset, 99,
+            "a stale missing probe cleared the published winner's offset after acquiring the key"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_absence_probe_must_not_clear_the_installed_owners_offset() {
+        stale_absence(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fresh_absence_probe_keeps_the_installed_owners_offset() {
+        stale_absence(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn cancelled_retirement(mode: &str) {
+        use std::io::Write;
+        let f = fixture(mode);
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        f.push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .update_offset(&f.q, 7, false)
+            .await;
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+        if mode == "closed" {
+            f.push.work.close();
+        }
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let empty = HashSet::new();
+        let topic = f.q.get_topic().to_string();
+        let mut retiring = Box::pin(async {
+            if mode == "plain" {
+                rebalance
+                    .rebalance_impl_inner
+                    .update_process_queue_table_in_rebalance(&topic, &empty, false)
+                    .await;
+            } else {
+                rebalance.remove_process_queue(&f.q, &old).await;
+            }
+        });
+        tokio::select! {_=&mut retiring=>panic!("retirement missed the writer window"),_=tokio::time::sleep(Duration::from_millis(30))=>{}}
+        let owned_before = transitions.retiring(&f.q);
+        drop(retiring);
+        let writer_alive = f.io.try_lock().is_err();
+        let owner_after = transitions.retiring(&f.q);
+        let deferred_after = transitions.install_deferred(&f.q);
+        eprintln!(
+            "retirement mode={mode}: owned_before={owned_before} writer_alive={writer_alive} \
+             owner_after={owner_after} deferred_after={deferred_after}"
+        );
+        std::fs::remove_file(&f.path).unwrap();
+        let empty = br#"{"offsetTable":{}}"#;
+        std::fs::write(&f.path, empty).unwrap();
+        pipe.write_all(empty).unwrap();
+        drop(pipe);
+        let writer_done = tokio::time::timeout(Duration::from_secs(2), f.io.lock()).await.is_ok();
+        cleanup(f).await;
+        assert!(owned_before && writer_alive && writer_done);
+        assert!(
+            owner_after && deferred_after,
+            "this retirement entry path left its active writer without transition ownership"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_plain_rebalance_must_keep_its_retirement_owner() {
+        cancelled_retirement("plain").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_after_work_closes_must_keep_its_retirement_owner() {
+        cancelled_retirement("closed").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_open_direct_retirement_keeps_its_owner() {
+        cancelled_retirement("direct").await;
+    }
+
+    async fn failed_persistence(fail: bool) {
+        let f = fixture(if fail { "failed-write" } else { "successful-write" });
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        if fail {
+            std::fs::create_dir(&f.path).unwrap();
+        }
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let returned = tokio::time::timeout(Duration::from_millis(200), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .is_ok();
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let local_proof = store.io_complete().await;
+        let owned = transitions.retiring(&f.q);
+        let epoch = f.push.progress.current_epoch(&f.q);
+        if fail {
+            std::fs::remove_dir(&f.path).unwrap();
+        }
+        let empty_attempt = store.persist_local(&HashSet::new()).await.unwrap();
+        let proof_after_heal = store.io_complete().await;
+        eprintln!(
+            "retirement persistence: fail={fail} returned={returned} offset={offset} local_proof={local_proof} \
+             owned={owned} epoch={epoch:?} empty_attempt={empty_attempt} proof_after_heal={proof_after_heal}"
+        );
+        cleanup(f).await;
+        if fail {
+            assert_eq!(offset, 7, "failed local persistence erased the last retryable offset");
+            assert!(owned && epoch.is_some());
+        } else {
+            assert!(returned && local_proof && proof_after_heal);
+            assert_eq!(offset, -1);
+            assert!(!owned && epoch.is_none());
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_local_retirement_must_retain_the_offset_until_persistence_succeeds() {
+        failed_persistence(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_local_retirement_releases_its_offset_and_owner() {
+        failed_persistence(false).await;
+    }
+}
+
+/// Companion coverage for plan 49k's other entry points and controls (plan 3.2.5): the reviewer's
+/// module drives the plain rebalance installation path, a successful write and one cancelled
+/// retirement; this module adds the broker-assigned repair path, a persistence budget that runs
+/// out, a write that heals, an offset whose debt survives an empty assignment set, a store model
+/// with no local file at all, and the repair path's removal loop.
+#[cfg(test)]
+mod review49k_extra {
+    use std::time::Duration;
+
+    use futures::future::FutureExt as _;
+    use once_cell::sync::Lazy;
+
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::consumer_impl::re_balance::rebalance_push_impl::review49k_cap_persist_attempts;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+
+    /// One installation pass parked per queue, so several tests may hold their own gate at once.
+    /// A caller-held permit rather than a sleep: the pass waits until this test drops the permit,
+    /// which keeps the race window open as long as the assertions need it and no longer.
+    static PROBES: Lazy<std::sync::Mutex<HashMap<MessageQueue, Arc<tokio::sync::Semaphore>>>> =
+        Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    /// Dropping this lets the parked pass go on.
+    struct Probe {
+        queue: MessageQueue,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let gate = PROBES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.queue);
+            if let Some(gate) = gate {
+                gate.add_permits(1);
+            }
+        }
+    }
+
+    /// Park the next installation pass for this queue between its absence probe and its claim.
+    fn park_after_probe(queue: &MessageQueue) -> Probe {
+        PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(queue.clone(), Arc::new(tokio::sync::Semaphore::new(0)));
+        Probe { queue: queue.clone() }
+    }
+
+    pub(crate) async fn hold_after_probe(queue: &MessageQueue) {
+        let gate = PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(queue)
+            .cloned();
+        if let Some(gate) = gate {
+            let _ = tokio::time::timeout(Duration::from_secs(5), gate.acquire())
+                .await
+                .expect("the parked installation was never released");
+        }
+    }
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        io: Arc<tokio::sync::Mutex<()>>,
+        path: std::path::PathBuf,
+        q: MessageQueue,
+    }
+
+    fn fixture(label: &str) -> Fixture {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49kx-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        let client = MQClientInstance::new_arc(cc, 0, format!("review49kx-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49kx-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        Fixture {
+            push,
+            client,
+            io,
+            path,
+            q: MessageQueue::from_parts(format!("review49kx-{label}"), "broker", 0),
+        }
+    }
+
+    async fn cleanup(mut f: Fixture) {
+        f.push.work.close();
+        let _ = tokio::time::timeout(Duration::from_secs(3), f.push.work.wait()).await;
+        f.client.shutdown().await;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::remove_dir(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
+    }
+
+    fn assignment(queue: &MessageQueue) -> MessageQueueAssignment {
+        MessageQueueAssignment {
+            message_queue: Some(queue.clone()),
+            mode: MessageRequestMode::Pull,
+            attachments: None,
+        }
+    }
+
+    /// The broker-assigned repair path follows the same rule as the plain rebalance path (plan 49k
+    /// K1 item 1): an absence probe is not ownership, so a queue that another installer published
+    /// while this pass was deciding keeps its entry, its acquisition and the offset its owner
+    /// prepared.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_repair_path_rechecks_its_key_under_the_claim() {
+        let f = fixture("repair-stale-probe");
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        let topic = CheetahString::from_static_str("T");
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+
+        // Something is on record for this queue, so an installation that goes ahead anyway gets as
+        // far as its offset side effects instead of stopping at a route lookup.
+        store.update_offset(&f.q, 7, false).await;
+
+        // The repair pass has probed this queue and found nothing; it is parked before its claim.
+        let parked = park_after_probe(&f.q);
+        let mut late = f.push.rebalance_impl.clone();
+        let assignments = HashSet::from([assignment(&f.q)]);
+        let mut installing = Box::pin(late.rebalance_impl_inner.update_message_queue_assignment(
+            &topic,
+            &assignments,
+            false,
+        ));
+        tokio::select! {
+            _ = installing.as_mut() => panic!("the parked repair pass finished without waiting"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        // A competing installation completes in that window and prepares its own offset.
+        let winner = Arc::new(ProcessQueue::new());
+        f.push.note_queue_installed(&f.q, &winner);
+        table.write().await.insert(f.q.clone(), winner.clone());
+        store.update_offset(&f.q, 99, false).await;
+
+        drop(parked);
+        // An installer that ignores its stale probe finds this queue's offset already prepared by
+        // its owner and walks on into another owner's side effects. Catching the outcome
+        // here keeps the assertions below about what it did to the winner, rather than
+        // about how loudly it failed.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            std::panic::AssertUnwindSafe(installing.as_mut()).catch_unwind(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "a repair installer whose probe went stale did not abandon this queue quietly: {outcome:?}"
+        );
+
+        let held = table.read().await.get(&f.q).cloned().expect("the queue vanished");
+        let bound = f.push.progress.review49h_bound_to(&f.q).unwrap().upgrade().unwrap();
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "repair recheck: table_same={} binding_same={} offset={offset}",
+            Arc::ptr_eq(&held, &winner),
+            Arc::ptr_eq(&bound, &winner)
+        );
+        assert!(
+            Arc::ptr_eq(&held, &winner),
+            "a repair pass whose probe went stale replaced the installed queue"
+        );
+        assert!(
+            Arc::ptr_eq(&bound, &winner),
+            "a repair pass whose probe went stale republished this key's acquisition"
+        );
+        assert_eq!(offset, 99, "a stale repair probe cleared the installed owner's offset");
+        // Abandoning must not strand the key: its transition is free again for whoever needs it.
+        let claim = transitions
+            .try_retire(&f.q, &winner)
+            .expect("the abandoned installation kept its key closed");
+        assert!(!claim.release());
+        cleanup(f).await;
+    }
+
+    /// Whoever abandons an installation releases only its claim: the winner's offsets stay where
+    /// they are and a retirement of that queue is still this SDK's to perform (plan 49k K1 item
+    /// 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_installation_touches_nothing_it_never_owned() {
+        let f = fixture("abandoned-install");
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 99, false).await;
+        let topic = CheetahString::from_static_str("T");
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+
+        let parked = park_after_probe(&f.q);
+        let mut late = f.push.rebalance_impl.clone();
+        let assignments = HashSet::from([assignment(&f.q)]);
+        let mut installing = Box::pin(late.rebalance_impl_inner.update_message_queue_assignment(
+            &topic,
+            &assignments,
+            false,
+        ));
+        tokio::select! {
+            _ = installing.as_mut() => panic!("the parked repair pass finished without waiting"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        let winner = Arc::new(ProcessQueue::new());
+        f.push.note_queue_installed(&f.q, &winner);
+        table.write().await.insert(f.q.clone(), winner.clone());
+        // The abandoned installation's own object - the one it built before giving up - is what its
+        // side effects would have named had it gone on.
+        let stale_object = Arc::new(ProcessQueue::new());
+        drop(parked);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            std::panic::AssertUnwindSafe(installing.as_mut()).catch_unwind(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "an abandoned repair installation did not stop quietly: {outcome:?}"
+        );
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let erased = rebalance.remove_unnecessary_message_queue(&f.q, &stale_object).await;
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "abandoned installation: erased={erased:?} offset={offset} installed_same={}",
+            Arc::ptr_eq(&table.read().await.get(&f.q).cloned().unwrap(), &winner)
+        );
+        assert!(
+            erased.is_none(),
+            "an object that was never installed reported clearing this key's offsets"
+        );
+        assert_eq!(offset, 99, "the winner's offset did not survive the loser");
+        cleanup(f).await;
+    }
+
+    /// A retirement whose persistence budget runs out keeps everything it could still need: the
+    /// table entry, its acquisition identity, and the memory copy of the offset a later pass
+    /// can retry. What it gives back is only its claim, so "not now" never becomes "never"
+    /// (plan 49k K2 item 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_given_up_retirement_keeps_its_queue_and_offset() {
+        let f = fixture("persist-give-up");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        // The offset file cannot be written at all this test.
+        std::fs::create_dir(&f.path).unwrap();
+        review49k_cap_persist_attempts(&f.q, 1);
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(Duration::from_secs(3), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .expect("a retirement that gave up must still report back");
+
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let held = table.read().await.get(&f.q).cloned();
+        let installed = held.as_ref().is_some_and(|pq| Arc::ptr_eq(pq, &old));
+        let epoch = f.push.progress.current_epoch(&f.q);
+        eprintln!(
+            "give up: offset={offset} installed={installed} retiring={} epoch={epoch:?} io_complete={}",
+            transitions.retiring(&f.q),
+            store.io_complete().await
+        );
+        assert_eq!(offset, 7, "a retirement that gave up erased its retryable offset");
+        assert!(
+            installed,
+            "a retirement whose write never landed removed the queue anyway"
+        );
+        assert!(epoch.is_some(), "the retired queue's acquisition outlived its entry");
+        assert!(
+            !transitions.retiring(&f.q),
+            "a retirement that gave up kept its key closed to a later pass"
+        );
+
+        // The offset it kept is not forgotten either: an assignment set naming nothing still
+        // carries the debt, and a second failing attempt does not quietly settle it.
+        let carried = store.persist_local(&HashSet::new()).await.unwrap();
+        eprintln!("debt on a broken volume: {carried}");
+        assert!(
+            carried.attempted >= 1 && carried.failed >= 1,
+            "an unproven offset was dropped rather than retried by a write that named no queue: {carried}"
+        );
+
+        std::fs::remove_dir(&f.path).unwrap();
+        let healed_write = store.persist_local(&HashSet::new()).await.unwrap();
+        let healed = store.io_complete().await;
+        eprintln!("debt on a healed volume: {healed_write} io_complete={healed}");
+        cleanup(f).await;
+        assert!(
+            healed_write.attempted >= 1 && healed_write.succeeded >= 1,
+            "a healed volume was never offered the offset it still owed: {healed_write}"
+        );
+        assert!(healed, "the retried whole-table write never landed");
+    }
+
+    /// The same retirement finishes the moment its volume heals - once, and with the bookkeeping it
+    /// owes: entry gone, offset erased exactly once, acquisition ended (plan 49k K2 items 1-2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_healed_write_completes_the_same_retirement_once() {
+        let f = fixture("persist-heal");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        std::fs::create_dir(&f.path).unwrap();
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        // The caller is only a watcher: it comes back as soon as its budget ends.
+        tokio::time::timeout(Duration::from_secs(3), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .expect("the retirement's watcher never returned");
+        let mid = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+
+        // The volume heals while the operation is still waiting on its own queue.
+        std::fs::remove_dir(&f.path).unwrap();
+        let mut gone = false;
+        for _ in 0..60 {
+            if !table.read().await.contains_key(&f.q) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        eprintln!(
+            "heal: mid={mid} gone={gone} offset={offset} retiring={} epoch={epoch:?}",
+            transitions.retiring(&f.q)
+        );
+        assert_eq!(mid, 7, "the queue's offset was dropped before its write landed");
+        assert!(gone, "a healed write did not let the same retirement finish");
+        assert_eq!(offset, -1, "the finished retirement left its offset behind");
+        assert!(!transitions.retiring(&f.q), "the finished retirement kept its claim");
+        assert!(epoch.is_none(), "the queue left the table with its acquisition open");
+
+        // A second retirement of the same object is a no-op rather than a second erase.
+        let mut rebalance = f.push.rebalance_impl.clone();
+        tokio::time::timeout(Duration::from_secs(1), rebalance.remove_process_queue(&f.q, &old))
+            .await
+            .expect("the second retirement never returned");
+        cleanup(f).await;
+    }
+
+    /// A store model with no local file has nothing to prove, so a retirement is not held up by a
+    /// missing write - the existing bounded best-effort policy for broker offsets still applies
+    /// (plan 49k K2 item 3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_store_with_no_local_file_has_nothing_to_prove() {
+        use crate::consumer::store::offset_store::OffsetWrite;
+        let mut store = OffsetStore::new(None, None);
+        let queue = MessageQueue::from_parts("Review49kNoLocal", "broker", 0);
+        let proof = store.persist_for_retirement(&queue).await;
+        assert_eq!(
+            proof,
+            OffsetWrite::NoLocalState,
+            "a store model with no file was treated as a failed write"
+        );
+    }
+
+    /// The repair path's removal loop retires through the same owned operation as everything else:
+    /// when its pass moves on - or is cancelled outright - the queue keeps its claim and its
+    /// blocking writer, and that writer still finishes (plan 49k K3 item 1).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_repair_path_holds_a_retirement_its_pass_walked_away_from() {
+        use std::io::Write;
+        let f = fixture("repair-retire");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        f.push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .update_offset(&f.q, 7, false)
+            .await;
+        // Nothing this pass writes can finish until the test drains the pipe.
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        // The removal loop works one topic at a time, so ask about this queue's own.
+        let topic = CheetahString::from_string(f.q.get_topic().to_string());
+        let mut repair = f.push.rebalance_impl.clone();
+        let none_assigned: HashSet<MessageQueueAssignment> = HashSet::new();
+        let mut retiring = Box::pin(repair.rebalance_impl_inner.update_message_queue_assignment(
+            &topic,
+            &none_assigned,
+            false,
+        ));
+        tokio::select! {
+            _ = retiring.as_mut() => panic!("the repair pass finished without waiting on its retirement"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        let owned_before = transitions.retiring(&f.q);
+        drop(retiring);
+        let writer_alive = f.io.try_lock().is_err();
+        let owner_after = transitions.retiring(&f.q);
+
+        std::fs::remove_file(&f.path).unwrap();
+        let empty = br#"{"offsetTable":{}}"#;
+        std::fs::write(&f.path, empty).unwrap();
+        pipe.write_all(empty).unwrap();
+        drop(pipe);
+        let writer_done = tokio::time::timeout(Duration::from_secs(3), f.io.lock()).await.is_ok();
+
+        // The queue is still this retirement's to finish; a later pass may take it over.
+        let mut late = false;
+        for _ in 0..40 {
+            if !table.read().await.contains_key(&f.q) {
+                late = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        eprintln!(
+            "repair retirement: owned_before={owned_before} writer_alive={writer_alive} writer_done={writer_done} \
+             owner_after={owner_after} finished_late={late}"
+        );
+        assert!(owned_before && writer_alive && writer_done);
+        assert!(
+            owner_after,
+            "the repair path left its active writer without transition ownership"
+        );
+        assert!(late, "the retirement did not finish once its write could land");
+        cleanup(f).await;
+    }
+
+    /// A cancelled observer of a direct retirement is the same story from the other side: the
+    /// offset stays where it is while that retirement's writer runs, and nobody else may
+    /// install over it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_observer_leaves_the_offset_with_its_writer() {
+        use std::io::Write;
+        let f = fixture("cancel-observer");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let retirement = Box::pin(rebalance.remove_process_queue(&f.q, &old));
+        tokio::select! {
+            _ = retirement => panic!("the retirement finished while its write was blocked"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        // An installation turned away behind this retirement is reported, not swallowed.
+        let deferred = transitions.install_deferred(&f.q);
+        let offset_while_blocked = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+
+        std::fs::remove_file(&f.path).unwrap();
+        let payload = br#"{"offsetTable":{}}"#;
+        std::fs::write(&f.path, payload).unwrap();
+        pipe.write_all(payload).unwrap();
+        drop(pipe);
+        let mut done = false;
+        for _ in 0..40 {
+            if !transitions.retiring(&f.q) {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let offset_after = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "cancelled observer: deferred={deferred} blocked_offset={offset_while_blocked} finished={done} \
+             after_offset={offset_after}"
+        );
+        assert!(deferred, "an installation behind a live retirement was not reported");
+        assert_eq!(
+            offset_while_blocked, 7,
+            "a blocked retirement erased the offset it had not written yet"
+        );
+        assert!(done, "the retirement never ended once its write could land");
+        assert_eq!(
+            offset_after, -1,
+            "the finished retirement kept an erased queue's offset"
+        );
+        cleanup(f).await;
+    }
+
+    /// A scheduling pass hands its retirement over and walks away: required persistence may wait on
+    /// a local writer that outlives the pass, and holding the loop to it would stall every
+    /// queue behind this one (plan 49k K3 item 1, plan 49i I2 item 1). The pass comes back
+    /// inside its watch budget and asks for another round; the retirement keeps running without
+    /// it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_retirement_does_not_hold_the_pass_that_started_it() {
+        use std::io::Write;
+        let f = fixture("bounded-watch");
+        let old = Arc::new(ProcessQueue::new());
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(f.q.clone(), old.clone());
+        f.push.note_queue_installed(&f.q, &old);
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&f.path)
+            .status()
+            .unwrap()
+            .success());
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+
+        let wakes_before = f.client.review49j_rebalance_wakes();
+        let topic = CheetahString::from_string(f.q.get_topic().to_string());
+        let mut repair = f.push.rebalance_impl.clone();
+        let none_assigned: HashSet<MessageQueueAssignment> = HashSet::new();
+        // The pass has to come back on its own; nothing here cancels it.
+        let returned = tokio::time::timeout(
+            Duration::from_millis(1_000),
+            repair
+                .rebalance_impl_inner
+                .update_message_queue_assignment(&topic, &none_assigned, false),
+        )
+        .await;
+        let writer_alive = f.io.try_lock().is_err();
+        let still_owned = transitions.retiring(&f.q);
+        let wakes_before_seen = wakes_before;
+
+        std::fs::remove_file(&f.path).unwrap();
+        let payload = br#"{"offsetTable":{}}"#;
+        std::fs::write(&f.path, payload).unwrap();
+        pipe.write_all(payload).unwrap();
+        drop(pipe);
+        let mut done = false;
+        for _ in 0..60 {
+            if !table.read().await.contains_key(&f.q) && !transitions.retiring(&f.q) {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        // The pass asks for another round on a delay rather than pushing another pass into the
+        // queue, so its report arrives after that delay.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let wakes_after = f.client.review49j_rebalance_wakes();
+        eprintln!(
+            "bounded watch: returned={} writer_alive={writer_alive} still_owned={still_owned} \
+             wakes={wakes_before_seen}->{wakes_after} finished_late={done} offset={offset}",
+            returned.is_ok()
+        );
+        assert!(
+            returned.is_ok(),
+            "a rebalance pass waited on the local write of the queue it retired"
+        );
+        assert!(writer_alive, "fixture did not keep a real writer blocked");
+        assert!(
+            still_owned,
+            "the pass that handed its retirement over also ended its claim"
+        );
+        assert!(
+            wakes_after > wakes_before,
+            "a pass that deferred a running retirement reported itself as finished"
+        );
+        assert!(done, "the retirement did not finish on its own after the write landed");
+        assert_eq!(offset, -1, "the finished retirement left its offset behind");
+        cleanup(f).await;
+    }
+
+    /// The unproven set is a debt, not a latch: it carries an offset until a write lands, then
+    /// stops being carried (plan 49k K2 item 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unproven_offset_is_carried_until_a_write_lands() {
+        let f = fixture("unproven-debt");
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        store.update_offset(&f.q, 7, false).await;
+
+        std::fs::create_dir(&f.path).unwrap();
+        let failed = store.persist_for_retirement(&f.q).await;
+        let offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!("debt: proof={failed:?} offset={offset}");
+        assert_eq!(failed, crate::consumer::store::offset_store::OffsetWrite::Deferred);
+        assert_eq!(offset, 7, "a failed write dropped the value it was meant to save");
+
+        std::fs::remove_dir(&f.path).unwrap();
+        let carried = store.persist_local(&HashSet::new()).await.unwrap();
+        eprintln!("debt retry: {carried} io_complete={}", store.io_complete().await);
+        assert!(carried.attempted >= 1 && carried.succeeded >= 1);
+
+        // Nothing is owed any more, so a write naming no queue writes nothing.
+        let idle = store.persist_local(&HashSet::new()).await.unwrap();
+        eprintln!("debt cleared: {idle}");
+        assert_eq!(idle.attempted, 0, "a settled offset was written again and again");
         cleanup(f).await;
     }
 }

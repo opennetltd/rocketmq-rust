@@ -23,6 +23,8 @@ use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::queue_transitions::RetirementGuard;
+use crate::consumer::store::offset_store::OffsetWrite;
 
 pub(crate) mod queue_transitions;
 pub(crate) mod rebalance_impl;
@@ -72,7 +74,7 @@ pub trait RebalanceLocal {
     /// (plan 49i I2 item 3).
     async fn note_queue_revoked(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
 
-    /// Erase the local offsets of a queue this pass retired.
+    /// Write and then erase the local offsets of a queue this pass is retiring.
     ///
     /// The object is named because those offsets are shared by key: an installation that appeared
     /// while this was waiting on persistence owns them now, and this call must leave them alone
@@ -80,8 +82,33 @@ pub trait RebalanceLocal {
     ///
     /// # Returns
     ///
-    /// Whether the queue's offsets were erased - `false` when a newer installation owns them.
-    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>) -> bool;
+    /// What the write proved - and `None` when a newer installation owns those offsets, in which
+    /// case nothing was written or erased. A retirement that got `Deferred` keeps its queue:
+    /// the offset is still retryable and this object's ownership has to outlast it (plan 49k K2
+    /// item 1).
+    async fn remove_unnecessary_message_queue(
+        &mut self,
+        mq: &MessageQueue,
+        pq: &Arc<ProcessQueue>,
+    ) -> Option<OffsetWrite>;
+
+    /// Retire one **exact** process queue on work this SDK owns, under a transition claim the
+    /// caller already holds (plan 49k K3 item 1). This is the one retirement operation every
+    /// entry point uses - the direct request and both rebalance removal loops alike.
+    ///
+    /// The claim moves in rather than being carried by the caller, because required persistence may
+    /// wait on a local writer that outlives whoever asked: cancelling then would end the claim -
+    /// authorizing an installation to write the same offset file - while this retirement's own
+    /// erase is still coming. Watching the returned completion is optional; giving up watching
+    /// cancels nothing, and shutdown joins the work because it belongs to the consumer's drain.
+    ///
+    /// # Returns
+    ///
+    /// Whether the queue left this consumer's table. `false` means somebody else owns that key now,
+    /// or its offset write has not landed yet - in both cases the entry stays where it is for a
+    /// later pass.
+    async fn retire_process_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>, guard: RetirementGuard)
+        -> bool;
 
     /// Removes an unnecessary pop message queue.
     ///
@@ -176,6 +203,7 @@ pub trait RebalanceLocal {
     /// Removes one **exact** process queue: the table entry is dropped only while it still names
     /// `expected`, and its transition is claimed first so a second caller reaching the same key
     /// does not repeat the side effects or act on an installation it never owned (plan 49i I2).
+    /// The retirement itself then runs as [`Self::retire_process_queue`] (plan 49k K3 item 1).
     ///
     /// # Arguments
     ///

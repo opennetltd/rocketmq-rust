@@ -259,8 +259,9 @@ const LOCAL_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_mil
 /// Ceiling on that wait, so repeated attempts cannot dominate the session they belong to.
 const MAX_LOCAL_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// Attempts this pass makes before it accepts that the write is not going to land and reports the
-/// blocker instead. Bounded so an unrecoverable fault stays Blocked without spinning.
-const MAX_LOCAL_PERSIST_RETRIES: u32 = 8;
+/// blocker instead. Bounded so an unrecoverable fault stays Blocked without spinning. A
+/// retirement's own persistence retry uses the same schedule (plan 49k K2 item 4).
+pub(crate) const MAX_LOCAL_PERSIST_RETRIES: u32 = 8;
 
 /// Backoff before attempt number `attempt` (0-based) of an unfinished local offset write: doubling
 /// from the first wait up to its ceiling, which it reaches and then holds at.

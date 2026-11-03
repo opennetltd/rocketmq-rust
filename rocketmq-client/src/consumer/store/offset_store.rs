@@ -76,6 +76,23 @@ pub(crate) fn offset_rpc_timeout(remaining: std::time::Duration) -> u64 {
 /// One remote offset write is a single best-effort RPC; five seconds is the historical ceiling.
 pub(crate) const OFFSET_WRITE_TIMEOUT_MILLIS: u64 = 5_000;
 
+/// What one queue's offset write proved before a retirement was allowed to forget it (plan 49k K2
+/// item 1). The void `persist` API stays for callers that only schedule a write; retiring a queue
+/// is not one of them, because erasing an offset whose final write failed destroys the only copy
+/// this SDK could still retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetWrite {
+    /// A local file holds this queue's offset and its writer finished.
+    Proven,
+    /// The write failed or its I/O cannot be trusted. The memory copy is untouched and this queue
+    /// is now carried by every later whole-table write, so a healed filesystem retries it even
+    /// when no assignment names it any more (plan 49k K2 item 2).
+    Deferred,
+    /// No local file backs this store - broker offsets only - where the existing bounded
+    /// best-effort policy applies and there is nothing local to prove.
+    NoLocalState,
+}
+
 pub struct OffsetStore {
     remote_broker_offset_store: Option<RemoteBrokerOffsetStore>,
     local_file_offset_store: Option<LocalFileOffsetStore>,
@@ -221,6 +238,24 @@ impl OffsetStore {
         }
         if let Some(ref mut store) = self.local_file_offset_store {
             store.persist(mq).await;
+        }
+    }
+
+    /// Write one queue's offsets on the way to retiring it, and report what that write proved
+    /// (plan 49k K2 item 1). Nothing is forgotten here: a replacement installation can appear while
+    /// the write runs, and [`Self::remove_offset`] is only called once the retirement has rechecked
+    /// that it still owns the queue.
+    ///
+    /// A store with both halves is judged by its file. The broker half keeps its existing
+    /// best-effort semantics - making a broker acknowledgement a precondition of retiring a
+    /// queue would let one unbounded RPC hold a queue's transition open forever.
+    pub(crate) async fn persist_for_retirement(&mut self, mq: &MessageQueue) -> OffsetWrite {
+        if let Some(ref mut store) = self.remote_broker_offset_store {
+            store.persist(mq).await;
+        }
+        match self.local_file_offset_store.as_mut() {
+            Some(local) => local.persist_with_proof(mq).await,
+            None => OffsetWrite::NoLocalState,
         }
     }
 

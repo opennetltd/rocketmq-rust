@@ -57,18 +57,49 @@ impl ConsumerWork {
     /// The task belongs to this SDK, not to whoever asked for the work: a caller whose future is
     /// cancelled leaves it running, and shutdown still joins it because the tracker token - not the
     /// caller - is what the drain waits on.
-    pub(crate) fn spawn_draining_owned(
+    /// The same admission and drain guarantee for an operation that reports a result (plan 49k K3
+    /// item 1): a rebalance pass has to know whether the retirement it started really removed its
+    /// queue before it can report the assignment as changed.
+    pub(crate) fn spawn_draining_owned<T>(
         &self,
         handle: &Handle,
-        future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
-    ) -> Result<JoinHandle<()>, Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
+    ) -> Result<JoinHandle<T>, Pin<Box<dyn Future<Output = T> + Send + 'static>>>
+    where
+        T: Send + 'static,
+    {
         let Some(token) = self.enter() else {
             return Err(future);
         };
         Ok(handle.spawn(async move {
+            // Held until the operation has fully finished, including the moment its result is
+            // produced, so watching the result never means the drain stopped counting this task.
             let _token = token;
-            future.await;
+            future.await
         }))
+    }
+
+    /// Hand work to the drain although admission has already closed (plan 49k K3 item 2).
+    ///
+    /// A retirement's persistence is required I/O for an offset this SDK still owns. Running it on
+    /// a future nobody tracks would lose the write the moment its caller was cancelled, and
+    /// dropping it would lose the offset outright, so neither answer is available here. Closing
+    /// admission stops new *optional* consumer work; the tracker keeps counting what it is
+    /// given afterwards, which is what lets a cleanup session that waits on `wait()` join this
+    /// task too.
+    pub(crate) fn spawn_drained_after_close<T>(
+        &self,
+        handle: &Handle,
+        future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
+    ) -> JoinHandle<T>
+    where
+        T: Send + 'static,
+    {
+        let token = self.tasks.token();
+        handle.spawn(async move {
+            let _token = token;
+            future.await
+        })
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {

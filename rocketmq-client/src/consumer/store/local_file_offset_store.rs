@@ -35,6 +35,7 @@ use crate::consumer::store::controllable_offset::ControllableOffset;
 use crate::consumer::store::offset_serialize::OffsetSerialize;
 use crate::consumer::store::offset_serialize_wrapper::OffsetSerializeWrapper;
 use crate::consumer::store::offset_store::OffsetStoreTrait;
+use crate::consumer::store::offset_store::OffsetWrite;
 use crate::consumer::store::offset_store::PersistSummary;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::factory::mq_client_instance::MQClientInstance;
@@ -60,6 +61,11 @@ pub struct LocalFileOffsetStore {
     offset_table: Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>>,
     file_io: Arc<Mutex<()>>,
     io_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Queues whose last local write was never proven (plan 49k K2 item 2). Their memory copy is
+    /// what a retirement could not yet afford to lose, so every later whole-table write re-includes
+    /// these keys - including a pass whose assigned set is empty, which is how a healed filesystem
+    /// retries an offset for a queue no assignment names any more.
+    offsets_unproven: Arc<Mutex<HashSet<MessageQueue>>>,
 }
 
 impl LocalFileOffsetStore {
@@ -78,6 +84,7 @@ impl LocalFileOffsetStore {
             offset_table: Arc::new(Mutex::new(HashMap::new())),
             file_io: Arc::new(Mutex::new(())),
             io_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            offsets_unproven: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -135,6 +142,26 @@ impl LocalFileOffsetStore {
         // The blocking closure owns the guard even if its awaiting future was cancelled.
         let _guard = self.file_io.lock().await;
         !self.io_failed.load(Ordering::Acquire)
+    }
+
+    /// Write one queue's offset and report what that write proved, forgetting nothing (plan 49k K2
+    /// item 1). A retirement needs this instead of the void `persist`: erasing an offset whose
+    /// final write failed destroys the only copy this SDK can still retry.
+    ///
+    /// A failed attempt keeps the memory copy exactly as it was and records this queue among the
+    /// offsets every later whole-table write re-includes, so neither an empty assignment set nor a
+    /// pass that no longer sees the queue can forget it.
+    pub(crate) async fn persist_with_proof(&mut self, mq: &MessageQueue) -> OffsetWrite {
+        let summary = self.persist_all(&HashSet::from([mq.clone()]), &|| false).await;
+        if summary.succeeded >= 1 && self.io_complete().await {
+            return OffsetWrite::Proven;
+        }
+        error!(
+            "local offset write for {} is not proven ({}); retaining it for a later pass",
+            mq, summary
+        );
+        self.offsets_unproven.lock().await.insert(mq.clone());
+        OffsetWrite::Deferred
     }
 }
 
@@ -206,16 +233,20 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> PersistSummary {
         let mut summary = PersistSummary::default();
-        if mqs.is_empty() {
+        // An offset whose write was never proven is written again whatever the assignment says
+        // (plan 49k K2 item 2); it is part of this table's durable state until a write proves it.
+        let unproven: HashSet<MessageQueue> = self.offsets_unproven.lock().await.iter().cloned().collect();
+        let keys: HashSet<MessageQueue> = mqs.union(&unproven).cloned().collect();
+        if keys.is_empty() {
             return summary;
         }
         // One guard covers the whole table, so cancellation is honoured before the write starts and
         // never during it: an active local writer is always allowed to finish (plan 49a F10).
         if cancelled() {
-            summary.skipped += mqs.len() as u64;
+            summary.skipped += keys.len() as u64;
             return summary;
         }
-        let count = mqs.len() as u64;
+        let count = keys.len() as u64;
         summary.attempted = count;
         let guard = self.file_io.clone().lock_owned().await;
         let offsets = self
@@ -223,7 +254,7 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
             .lock()
             .await
             .iter()
-            .filter(|(mq, _)| mqs.contains(mq))
+            .filter(|(mq, _)| keys.contains(mq))
             .map(|(mq, offset)| (mq.clone(), AtomicI64::new(offset.get_offset())))
             .collect::<HashMap<_, _>>();
         let path = self.store_path.clone();
@@ -244,6 +275,10 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         .await;
         if matches!(result, Ok(Ok(()))) {
             summary.succeeded += count;
+            // Every retained offset this pass was asked to carry is on disk now - including the
+            // ones no assignment names any more - so none of them stays in debt (plan
+            // 49k K2 item 2).
+            self.offsets_unproven.lock().await.clear();
         } else {
             error!("persistAll consumer offset failed: {}", self.store_path);
             summary.failed += count;
@@ -258,6 +293,10 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
     async fn remove_offset(&self, mq: &MessageQueue) {
         let mut offset_table = self.offset_table.lock().await;
         offset_table.remove(mq);
+        // Forgetting a queue's offset by request also ends its unproven debt: this call is the
+        // caller saying it no longer needs the value at all, which a deferred retirement never
+        // says.
+        self.offsets_unproven.lock().await.remove(mq);
         // Per-queue bookkeeping is routine: one line per revoked queue buries the summaries that
         // matter (plan 49a F10).
         debug!(
