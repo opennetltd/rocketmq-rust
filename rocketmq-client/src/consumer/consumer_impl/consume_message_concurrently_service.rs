@@ -485,17 +485,11 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
             );
             return;
         }
-        if !dispatch_to_consume {
-            // Nothing was scheduled for these messages; they stay in the process queue until a
-            // later submit dispatches them. Their pull-side ownership ends with this
-            // call - holding it would report a listener that has not been called as
-            // outstanding work.
-            debug!(
-                messages = queued,
-                "batch not dispatched, its messages wait in the process queue for the next submit"
-            );
-            return;
-        }
+        // ProcessQueue::put_message returns an orderly-consumption wake-up flag: it is true
+        // only when that queue first becomes consuming. Concurrent consumption schedules every
+        // newly pulled batch independently, including when this flag is false. Rejecting later
+        // batches strands their cached messages without a listener or accounting owner, eventually
+        // stopping pulls at the queue's flow-control threshold.
         let consume_batch_size = self.consumer_config.consume_message_batch_max_size;
         if msgs.len() <= consume_batch_size as usize {
             let owned = accounting.as_mut().and_then(|owner| owner.split_off(msgs.len()));
@@ -1240,5 +1234,87 @@ mod tests {
 
         let (failed, finalized) = partition_send_backs(Vec::new(), &[]);
         assert!(failed.is_empty() && finalized.is_empty());
+    }
+
+    struct CountingSuccess(StdArc<std::sync::atomic::AtomicU64>);
+
+    impl MessageListenerConcurrently for CountingSuccess {
+        fn consume_message(
+            &self,
+            msgs: &[&MessageExt],
+            _: &mut ConsumeConcurrentlyContext,
+        ) -> rocketmq_error::RocketMQResult<ConsumeConcurrentlyStatus> {
+            self.0.fetch_add(msgs.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)
+        }
+    }
+
+    async fn repeated_pull_batches_are_dispatched(model: MessageModel, label: &str) {
+        let mut fixture = Fixture::new(label, model, 3, Vec::new()).await;
+        let received = StdArc::new(std::sync::atomic::AtomicU64::new(0));
+        fixture.service.message_listener = StdArc::new(Box::new(CountingSuccess(received.clone())));
+        fixture.service.consumer_config.consume_message_batch_max_size = 2;
+        let mut expected = 0;
+        let mut drained = true;
+        for offsets in [vec![0], vec![1], vec![2, 3, 4]] {
+            let msgs = offsets
+                .into_iter()
+                .map(|offset| ArcMut::new(message(offset, 0)))
+                .collect::<Vec<_>>();
+            expected += msgs.len() as u64;
+            let dispatch = fixture.pq.put_message(msgs.clone()).await;
+            assert_eq!(dispatch, expected == 1, "put_message exposes an orderly wake-up flag");
+            let owner = fixture.push.progress.admit_batch(&fixture.mq, msgs.len());
+            fixture
+                .service
+                .submit_consume_request_accounted(
+                    fixture.service.clone(),
+                    msgs,
+                    fixture.pq.clone(),
+                    fixture.mq.clone(),
+                    dispatch,
+                    Some(owner),
+                )
+                .await;
+            drained = tokio::time::timeout(Duration::from_secs(1), async {
+                while received.load(std::sync::atomic::Ordering::SeqCst) != expected || fixture.pq.msg_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !drained {
+                break;
+            }
+        }
+        fixture.service.work.close();
+        fixture.service.work.wait().await;
+        let calls = received.load(std::sync::atomic::Ordering::SeqCst);
+        let cached = fixture.pq.msg_count();
+        let offset = fixture.memory_offset().await;
+        let progress = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        fixture.shutdown().await;
+        assert!(
+            drained,
+            "later pulled batch was not dispatched: received={calls}, expected={expected}, cached={cached}"
+        );
+        assert_eq!(calls, 5);
+        assert_eq!(cached, 0);
+        assert_eq!(offset, 5);
+        assert_eq!(progress.pending_delivery_msgs, 0);
+        assert_eq!(progress.accounting_underflows, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_broadcast_pull_batches_reach_the_listener() {
+        repeated_pull_batches_are_dispatched(MessageModel::Broadcasting, "continuous-broadcast").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_clustering_pull_batches_reach_the_listener() {
+        repeated_pull_batches_are_dispatched(MessageModel::Clustering, "continuous-clustering").await;
     }
 }
