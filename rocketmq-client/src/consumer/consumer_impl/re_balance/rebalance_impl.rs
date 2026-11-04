@@ -543,6 +543,12 @@ where
                     if !mq2push_assignment.contains_key(mq) {
                         pq.set_dropped(true);
                         remove_queue_map.insert(mq.clone(), pq.clone());
+                    } else if pq.is_dropped() {
+                        // A previous retirement may have exhausted its local persistence retries
+                        // while this queue stayed assigned. Retry the same owned retirement on an
+                        // ordinary pass; it will either retain the entry again or allow a fresh
+                        // process queue to be installed below once its offset is proven.
+                        remove_queue_map.insert(mq.clone(), pq.clone());
                     } else if pq.is_pull_expired() {
                         if let Some(sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
                             if sub_rebalance.consume_type() == ConsumeType::ConsumePassively {
@@ -841,6 +847,10 @@ where
                 if mq.get_topic() == topic {
                     if !mq_set.contains(mq) {
                         pq.set_dropped(true);
+                        remove_queue_map.insert(mq.clone(), pq.clone());
+                    } else if pq.is_dropped() {
+                        // Repair a dropped queue even when it is still assigned and its pull age
+                        // is fresh. Persistence may have healed since the previous pass.
                         remove_queue_map.insert(mq.clone(), pq.clone());
                     } else if pq.is_pull_expired() {
                         if let Some(sub_rebalance) = self.sub_rebalance_impl.as_mut().unwrap().upgrade() {
@@ -4200,5 +4210,541 @@ mod review49l {
         );
         assert!(clean, "cleanup proof stayed closed after every owed offset had landed");
         assert_eq!(on_disk, 7);
+    }
+}
+
+#[cfg(test)]
+mod review49m {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::consumer_impl::re_balance::rebalance_push_impl::review49k_cap_persist_attempts;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+    use std::time::Duration;
+
+    struct Fixture {
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        client: ArcMut<MQClientInstance>,
+        path: std::path::PathBuf,
+        q: MessageQueue,
+        pq: Arc<ProcessQueue>,
+    }
+    async fn fixture(label: &str) -> Fixture {
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49m-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        let client = MQClientInstance::new_arc(cc, 0, format!("review49m-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49m-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        local.review49e_path_and_lock(path.clone());
+        push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+        let q = MessageQueue::from_parts(format!("review49m-{label}"), "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .write()
+            .await
+            .insert(q.clone(), pq.clone());
+        push.note_queue_installed(&q, &pq);
+        push.offset_store.as_ref().unwrap().update_offset(&q, 7, false).await;
+        Fixture {
+            push,
+            client,
+            path,
+            q,
+            pq,
+        }
+    }
+    async fn cleanup(mut f: Fixture) {
+        f.push.work.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), f.push.work.wait()).await;
+        f.client.shutdown().await;
+        let _ = std::fs::remove_file(&f.path);
+        let _ = std::fs::remove_dir(&f.path);
+        let _ = std::fs::remove_file(f.path.with_extension("json.bak"));
+    }
+    async fn advancing_offset(late: bool) {
+        let f = fixture(if late { "late-offset" } else { "early-offset" }).await;
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        if !late {
+            store.update_offset(&f.q, 99, true).await;
+        }
+        // The normal consume-result path holds this lock across its dropped check and update.
+        let commit_guard = if late {
+            Some(f.pq.commit_lock.lock().await)
+        } else {
+            None
+        };
+        if late {
+            assert!(!f.pq.is_dropped(), "commit must be admitted before retirement starts");
+        }
+        let (mut entered, release) = hold_next_write(&f.q);
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Box::pin(rebalance.remove_process_queue(&f.q, &f.pq));
+        let mut snapshot_before_commit = false;
+        if late {
+            tokio::select! {
+                r=&mut entered => { r.unwrap(); snapshot_before_commit = true; },
+                _=&mut retiring => panic!("retirement watcher ended before its active commit"),
+                _=tokio::time::sleep(Duration::from_millis(20))=>{}
+            }
+        }
+        if late {
+            store.update_offset(&f.q, 99, true).await;
+        }
+        drop(commit_guard);
+        if !snapshot_before_commit {
+            tokio::select! { r=&mut entered=>r.unwrap(), _=&mut retiring=>panic!("retirement missed its final snapshot"), _=tokio::time::sleep(Duration::from_secs(1))=>panic!("write hook was not reached") };
+        }
+        let before_release = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut retiring)
+            .await
+            .unwrap();
+        drop(retiring);
+        f.push.work.close();
+        tokio::time::timeout(Duration::from_secs(2), f.push.work.wait())
+            .await
+            .unwrap();
+        let memory = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        eprintln!(
+            "retirement offset: late={late} snapshot_before_commit={snapshot_before_commit} \
+             memory_before_release={before_release} memory_after={memory} disk={disk} proof={proof} epoch={epoch:?}"
+        );
+        cleanup(f).await;
+        assert_eq!(before_release, 99);
+        assert!(proof);
+        assert_eq!(
+            disk, 99,
+            "retirement erased a newer committed offset after proving only its older snapshot"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_must_preserve_an_offset_advanced_after_its_write_snapshot() {
+        advancing_offset(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_preserves_an_offset_advanced_before_its_write_snapshot() {
+        advancing_offset(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_pull_offset_correction_is_committed_under_the_retirement_barrier() {
+        let f = fixture("empty-pull-commit").await;
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        let mut push = f.push.clone();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49m-empty-pull"),
+            f.q.clone(),
+            f.pq.clone(),
+            7,
+        );
+        request.set_next_offset(99);
+        push.correct_tags_offset(&request).await;
+        assert_eq!(store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await, 99);
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        rebalance.remove_process_queue(&f.q, &f.pq).await;
+        let memory = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        cleanup(f).await;
+
+        assert_eq!(memory, -1);
+        assert_eq!(disk, 99, "retirement did not persist the empty-pull offset correction");
+        assert!(proof);
+        assert_eq!(epoch, None);
+    }
+
+    /// A queue-bound writer can be waiting for the same lock when retirement closes the queue.
+    /// Its final dropped check runs after it acquires the lock, so it must reject the old request
+    /// even though it reached the lock queue first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_pull_writer_queued_before_drop_revalidates_before_mutating_the_offset() {
+        let f = fixture("queued-empty-pull").await;
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        let mut push = f.push.clone();
+        let mut request = PullRequest::new(
+            CheetahString::from_static_str("review49m-queued-empty-pull"),
+            f.q.clone(),
+            f.pq.clone(),
+            7,
+        );
+        request.set_next_offset(99);
+        let commit_guard = f.pq.commit_lock.lock().await;
+        let mut correction = Box::pin(push.correct_tags_offset(&request));
+        tokio::select! {
+            biased;
+            _ = &mut correction => panic!("the queued empty-pull writer passed a held commit lock"),
+            _ = std::future::ready(()) => {}
+        }
+
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut retiring = Box::pin(rebalance.remove_process_queue(&f.q, &f.pq));
+        tokio::select! {
+            _ = &mut retiring => panic!("retirement finished while the commit lock was held"),
+            _ = async {
+                while !f.pq.is_dropped() {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        drop(commit_guard);
+        tokio::time::timeout(Duration::from_secs(2), &mut correction)
+            .await
+            .expect("the queued empty-pull writer did not revalidate after acquiring the lock");
+        tokio::time::timeout(Duration::from_secs(2), &mut retiring)
+            .await
+            .expect("retirement did not complete after the rejected writer released the lock");
+        drop(retiring);
+
+        let memory = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        cleanup(f).await;
+        assert_eq!(memory, -1);
+        assert_eq!(disk, 7, "a dropped pull callback recreated a newer offset");
+        assert!(proof);
+        assert_eq!(epoch, None);
+    }
+
+    /// The observer may stop watching while the commit barrier is held. The SDK-owned retirement
+    /// still waits for the already-admitted commit, proves its value, and performs final cleanup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_retirement_observer_does_not_release_its_commit_barrier() {
+        let f = fixture("cancelled-observer").await;
+        let store = f.push.offset_store.as_ref().unwrap().clone();
+        let commit_guard = f.pq.commit_lock.lock().await;
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let retirement_mq = f.q.clone();
+        let retirement_pq = f.pq.clone();
+        let observer = tokio::spawn(async move {
+            rebalance.remove_process_queue(&retirement_mq, &retirement_pq).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !f.pq.is_dropped() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement did not reach its commit barrier");
+        observer.abort();
+        let _ = observer.await;
+
+        // This models the commit that had already passed its dropped check before retirement
+        // began. It owns the lock and completes before the retirement can take its final snapshot.
+        store.update_offset(&f.q, 99, true).await;
+        drop(commit_guard);
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transitions.retiring(&f.q) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the SDK-owned retirement stopped when its observer was cancelled");
+
+        let memory = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = f.push.progress.current_epoch(&f.q);
+        cleanup(f).await;
+        assert_eq!(memory, -1);
+        assert_eq!(
+            disk, 99,
+            "observer cancellation let retirement forget the admitted commit"
+        );
+        assert!(proof);
+        assert_eq!(epoch, None);
+    }
+
+    async fn healed_queue(unassign: bool) {
+        let f = fixture(if unassign {
+            "healed-unassigned"
+        } else {
+            "healed-assigned"
+        })
+        .await;
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        review49k_cap_persist_attempts(&f.q, 1);
+        std::fs::create_dir(&f.path).unwrap();
+        rebalance.remove_process_queue(&f.q, &f.pq).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transitions.retiring(&f.q) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let exhausted = f.pq.is_dropped() && table.read().await.contains_key(&f.q);
+        let fresh = !f.pq.is_pull_expired();
+        let retry_changed = rebalance
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance(f.q.get_topic(), &HashSet::from([f.q.clone()]), false)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transitions.retiring(&f.q) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a persistent local failure stranded the ordinary retry pass");
+        let retained = table
+            .read()
+            .await
+            .get(&f.q)
+            .is_some_and(|current| Arc::ptr_eq(current, &f.pq));
+        let retained_offset = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let retained_epoch = f.push.progress.current_epoch(&f.q);
+        assert!(!retry_changed && retained && f.pq.is_dropped());
+        assert_eq!(retained_offset, 7, "a repeated failed pass lost its retryable offset");
+        assert_eq!(retained_epoch, Some(1), "a failed retry revoked the old acquisition");
+
+        std::fs::remove_dir(&f.path).unwrap();
+        store.persist_local(&HashSet::new()).await;
+        let proof = store.local_writer_finished().await;
+        let topic = f.q.get_topic().to_string();
+        if unassign {
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance(&topic, &HashSet::new(), false)
+                .await;
+        }
+        let changed = rebalance
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance(&topic, &HashSet::from([f.q.clone()]), false)
+            .await;
+        let current = table
+            .read()
+            .await
+            .get(&f.q)
+            .cloned()
+            .expect("the desired queue must end installed");
+        let dropped = current.is_dropped();
+        let epoch = f.push.progress.current_epoch(&f.q);
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        eprintln!(
+            "healed retirement: unassign={unassign} exhausted={exhausted} not_pull_expired={fresh} \
+             healed_proof={proof} changed={changed} dropped={dropped} epoch={epoch:?} disk={disk}"
+        );
+        cleanup(f).await;
+        assert!(exhausted && fresh && proof);
+        assert_eq!(disk, 7);
+        assert!(
+            !dropped,
+            "rebalance ignored a dropped desired queue even after its persistence fault healed"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_healed_retirement_must_recover_while_the_queue_stays_assigned() {
+        healed_queue(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_healed_retirement_recovers_after_explicit_unassignment() {
+        healed_queue(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_healed_dropped_queue_recovers_through_the_broker_assignment_path() {
+        let f = fixture("healed-broker-assignment").await;
+        let mut store = f.push.offset_store.as_ref().unwrap().clone();
+        let table = f.push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        review49k_cap_persist_attempts(&f.q, 1);
+        std::fs::create_dir(&f.path).unwrap();
+        let mut rebalance = f.push.rebalance_impl.clone();
+        rebalance.remove_process_queue(&f.q, &f.pq).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transitions.retiring(&f.q) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(f.pq.is_dropped());
+        assert!(table.read().await.contains_key(&f.q));
+        std::fs::remove_dir(&f.path).unwrap();
+        store.persist_local(&HashSet::new()).await;
+
+        let assignment = MessageQueueAssignment {
+            message_queue: Some(f.q.clone()),
+            mode: MessageRequestMode::Pull,
+            attachments: None,
+        };
+        let topic = CheetahString::from(f.q.get_topic().to_string());
+        let changed = rebalance
+            .rebalance_impl_inner
+            .update_message_queue_assignment(&topic, &HashSet::from([assignment]), false)
+            .await;
+        let replacement = table
+            .read()
+            .await
+            .get(&f.q)
+            .cloned()
+            .expect("the broker-assigned desired queue was not reinstalled");
+        let old_process_queue = f.pq.clone();
+        let epoch = f.push.progress.current_epoch(&f.q);
+        let disk = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+
+        // A late callback from the retired ProcessQueue must not rewrite the successor's offset.
+        let mut old_callback = PullRequest::new(
+            CheetahString::from_static_str("review49m-old-callback"),
+            f.q.clone(),
+            f.pq.clone(),
+            7,
+        );
+        old_callback.set_next_offset(99);
+        let mut push = f.push.clone();
+        push.correct_tags_offset(&old_callback).await;
+        let memory_after_old_callback = store.read_offset(&f.q, ReadOffsetType::ReadFromMemory).await;
+        let disk_after_old_callback = store.read_offset(&f.q, ReadOffsetType::ReadFromStore).await;
+        let old_dropped = old_process_queue.is_dropped();
+        cleanup(f).await;
+
+        assert!(changed);
+        assert!(!Arc::ptr_eq(&replacement, &old_process_queue));
+        assert!(old_dropped);
+        assert!(!replacement.is_dropped());
+        assert_eq!(epoch, Some(2));
+        assert_eq!(disk, 7, "the broker-assigned repair lost durable offset continuity");
+        assert_eq!(
+            memory_after_old_callback, -1,
+            "an old callback recreated memory for a retired key"
+        );
+        assert_eq!(disk_after_old_callback, 7);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_repeated_pass_defers_behind_one_active_recovery_writer_then_reinstalls_once() {
+        let f = fixture("active-recovery-writer").await;
+        let old_process_queue = f.pq.clone();
+        let desired = HashSet::from([f.q.clone()]);
+        let topic = f.q.get_topic().to_string();
+        let transitions = f.push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        f.pq.set_dropped(true);
+        let (mut entered, release) = hold_next_write(&f.q);
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let mut first_pass = Box::pin(
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance(&topic, &desired, false),
+        );
+        tokio::select! {
+            result = &mut first_pass => panic!("the first pass finished before its local writer entered: {result}"),
+            result = &mut entered => result.expect("the held retirement writer was cancelled"),
+        }
+        let first_changed = tokio::time::timeout(Duration::from_secs(1), &mut first_pass)
+            .await
+            .expect("the caller kept watching beyond its bounded retirement window");
+        drop(first_pass);
+        assert!(
+            !first_changed,
+            "a pass reported removal before its required write finished"
+        );
+        assert!(transitions.retiring(&f.q));
+
+        let second_changed = tokio::time::timeout(
+            Duration::from_millis(500),
+            rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance(&topic, &desired, false),
+        )
+        .await
+        .expect("a repeated pass blocked behind the first queue's active writer");
+        assert!(!second_changed, "a second pass duplicated an active retirement");
+        assert!(transitions.retiring(&f.q));
+        assert!(f.pq.is_dropped());
+        let still_installed = table_queue(&f.push, &f.q).await.unwrap();
+        assert!(Arc::ptr_eq(&old_process_queue, &still_installed));
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transitions.retiring(&f.q) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned retirement did not finish after its writer resumed");
+        assert!(table_queue(&f.push, &f.q).await.is_none());
+
+        let changed = rebalance
+            .rebalance_impl_inner
+            .update_process_queue_table_in_rebalance(&topic, &desired, false)
+            .await;
+        let replacement = table_queue(&f.push, &f.q)
+            .await
+            .expect("the desired queue was not installed after proof completed");
+        let epoch = f.push.progress.current_epoch(&f.q);
+        let disk = f
+            .push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .read_offset(&f.q, ReadOffsetType::ReadFromStore)
+            .await;
+        cleanup(f).await;
+        assert!(changed);
+        assert!(!Arc::ptr_eq(&replacement, &old_process_queue));
+        assert!(!replacement.is_dropped());
+        assert_eq!(epoch, Some(2));
+        assert_eq!(disk, 7);
+    }
+
+    async fn table_queue(push: &ArcMut<DefaultMQPushConsumerImpl>, mq: &MessageQueue) -> Option<Arc<ProcessQueue>> {
+        push.rebalance_impl
+            .rebalance_impl_inner
+            .process_queue_table
+            .read()
+            .await
+            .get(mq)
+            .cloned()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn healthy_desired_queues_remain_stable_across_repeated_passes() {
+        let f = fixture("healthy-repeat").await;
+        let desired = HashSet::from([f.q.clone()]);
+        let topic = f.q.get_topic().to_string();
+        let mut rebalance = f.push.rebalance_impl.clone();
+        let original_epoch = f.push.progress.current_epoch(&f.q);
+        for _ in 0..3 {
+            let changed = rebalance
+                .rebalance_impl_inner
+                .update_process_queue_table_in_rebalance(&topic, &desired, false)
+                .await;
+            assert!(!changed, "a healthy assigned queue was needlessly replaced");
+            let current = table_queue(&f.push, &f.q).await.unwrap();
+            assert!(Arc::ptr_eq(&current, &f.pq));
+            assert!(!current.is_dropped());
+            assert_eq!(f.push.progress.current_epoch(&f.q), original_epoch);
+        }
+        cleanup(f).await;
     }
 }
