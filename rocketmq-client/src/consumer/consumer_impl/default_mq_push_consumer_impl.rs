@@ -6256,7 +6256,7 @@ mod review49n {
 
     #[tokio::test(flavor = "current_thread")]
     async fn late_periodic_writers_wait_for_proof_and_skip_the_retired_value() {
-        use crate::consumer::store::local_file_offset_store::review49l::clear_holds;
+        use crate::consumer::store::local_file_offset_store::review49l::clear_holds_for;
         use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
         use crate::consumer::store::local_file_offset_store::review49n::hold_proof;
         let label = "late-writers";
@@ -6363,7 +6363,7 @@ mod review49n {
             result = &mut second => result.unwrap(),
             entered = &mut stale_q_write => panic!("a second late periodic snapshot included the retired value: {entered:?}"),
         }
-        clear_holds();
+        clear_holds_for(&q);
 
         let stale_assignment = store
             .persist_local(&HashSet::from([q.clone(), sibling.clone()]))

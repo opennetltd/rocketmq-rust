@@ -619,9 +619,12 @@ pub(crate) mod review49l {
         (entered_rx, release_tx)
     }
 
-    /// Forget every armed hold, so a test that gave up early cannot park a later one.
-    pub(crate) fn clear_holds() {
-        HOLDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    /// Forget an unused hold owned by one fixture without touching other parallel tests.
+    pub(crate) fn clear_holds_for(queue: &MessageQueue) {
+        HOLDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(queue);
     }
 
     /// Another handle on the same store state, which is how two writers are made to overlap on one
