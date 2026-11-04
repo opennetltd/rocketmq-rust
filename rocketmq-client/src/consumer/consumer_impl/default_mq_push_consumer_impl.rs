@@ -6256,10 +6256,13 @@ mod review49n {
 
     #[tokio::test(flavor = "current_thread")]
     async fn late_periodic_writers_wait_for_proof_and_skip_the_retired_value() {
+        review49o_late_periodic_fixture("late-writers").await;
+    }
+
+    async fn review49o_late_periodic_fixture(label: &str) {
         use crate::consumer::store::local_file_offset_store::review49l::clear_holds_for;
         use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
         use crate::consumer::store::local_file_offset_store::review49n::hold_proof;
-        let label = "late-writers";
         let cc = ClientConfig::default();
         let group = CheetahString::from_string(format!("review49n-{label}"));
         let cfg = ArcMut::new(ConsumerConfig {
@@ -6399,7 +6402,10 @@ mod review49n {
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_retirement_without_a_cached_offset_does_not_open_the_file() {
-        let label = format!("review49n-no-offset-{}", std::process::id());
+        review49o_no_offset_fixture(format!("review49n-no-offset-{}", std::process::id())).await;
+    }
+
+    async fn review49o_no_offset_fixture(label: String) {
         let cc = ClientConfig::default();
         let group = CheetahString::from_string(label.clone());
         let cfg = ArcMut::new(ConsumerConfig {
@@ -6474,5 +6480,45 @@ mod review49n {
     #[tokio::test(flavor = "current_thread")]
     async fn a_successful_captured_periodic_write_preserves_local_proof() {
         captured_periodic_write(false).await;
+    }
+
+    // Plan 49o: an unrelated test can arm its snapshot before another fixture cleans up.
+    // Run the real 49n fixture before observing the unrelated gate.
+    #[test]
+    fn review49o_late_periodic_cleanup_preserves_another_queues_snapshot_gate() {
+        review49o_unrelated_snapshot_gate(true);
+    }
+
+    #[test]
+    fn review49o_no_offset_cleanup_preserves_another_queues_snapshot_gate() {
+        review49o_unrelated_snapshot_gate(false);
+    }
+
+    fn review49o_unrelated_snapshot_gate(late_periodic: bool) {
+        use crate::consumer::store::local_file_offset_store::review49l::clear_holds_for;
+        use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let label = if late_periodic { "late-periodic" } else { "no-offset" };
+        let q = MessageQueue::from_parts(format!("review49o-unrelated-{label}"), "broker", 37);
+        let (mut entered, release) = hold_next_write(&q);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            if late_periodic {
+                review49o_late_periodic_fixture("review49o-late-periodic-fixture").await;
+            } else {
+                review49o_no_offset_fixture(format!("review49o-no-offset-fixture-{}", std::process::id())).await;
+            }
+        });
+        let result = entered.try_recv();
+        clear_holds_for(&q);
+        drop(release);
+        assert!(
+            matches!(result, Err(TryRecvError::Empty)),
+            "another fixture deleted this queue's armed snapshot gate: {result:?}"
+        );
     }
 }

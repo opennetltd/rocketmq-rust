@@ -788,6 +788,64 @@ pub(crate) mod review49l {
     async fn a_fresh_success_carries_and_clears_the_recorded_debt() {
         debt_snapshot(false).await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_hold_cleanup_preserves_another_queues_writer_gate() {
+        let label = format!("review49o-protocol-{}", std::process::id());
+        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
+        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        store.review49e_path_and_lock(path.clone());
+
+        let owner = MessageQueue::from_parts(format!("{label}-owner"), "broker", 0);
+        let other = MessageQueue::from_parts(format!("{label}-other"), "broker", 1);
+        store.update_offset(&other, 77, false).await;
+        let (mut owner_entered, owner_release) = hold_next_write(&owner);
+        let (mut other_entered, other_release) = hold_next_write(&other);
+
+        clear_holds_for(&owner);
+        let owner_was_removed = matches!(
+            owner_entered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        drop(owner_release);
+        assert!(owner_was_removed, "the owning queue's unused gate was not removed");
+        assert!(
+            matches!(
+                other_entered.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "scoped cleanup removed another queue's gate"
+        );
+
+        let mut writer_store = shared_handle(&store);
+        let selected = HashSet::from([other.clone()]);
+        let mut writer = tokio::spawn(async move { writer_store.persist_all(&selected, &|| false).await });
+        tokio::time::timeout(Duration::from_secs(1), &mut other_entered)
+            .await
+            .expect("the unrelated writer never reached its snapshot gate")
+            .expect("the unrelated writer gate was cancelled");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut writer)
+                .await
+                .is_err(),
+            "the unrelated writer did not remain parked until release"
+        );
+        other_release.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("the unrelated writer did not finish after release")
+            .unwrap();
+        assert_eq!((outcome.attempted, outcome.succeeded), (1, 1));
+        assert_eq!(store.read_offset(&other, ReadOffsetType::ReadFromStore).await, 77);
+        clear_holds_for(&owner);
+        clear_holds_for(&other);
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    }
 }
 
 #[cfg(test)]
