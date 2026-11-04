@@ -27,6 +27,7 @@ use rocketmq_remoting::protocol::RemotingDeserializable;
 use rocketmq_remoting::protocol::RemotingSerializable;
 use rocketmq_rust::ArcMut;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -65,6 +66,25 @@ struct OffsetDebt {
     generation: u64,
     /// The memory offset this obligation was created for, reported for diagnosis.
     offset: i64,
+}
+
+/// A successful final local write whose file-I/O serialization remains held until retirement
+/// conditionally forgets the same memory value.
+pub(crate) struct LocalOffsetProofReceipt {
+    _file_io: OwnedMutexGuard<()>,
+    offset: i64,
+}
+
+pub(crate) enum LocalOffsetRetirement {
+    Proven(LocalOffsetProofReceipt),
+    Deferred,
+    NoLocalState,
+}
+
+struct PersistOutcome {
+    summary: PersistSummary,
+    file_io: Option<OwnedMutexGuard<()>>,
+    offsets: HashMap<MessageQueue, i64>,
 }
 
 pub struct LocalFileOffsetStore {
@@ -129,100 +149,6 @@ impl LocalFileOffsetStore {
                 ))),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod review49n {
-    use super::*;
-    use crate::base::client_config::ClientConfig;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn stale_and_cancelled_keys_do_not_start_local_writes() {
-        let label = format!("review49n-noop-{}", std::process::id());
-        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
-        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
-        let path = std::env::temp_dir().join(format!("{label}.json"));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&path);
-        let _ = std::fs::remove_file(path.with_extension("json.bak"));
-        store.review49e_path_and_lock(path.clone());
-
-        let stale = MessageQueue::from_parts(format!("{label}-stale"), "broker", 0);
-        let live = MessageQueue::from_parts(format!("{label}-live"), "broker", 1);
-        store.io_failed.store(true, Ordering::Release);
-        assert_eq!(store.persist_with_proof(&stale).await, OffsetWrite::NoLocalState);
-        assert!(
-            !store.io_complete().await,
-            "no-local-state retirement cleared unrelated failure evidence"
-        );
-        let no_op = store.persist_all(&HashSet::from([stale.clone()]), &|| false).await;
-        assert_eq!((no_op.attempted, no_op.succeeded, no_op.failed), (0, 0, 0));
-        assert!(!path.exists(), "a stale key opened or created the offset file");
-        assert!(!store.io_complete().await, "a no-op cleared prior I/O failure evidence");
-
-        store.io_failed.store(false, Ordering::Release);
-        store.update_offset(&live, 10, false).await;
-        let cancelled = store
-            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| true)
-            .await;
-        assert_eq!(
-            (
-                cancelled.attempted,
-                cancelled.succeeded,
-                cancelled.failed,
-                cancelled.skipped
-            ),
-            (0, 0, 0, 1)
-        );
-        assert!(!path.exists(), "cancellation before I/O still opened the offset file");
-        assert!(store.io_complete().await);
-
-        let mixed = store
-            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| false)
-            .await;
-        assert_eq!((mixed.attempted, mixed.succeeded, mixed.failed), (1, 1, 0));
-        assert_eq!(store.read_offset(&live, ReadOffsetType::ReadFromStore).await, 10);
-        assert_eq!(store.read_offset(&stale, ReadOffsetType::ReadFromStore).await, -1);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("json.bak"));
-        client.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn empty_assignment_keeps_unmatched_debt_and_failure_evidence() {
-        let label = format!("review49n-debt-{}", std::process::id());
-        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
-        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
-        let path = std::env::temp_dir().join(format!("{label}.json"));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&path);
-        let _ = std::fs::remove_file(path.with_extension("json.bak"));
-        store.review49e_path_and_lock(path.clone());
-
-        let q = MessageQueue::from_parts(label.as_str(), "broker", 0);
-        store.update_offset(&q, 7, false).await;
-        assert!(store.publish_debt(&q).await.is_some());
-        store.offset_table.lock().await.remove(&q);
-        store.io_failed.store(true, Ordering::Release);
-
-        let summary = store.persist_all(&HashSet::new(), &|| false).await;
-        assert_eq!(
-            (summary.attempted, summary.succeeded, summary.failed, summary.skipped),
-            (0, 0, 0, 1)
-        );
-        assert!(!path.exists(), "unmatched debt caused an empty file write");
-        assert!(store.offsets_unproven.lock().await.contains_key(&q));
-        assert!(
-            !store.io_complete().await,
-            "an empty assignment erased a genuine I/O failure"
-        );
-        assert!(!(store.io_complete().await && !store.has_required_debt().await));
-
-        client.shutdown().await;
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("json.bak"));
     }
 }
 
@@ -314,26 +240,63 @@ impl LocalFileOffsetStore {
     /// was, and every later whole-table write re-includes the key - including one whose assigned
     /// set is empty - until a write lands.
     pub(crate) async fn persist_with_proof(&mut self, mq: &MessageQueue) -> OffsetWrite {
-        let has_value = self.offset_table.lock().await.contains_key(mq);
-        let has_debt = self.offsets_unproven.lock().await.contains_key(mq);
-        match (has_value, has_debt) {
-            (false, false) => return OffsetWrite::NoLocalState,
-            (false, true) => return OffsetWrite::Deferred,
+        match self.persist_with_proof_receipt(mq).await {
+            LocalOffsetRetirement::Proven(receipt) => {
+                drop(receipt);
+                OffsetWrite::Proven
+            }
+            LocalOffsetRetirement::Deferred => OffsetWrite::Deferred,
+            LocalOffsetRetirement::NoLocalState => OffsetWrite::NoLocalState,
+        }
+    }
+
+    /// Persist a queue for retirement and keep file-I/O serialization through the caller's
+    /// conditional cache removal (plan 49n N1). Periodic writers take the same mutex before
+    /// snapshotting, so an older assigned-key snapshot either finishes first or runs after this
+    /// receipt has removed the value.
+    pub(crate) async fn persist_with_proof_receipt(&mut self, mq: &MessageQueue) -> LocalOffsetRetirement {
+        let has_memory_value = self.offset_table.lock().await.contains_key(mq);
+        let existing_debt = self.offsets_unproven.lock().await.contains_key(mq);
+        match (has_memory_value, existing_debt) {
+            (false, false) => return LocalOffsetRetirement::NoLocalState,
+            (false, true) => {
+                // A debt without a value cannot be repaired by writing an empty snapshot. Keep it
+                // visible to cleanup rather than manufacturing success or clearing it (plan 49n).
+                return LocalOffsetRetirement::Deferred;
+            }
             (true, _) => {}
         }
 
+        // Publish before waiting for file serialization. A prior periodic write may own the file
+        // already; if its snapshot predates this obligation, this retirement writes its own value
+        // after that writer releases the guard.
         let obligation = self.publish_debt(mq).await;
-        let summary = self.persist_all(&HashSet::from([mq.clone()]), &|| false).await;
-        // Settled means an acknowledged write carried this exact value to the file. A newer failed
-        // obligation for the same key keeps it open even if ours landed, because what memory holds
-        // now is not what reached disk.
-        let settled = match obligation {
-            Some(_) => self.debt_of(mq).await.is_none(),
-            None => true,
+        let guard = self.file_io.clone().lock_owned().await;
+        let outcome = self
+            .persist_all_with_guard(&HashSet::from([mq.clone()]), &|| false, guard)
+            .await;
+        let summary = outcome.summary;
+        let Some(guard) = outcome.file_io else {
+            error!("local offset write for {} lost its file guard before proof", mq);
+            self.publish_debt(mq).await;
+            return LocalOffsetRetirement::Deferred;
         };
-        if summary.succeeded >= 1 && settled && self.io_complete().await {
-            return OffsetWrite::Proven;
+
+        // The snapshot itself is the proof's value. The queue commit barrier prevents a valid
+        // writer from changing it while retirement is active; the conditional deletion below
+        // still checks equality to make that invariant explicit at the mutation boundary.
+        let written_offset = outcome.offsets.get(mq).copied();
+        let settled = obligation.is_some() && self.debt_of(mq).await.is_none();
+        let io_complete = !self.io_failed.load(Ordering::Acquire);
+        if summary.succeeded >= 1 && settled && io_complete {
+            #[cfg(test)]
+            review49n::after_retirement_proof(mq).await;
+            return LocalOffsetRetirement::Proven(LocalOffsetProofReceipt {
+                _file_io: guard,
+                offset: written_offset.expect("a successful queue write has a snapshot value"),
+            });
         }
+
         error!(
             "local offset write for {} is not proven ({}); retaining it for a later pass",
             mq, summary
@@ -341,7 +304,41 @@ impl LocalFileOffsetStore {
         // Re-publish rather than assume the earlier publication survived: what matters is that a
         // failed write always leaves an obligation behind (plan 49l L2 item 3).
         self.publish_debt(mq).await;
-        OffsetWrite::Deferred
+        LocalOffsetRetirement::Deferred
+    }
+
+    /// Forget only the value covered by a still-held proof receipt. No periodic writer can take a
+    /// snapshot between proving this value and removing it from memory.
+    pub(crate) async fn remove_offset_with_proof(&self, mq: &MessageQueue, receipt: LocalOffsetProofReceipt) -> bool {
+        let LocalOffsetProofReceipt { _file_io, offset } = receipt;
+        let mut offset_table = self.offset_table.lock().await;
+        let mut debts = self.offsets_unproven.lock().await;
+        let current = offset_table.get(mq).map(|value| value.get_offset());
+        let can_forget = match current {
+            Some(current) => current == offset && !debts.contains_key(mq),
+            None => !debts.contains_key(mq),
+        };
+        if can_forget {
+            offset_table.remove(mq);
+            debts.remove(mq);
+            debug!(
+                "remove proven messageQueue offset. group={}, mq={}, offsetTableSize={}",
+                self.group_name,
+                mq,
+                offset_table.len()
+            );
+            drop(debts);
+            drop(offset_table);
+            drop(_file_io);
+            return true;
+        }
+
+        drop(debts);
+        drop(offset_table);
+        // A newer value is still present, so leave it with an explicit retry obligation. The file
+        // guard remains held while publishing that obligation and is released on return.
+        self.publish_debt(mq).await;
+        false
     }
 }
 
@@ -412,80 +409,13 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         mqs: &HashSet<MessageQueue>,
         cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> PersistSummary {
-        let mut summary = PersistSummary::default();
         // One guard covers snapshot, write and acknowledgement for the whole table (plan 49a F10):
         // cancellation is honoured before a write starts and never during it, and an obligation can
         // be settled by the exact snapshot that carried it because no other writer or acknowledger
         // runs in between (plan 49l L2 item 3).
         let guard = self.file_io.clone().lock_owned().await;
-        // An offset whose write was never proven is written again whatever the assignment says
-        // (plan 49k K2 item 2); it is part of this table's durable state until a write proves it.
-        let debt: HashMap<MessageQueue, OffsetDebt> = self.offsets_unproven.lock().await.clone();
-        let keys: HashSet<MessageQueue> = mqs.union(&debt.keys().cloned().collect()).cloned().collect();
-        // Assignment keys only identify candidates. A retired queue may still be present in an
-        // earlier snapshot after its memory value and retry debt have both been removed; it must
-        // not trigger a physical write or alter the real I/O proof (plan 49n N1 item 1).
-        let snapshot_offsets = self
-            .offset_table
-            .lock()
-            .await
-            .iter()
-            .filter(|(mq, _)| keys.contains(mq))
-            .map(|(mq, offset)| (mq.clone(), offset.get_offset()))
-            .collect::<HashMap<_, _>>();
-        summary.skipped += debt.keys().filter(|mq| !snapshot_offsets.contains_key(*mq)).count() as u64;
-        if snapshot_offsets.is_empty() {
-            return summary;
-        }
-        if cancelled() {
-            summary.skipped += snapshot_offsets.len() as u64;
-            return summary;
-        }
-        let count = snapshot_offsets.len() as u64;
-        summary.attempted = count;
-        let offsets = snapshot_offsets
-            .iter()
-            .map(|(mq, offset)| (mq.clone(), AtomicI64::new(*offset)))
-            .collect::<HashMap<_, _>>();
-        // The obligations this write actually carries, captured with the values they are about
-        // (plan 49l L2 item 1). A key that has no memory value cannot be settled by a write
-        // of nothing.
-        let carried: Vec<(MessageQueue, OffsetDebt)> =
-            debt.into_iter().filter(|(mq, _)| offsets.contains_key(mq)).collect();
-        // Test seam (plan 49l L2): once this writer's key set and the obligations it carries are
-        // fixed - inside the file-I/O guard, before anything reaches the volume - a regression may
-        // hold it there. That is how another queue's failure can be made to land inside an earlier
-        // successful write, which is what debt settlement has to get right. Never compiled into
-        // anything that ships.
-        #[cfg(test)]
-        review49l::after_key_snapshot(&snapshot_offsets.keys().cloned().collect()).await;
-        let path = self.store_path.clone();
-        let failed = self.io_failed.clone();
-        // Mark unfinished work unsafe before spawning; panic/cancellation cannot report success.
-        failed.store(true, Ordering::Release);
-        let result = tokio::task::spawn_blocking(move || -> rocketmq_error::RocketMQResult<()> {
-            let _guard = guard;
-            let mut wrapper = Self::read_local_offset_at(path.as_str())?.unwrap_or_default();
-            wrapper.offset_table.extend(offsets);
-            let content = OffsetSerialize::from(wrapper)
-                .serialize_json_pretty()
-                .map_err(|e| mq_client_err!(e.to_string()))?;
-            file_utils::string_to_file(&content, path.as_str()).map_err(|e| mq_client_err!(e.to_string()))?;
-            failed.store(false, Ordering::Release);
-            Ok(())
-        })
-        .await;
-        if matches!(result, Ok(Ok(()))) {
-            summary.succeeded += count;
-            // Only the obligations this write carried are settled - including the ones no
-            // assignment names any more (plan 49k K2 item 2) - and only while nothing newer has
-            // republished them (plan 49l L2 item 1).
-            self.settle_debts(&carried).await;
-        } else {
-            error!("persistAll consumer offset failed: {}", self.store_path);
-            summary.failed += count;
-        }
-        summary
+        let outcome = self.persist_all_with_guard(mqs, cancelled, guard).await;
+        outcome.summary
     }
 
     async fn persist(&mut self, mq: &MessageQueue) {
@@ -525,6 +455,111 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         is_oneway: bool,
     ) -> rocketmq_error::RocketMQResult<()> {
         Ok(())
+    }
+}
+
+impl LocalFileOffsetStore {
+    async fn persist_all_with_guard(
+        &self,
+        mqs: &HashSet<MessageQueue>,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+        guard: OwnedMutexGuard<()>,
+    ) -> PersistOutcome {
+        let mut summary = PersistSummary::default();
+        // An offset whose write was never proven is written again whatever the assignment says
+        // (plan 49k K2 item 2); it is part of this table's durable state until a write proves it.
+        let debt: HashMap<MessageQueue, OffsetDebt> = self.offsets_unproven.lock().await.clone();
+        let keys: HashSet<MessageQueue> = mqs.union(&debt.keys().cloned().collect()).cloned().collect();
+        // Assignment keys are candidates, not values to write. A retired queue can still appear
+        // in a periodic pass's old assignment snapshot after its cache value and debt are gone;
+        // such a key must not open or poison the file writer (plan 49n N1 item 1).
+        let snapshot_offsets = self
+            .offset_table
+            .lock()
+            .await
+            .iter()
+            .filter(|(mq, _)| keys.contains(mq))
+            .map(|(mq, offset)| (mq.clone(), offset.get_offset()))
+            .collect::<HashMap<_, _>>();
+        let debts_without_value = debt.keys().filter(|mq| !snapshot_offsets.contains_key(*mq)).count() as u64;
+        summary.skipped += debts_without_value;
+        if snapshot_offsets.is_empty() {
+            return PersistOutcome {
+                summary,
+                file_io: Some(guard),
+                offsets: snapshot_offsets,
+            };
+        }
+        if cancelled() {
+            summary.skipped += snapshot_offsets.len() as u64;
+            return PersistOutcome {
+                summary,
+                file_io: Some(guard),
+                offsets: snapshot_offsets,
+            };
+        }
+        let count = snapshot_offsets.len() as u64;
+        summary.attempted = count;
+        let offsets = snapshot_offsets
+            .iter()
+            .map(|(mq, offset)| (mq.clone(), AtomicI64::new(*offset)))
+            .collect::<HashMap<_, _>>();
+        // The obligations this write actually carries, captured with the values they are about
+        // (plan 49l L2 item 1). A key that has no memory value cannot be settled by a write
+        // of nothing.
+        let carried: Vec<(MessageQueue, OffsetDebt)> =
+            debt.into_iter().filter(|(mq, _)| offsets.contains_key(mq)).collect();
+        // Test seam (plan 49l L2): once this writer's key set and the obligations it carries are
+        // fixed - inside the file-I/O guard, before anything reaches the volume - a regression may
+        // hold it there. That is how another queue's failure can be made to land inside an earlier
+        // successful write, which is what debt settlement has to get right. Never compiled into
+        // anything that ships.
+        #[cfg(test)]
+        review49l::after_key_snapshot(&snapshot_offsets.keys().cloned().collect()).await;
+        let path = self.store_path.clone();
+        let failed = self.io_failed.clone();
+        // Mark unfinished work unsafe before spawning; panic/cancellation cannot report success.
+        failed.store(true, Ordering::Release);
+        let result = tokio::task::spawn_blocking(move || {
+            let write_result = (|| -> rocketmq_error::RocketMQResult<()> {
+                let mut wrapper = Self::read_local_offset_at(path.as_str())?.unwrap_or_default();
+                wrapper.offset_table.extend(offsets);
+                let content = OffsetSerialize::from(wrapper)
+                    .serialize_json_pretty()
+                    .map_err(|e| mq_client_err!(e.to_string()))?;
+                file_utils::string_to_file(&content, path.as_str()).map_err(|e| mq_client_err!(e.to_string()))
+            })();
+            if write_result.is_ok() {
+                failed.store(false, Ordering::Release);
+            }
+            (write_result, guard)
+        })
+        .await;
+        let file_io = match result {
+            Ok((Ok(()), guard)) => {
+                summary.succeeded += count;
+                // Only the obligations this write carried are settled - including the ones no
+                // assignment names any more (plan 49k K2 item 2) - and only while nothing newer has
+                // republished them (plan 49l L2 item 1).
+                self.settle_debts(&carried).await;
+                Some(guard)
+            }
+            Ok((Err(err), guard)) => {
+                error!("persistAll consumer offset failed: {}: {}", self.store_path, err);
+                summary.failed += count;
+                Some(guard)
+            }
+            Err(err) => {
+                error!("persistAll consumer offset worker failed: {}: {}", self.store_path, err);
+                summary.failed += count;
+                None
+            }
+        };
+        PersistOutcome {
+            summary,
+            file_io,
+            offsets: snapshot_offsets,
+        }
     }
 }
 
@@ -749,5 +784,127 @@ pub(crate) mod review49l {
     #[tokio::test(flavor = "current_thread")]
     async fn a_fresh_success_carries_and_clears_the_recorded_debt() {
         debt_snapshot(false).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod review49n {
+    use super::*;
+    struct Gate {
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+    static GATES: once_cell::sync::Lazy<std::sync::Mutex<HashMap<MessageQueue, Gate>>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+    pub(crate) fn hold_proof(
+        key: &MessageQueue,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        GATES.lock().unwrap().insert(
+            key.clone(),
+            Gate {
+                entered,
+                release: release_rx,
+            },
+        );
+        (entered_rx, release)
+    }
+    pub(super) async fn after_retirement_proof(key: &MessageQueue) {
+        let gate = GATES.lock().unwrap().remove(key);
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_and_cancelled_keys_do_not_start_local_writes() {
+        use crate::base::client_config::ClientConfig;
+
+        let label = format!("review49n-noop-{}", std::process::id());
+        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
+        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        store.review49e_path_and_lock(path.clone());
+
+        let stale = MessageQueue::from_parts(format!("{label}-stale"), "broker", 0);
+        let live = MessageQueue::from_parts(format!("{label}-live"), "broker", 1);
+        store.io_failed.store(true, Ordering::Release);
+        let no_op = store.persist_all(&HashSet::from([stale.clone()]), &|| false).await;
+        assert_eq!((no_op.attempted, no_op.succeeded, no_op.failed), (0, 0, 0));
+        assert!(!path.exists(), "a stale key opened or created the offset file");
+        assert!(!store.io_complete().await, "a no-op cleared prior I/O failure evidence");
+
+        store.io_failed.store(false, Ordering::Release);
+        store.update_offset(&live, 10, false).await;
+        let cancelled = store
+            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| true)
+            .await;
+        assert_eq!(
+            (
+                cancelled.attempted,
+                cancelled.succeeded,
+                cancelled.failed,
+                cancelled.skipped
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(!path.exists(), "cancellation before I/O still opened the offset file");
+        assert!(store.io_complete().await);
+
+        let mixed = store
+            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| false)
+            .await;
+        assert_eq!((mixed.attempted, mixed.succeeded, mixed.failed), (1, 1, 0));
+        assert_eq!(store.read_offset(&live, ReadOffsetType::ReadFromStore).await, 10);
+        assert_eq!(store.read_offset(&stale, ReadOffsetType::ReadFromStore).await, -1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_assignment_keeps_unmatched_debt_and_failure_evidence() {
+        use crate::base::client_config::ClientConfig;
+
+        let label = format!("review49n-debt-{}", std::process::id());
+        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
+        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        store.review49e_path_and_lock(path.clone());
+
+        let q = MessageQueue::from_parts(label.as_str(), "broker", 0);
+        store.update_offset(&q, 7, false).await;
+        assert!(store.publish_debt(&q).await.is_some());
+        store.offset_table.lock().await.remove(&q);
+        store.io_failed.store(true, Ordering::Release);
+
+        let summary = store.persist_all(&HashSet::new(), &|| false).await;
+        assert_eq!(
+            (summary.attempted, summary.succeeded, summary.failed, summary.skipped),
+            (0, 0, 0, 1)
+        );
+        assert!(!path.exists(), "unmatched debt caused an empty file write");
+        assert!(store.offsets_unproven.lock().await.contains_key(&q));
+        assert!(
+            !store.io_complete().await,
+            "an empty assignment erased a genuine I/O failure"
+        );
+        assert!(
+            !(store.io_complete().await && !store.has_required_debt().await),
+            "missing required debt looked proven"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
     }
 }

@@ -54,6 +54,7 @@ use crate::consumer::consumer_impl::re_balance::rebalance_impl::table_holds_proc
 use crate::consumer::consumer_impl::re_balance::rebalance_impl::RebalanceImpl;
 use crate::consumer::consumer_impl::re_balance::Rebalance;
 use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+use crate::consumer::store::local_file_offset_store::LocalOffsetRetirement;
 use crate::consumer::store::offset_store::OffsetWrite;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::factory::mq_client_instance::MQClientInstance;
@@ -440,14 +441,37 @@ impl Rebalance for RebalancePushImpl {
         if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
             return None;
         }
-        // Write first and keep the memory copy, because what this call is about to erase may be all
-        // that can still be retried (plan 49k K2 item 1). The old shape called the void persist API
-        // and erased whether or not anything landed.
-        let written = default_mqpush_consumer_impl
+        if consume_orderly && MessageModel::Clustering == self.consumer_config.message_model {
+            // Orderly consumption keeps its own unlock-and-persist sequence unchanged; it is not a
+            // concurrent-PULL retirement and this plan does not rewrite its policy.
+            let written = default_mqpush_consumer_impl
+                .offset_store
+                .as_mut()
+                .unwrap()
+                .persist_for_retirement(mq)
+                .await;
+            if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
+                debug!(
+                    "leaving the offsets of {} alone, this retirement no longer owns that queue",
+                    mq
+                );
+                return None;
+            }
+            return match written {
+                OffsetWrite::Deferred => Some(OffsetWrite::Deferred),
+                _ => self.try_remove_order_message_queue(mq, pq).await.then_some(written),
+            };
+        }
+
+        // Concurrent PULL retirement keeps the file-I/O guard from the final write until the
+        // matching cache value is conditionally forgotten. A periodic writer that took an older
+        // assignment snapshot must therefore run either before this proof or after the value is
+        // absent (plan 49n N1 item 2).
+        let proof = default_mqpush_consumer_impl
             .offset_store
             .as_mut()
             .unwrap()
-            .persist_for_retirement(mq)
+            .persist_for_retirement_with_proof(mq)
             .await;
         if !default_mqpush_consumer_impl.owns_process_queue(mq, pq) {
             debug!(
@@ -456,28 +480,30 @@ impl Rebalance for RebalancePushImpl {
             );
             return None;
         }
-        if consume_orderly && MessageModel::Clustering == self.consumer_config.message_model {
-            // Orderly consumption keeps its own unlock-and-persist sequence unchanged; it is not a
-            // concurrent-PULL retirement and this plan does not rewrite its policy.
-            return match written {
-                OffsetWrite::Deferred => Some(OffsetWrite::Deferred),
-                _ => self.try_remove_order_message_queue(mq, pq).await.then_some(written),
-            };
-        }
-        match written {
-            // Proven on disk, or nothing local to prove: only now may this queue's offset go.
-            OffsetWrite::Proven | OffsetWrite::NoLocalState => {
+        match proof {
+            LocalOffsetRetirement::Proven(receipt) => {
+                let forgotten = default_mqpush_consumer_impl
+                    .offset_store
+                    .as_ref()
+                    .unwrap()
+                    .remove_offset_after_proof(mq, receipt)
+                    .await;
+                Some(if forgotten {
+                    OffsetWrite::Proven
+                } else {
+                    OffsetWrite::Deferred
+                })
+            }
+            LocalOffsetRetirement::NoLocalState => {
                 default_mqpush_consumer_impl
                     .offset_store
-                    .as_mut()
+                    .as_ref()
                     .unwrap()
                     .remove_offset(mq)
                     .await;
-                Some(written)
+                Some(OffsetWrite::NoLocalState)
             }
-            // The write failed. The value stays in memory, carried by every later whole-table write,
-            // and the retirement that asked for this call keeps its queue (plan 49k K2 item 1).
-            OffsetWrite::Deferred => Some(OffsetWrite::Deferred),
+            LocalOffsetRetirement::Deferred => Some(OffsetWrite::Deferred),
         }
     }
 

@@ -20,6 +20,8 @@ use tokio::time::Instant as TokioInstant;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 
 use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+use crate::consumer::store::local_file_offset_store::LocalOffsetProofReceipt;
+use crate::consumer::store::local_file_offset_store::LocalOffsetRetirement;
 use crate::consumer::store::read_offset_type::ReadOffsetType;
 use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
 
@@ -265,6 +267,34 @@ impl OffsetStore {
             Some(local) => local.persist_with_proof(mq).await,
             None => OffsetWrite::NoLocalState,
         }
+    }
+
+    /// Persist a concurrent-PULL retirement while retaining local file-I/O ownership through its
+    /// conditional cache deletion. The caller revalidates the process-queue identity before it
+    /// consumes a proven receipt (plan 49n N1 item 2).
+    pub(crate) async fn persist_for_retirement_with_proof(&mut self, mq: &MessageQueue) -> LocalOffsetRetirement {
+        if let Some(ref mut store) = self.remote_broker_offset_store {
+            store.persist(mq).await;
+        }
+        match self.local_file_offset_store.as_mut() {
+            Some(local) => local.persist_with_proof_receipt(mq).await,
+            None => LocalOffsetRetirement::NoLocalState,
+        }
+    }
+
+    /// Consume the local proof receipt and remove the broker-side cache only after the local value
+    /// was conditionally forgotten while the file-I/O guard remained held.
+    pub(crate) async fn remove_offset_after_proof(&self, mq: &MessageQueue, receipt: LocalOffsetProofReceipt) -> bool {
+        let Some(local) = &self.local_file_offset_store else {
+            return false;
+        };
+        if !local.remove_offset_with_proof(mq, receipt).await {
+            return false;
+        }
+        if let Some(remote) = &self.remote_broker_offset_store {
+            remote.remove_offset(mq).await;
+        }
+        true
     }
 
     pub async fn remove_offset(&self, mq: &MessageQueue) {

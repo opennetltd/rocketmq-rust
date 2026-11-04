@@ -3002,6 +3002,8 @@ impl MQConsumerInner for DefaultMQPushConsumerImpl {
                     .await;
                 guard.keys().cloned().collect::<HashSet<_>>()
             };
+            #[cfg(test)]
+            review49n::after_assignment_snapshot(&self.consumer_config.consumer_group).await;
             // The pass is cancellable by this consumer alone: stopping must not depend on stopping
             // its siblings or the client's scheduled task, and a write already in
             // flight is never cut off (plan 49a F10).
@@ -5987,5 +5989,490 @@ mod review49l {
             "admission reopened while cleanup was finalizing"
         );
         assert_eq!(repeated, proved, "a second observer invented another cleanup outcome");
+    }
+}
+
+#[cfg(test)]
+mod review49n {
+    use super::*;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use std::time::Duration;
+    struct Gate {
+        group: CheetahString,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+    static GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+    pub(super) async fn after_assignment_snapshot(group: &CheetahString) {
+        let gate = {
+            let mut slot = GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|gate| &gate.group == group) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+    async fn stale_persistence(stale: bool) {
+        let label = if stale { "stale" } else { "fresh" };
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49n-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        *push.service_state = ServiceState::Running;
+        let mut client = MQClientInstance::new_arc(cc, 0, format!("review49n-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49n-{label}-{}.json", std::process::id()));
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_dir(&backup);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group.clone());
+        local.review49e_path_and_lock(path.clone());
+        let mut store = ArcMut::new(OffsetStore::new_with_local(local));
+        push.offset_store = Some(store.clone());
+        let q = MessageQueue::from_parts(format!("review49n-{label}"), "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        push.note_queue_installed(&q, &pq);
+        store.update_offset(&q, 7, false).await;
+        let (entered, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        if stale {
+            *GATE.lock().unwrap() = Some(Gate {
+                group,
+                entered,
+                release: release_rx,
+            });
+        }
+        let periodic_owner = push.clone();
+        let mut periodic = Box::pin(periodic_owner.persist_consumer_offset());
+        if stale {
+            tokio::select! {r=&mut entered_rx=>r.unwrap(),_=&mut periodic=>panic!("periodic pass did not pause after its assignment snapshot"),_=tokio::time::sleep(Duration::from_secs(1))=>panic!("snapshot hook was not reached")};
+        }
+        let mut rebalance = push.rebalance_impl.clone();
+        rebalance.remove_process_queue(&q, &pq).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rebalance.rebalance_impl_inner.queue_transitions.retiring(&q) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let retired = !table.read().await.contains_key(&q) && push.progress.current_epoch(&q).is_none();
+        let proof_before = store.local_writer_finished().await;
+        let disk_before = store.read_offset(&q, ReadOffsetType::ReadFromStore).await;
+        // Fail only the backup copy; the already proven main offset file remains intact.
+        let _ = std::fs::remove_file(&backup);
+        std::fs::create_dir(&backup).unwrap();
+        if stale {
+            release.send(()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), &mut periodic)
+            .await
+            .unwrap();
+        drop(periodic);
+        let proof_during_fault = store.local_writer_finished().await;
+        assert!(
+            backup.is_dir(),
+            "the stale empty snapshot unexpectedly touched the backup path"
+        );
+        assert!(proof_during_fault, "a retired key with no value poisoned local proof");
+        std::fs::remove_dir(&backup).unwrap();
+        let retry = store.persist_local(&HashSet::new()).await.unwrap();
+        let proof_after_heal = store.local_writer_finished().await;
+        let disk_after = store.read_offset(&q, ReadOffsetType::ReadFromStore).await;
+        let memory = store.read_offset(&q, ReadOffsetType::ReadFromMemory).await;
+        eprintln!(
+            "periodic after retirement: stale={stale} retired={retired} proof_before={proof_before} \
+             proof_during_fault={proof_during_fault} retry={retry} proof_after_heal={proof_after_heal} \
+             disk_before={disk_before} disk_after={disk_after} memory={memory}"
+        );
+        push.work.close();
+        tokio::time::timeout(Duration::from_secs(2), push.work.wait())
+            .await
+            .unwrap();
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        assert!(retired && proof_before);
+        assert_eq!(disk_before, 7);
+        assert_eq!(disk_after, 7);
+        assert_eq!(memory, -1);
+        assert_eq!(retry.attempted, 0, "empty-assignment cleanup invented a write");
+        assert!(
+            proof_after_heal,
+            "a stale key-only empty write left no offset or debt that could repair local cleanup proof"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_periodic_snapshot_must_not_poison_a_proven_retirement() {
+        stale_persistence(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fresh_periodic_snapshot_preserves_a_proven_retirement() {
+        stale_persistence(false).await;
+    }
+
+    async fn captured_periodic_write(fail: bool) {
+        use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
+        let label = if fail { "captured-fail" } else { "captured-success" };
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49n-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let h = push.clone();
+        push.set_default_mqpush_consumer_impl(h);
+        push.mark_managed_lifecycle();
+        *push.service_state = ServiceState::Running;
+        let mut client = MQClientInstance::new_arc(cc, 0, format!("review49n-{label}").as_str(), None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49n-{label}-{}.json", std::process::id()));
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_dir(&backup);
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        let mut store = ArcMut::new(OffsetStore::new_with_local(local));
+        push.offset_store = Some(store.clone());
+        let q = MessageQueue::from_parts(format!("review49n-{label}"), "broker", 0);
+        let sibling = MessageQueue::from_parts(format!("review49n-{label}-sibling"), "broker", 1);
+        let pq = Arc::new(ProcessQueue::new());
+        let sibling_pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        table.write().await.insert(sibling.clone(), sibling_pq.clone());
+        push.note_queue_installed(&q, &pq);
+        push.note_queue_installed(&sibling, &sibling_pq);
+        store.update_offset(&q, 7, false).await;
+        store.update_offset(&sibling, 11, false).await;
+        let initial = store
+            .persist_local(&HashSet::from([q.clone(), sibling.clone()]))
+            .await
+            .unwrap();
+        assert_eq!((initial.attempted, initial.succeeded), (2, 2));
+        store.update_offset(&sibling, 13, false).await;
+
+        // A periodic write has already acquired the file mutex and captured its actual value before
+        // retirement asks for the same mutex.
+        let (mut write_entered, release_write) = hold_next_write(&q);
+        let periodic_store = store.clone();
+        let selected = HashSet::from([q.clone()]);
+        let mut periodic =
+            Box::pin(async move { periodic_store.mut_from_ref().persist_local(&selected).await.unwrap() });
+        tokio::select! {
+            r = &mut write_entered => r.unwrap(),
+            _ = &mut periodic => panic!("the periodic write finished before its snapshot was held"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("the periodic write did not reach its snapshot"),
+        }
+        assert!(io.try_lock().is_err(), "the captured periodic writer must own file I/O");
+
+        let mut rebalance = push.rebalance_impl.clone();
+        let task_q = q.clone();
+        let task_pq = pq.clone();
+        let observer = tokio::spawn(async move { rebalance.remove_process_queue(&task_q, &task_pq).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !transitions.retiring(&q) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(table.read().await.contains_key(&q));
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromMemory).await, 7);
+
+        if fail {
+            std::fs::create_dir(&backup).unwrap();
+        }
+        release_write.send(()).unwrap();
+        let periodic_summary = tokio::time::timeout(Duration::from_secs(2), &mut periodic)
+            .await
+            .unwrap();
+        if fail {
+            assert_eq!((periodic_summary.attempted, periodic_summary.failed), (1, 1));
+            // Heal synchronously before yielding to the owned retirement waiting on this writer.
+            std::fs::remove_dir(&backup).unwrap();
+        } else {
+            assert_eq!((periodic_summary.attempted, periodic_summary.succeeded), (1, 1));
+        }
+        drop(periodic);
+        let _ = tokio::time::timeout(Duration::from_secs(1), observer).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transitions.retiring(&q) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!table.read().await.contains_key(&q));
+        assert!(table.read().await.contains_key(&sibling));
+        assert!(push.progress.current_epoch(&sibling).is_some());
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromMemory).await, -1);
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromStore).await, 7);
+        assert_eq!(store.read_offset(&sibling, ReadOffsetType::ReadFromMemory).await, 13);
+        assert!(store.local_writer_finished().await);
+
+        // The sibling remains writable and cleanup can prove its local persistence after the fault
+        // heals.
+        let mut stopper = push.clone();
+        let cleanup_proved = stopper
+            .shutdown_until(TokioInstant::now() + Duration::from_secs(5))
+            .await;
+        assert!(cleanup_proved, "cleanup did not prove local persistence after recovery");
+        assert_eq!(store.read_offset(&sibling, ReadOffsetType::ReadFromStore).await, 13);
+        assert!(store.local_writer_finished().await);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_periodic_writers_wait_for_proof_and_skip_the_retired_value() {
+        use crate::consumer::store::local_file_offset_store::review49l::clear_holds;
+        use crate::consumer::store::local_file_offset_store::review49l::hold_next_write;
+        use crate::consumer::store::local_file_offset_store::review49n::hold_proof;
+        let label = "late-writers";
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(format!("review49n-{label}"));
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        *push.service_state = ServiceState::Running;
+        let mut client = MQClientInstance::new_arc(cc, 0, label, None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("review49n-{label}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        let io = local.review49e_path_and_lock(path.clone());
+        let mut store = ArcMut::new(OffsetStore::new_with_local(local));
+        push.offset_store = Some(store.clone());
+        let q = MessageQueue::from_parts(format!("review49n-{label}"), "broker", 0);
+        let sibling = MessageQueue::from_parts(format!("review49n-{label}-sibling"), "broker", 1);
+        let pq = Arc::new(ProcessQueue::new());
+        let sibling_pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        let transitions = push.rebalance_impl.rebalance_impl_inner.queue_transitions.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        table.write().await.insert(sibling.clone(), sibling_pq.clone());
+        push.note_queue_installed(&q, &pq);
+        push.note_queue_installed(&sibling, &sibling_pq);
+        store.update_offset(&q, 7, false).await;
+        store.update_offset(&sibling, 11, false).await;
+        let initial = store
+            .persist_local(&HashSet::from([q.clone(), sibling.clone()]))
+            .await
+            .unwrap();
+        assert_eq!((initial.attempted, initial.succeeded), (2, 2));
+
+        // Hold the owned retirement after its final write has proved, but before the cache value is
+        // removed. The caller's bounded watch expires while the receipt still owns file I/O.
+        let (proof_entered, release_proof) = hold_proof(&q);
+        let mut rebalance = push.rebalance_impl.clone();
+        let task_q = q.clone();
+        let task_pq = pq.clone();
+        let observer = tokio::spawn(async move { rebalance.remove_process_queue(&task_q, &task_pq).await });
+        tokio::time::timeout(Duration::from_secs(1), proof_entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            transitions.retiring(&q),
+            "observer expiry cancelled the owned retirement"
+        );
+        assert!(
+            io.try_lock().is_err(),
+            "the proof receipt released file I/O before cache removal"
+        );
+        assert!(table.read().await.contains_key(&q));
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromMemory).await, 7);
+
+        // Two periodic callers have already captured the old assignment, but cannot snapshot any
+        // offset while retirement holds the proof receipt.
+        let (mut stale_q_write, _release_stale_q) = hold_next_write(&q);
+        let first_owner = push.clone();
+        let second_owner = push.clone();
+        let mut first = tokio::spawn(async move { first_owner.persist_consumer_offset().await });
+        let mut second = tokio::spawn(async move { second_owner.persist_consumer_offset().await });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut first)
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second)
+            .await
+            .is_err());
+
+        release_proof.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transitions.retiring(&q) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!table.read().await.contains_key(&q));
+        assert!(table.read().await.contains_key(&sibling));
+
+        // If a late periodic pass included the retired value in its actual offset snapshot, this
+        // keyed write hold would fire. It must only persist the still-live sibling.
+        tokio::select! {
+            result = &mut first => result.unwrap(),
+            entered = &mut stale_q_write => panic!("a late periodic snapshot still included the retired value: {entered:?}"),
+        }
+        tokio::select! {
+            result = &mut second => result.unwrap(),
+            entered = &mut stale_q_write => panic!("a second late periodic snapshot included the retired value: {entered:?}"),
+        }
+        clear_holds();
+
+        let stale_assignment = store
+            .persist_local(&HashSet::from([q.clone(), sibling.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                stale_assignment.attempted,
+                stale_assignment.succeeded,
+                stale_assignment.failed
+            ),
+            (1, 1, 0),
+            "the stale assignment key was counted as a write without a local value"
+        );
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromMemory).await, -1);
+        assert_eq!(store.read_offset(&q, ReadOffsetType::ReadFromStore).await, 7);
+        assert!(store.local_writer_finished().await);
+
+        let mut stopper = push.clone();
+        let cleanup_proved = stopper
+            .shutdown_until(TokioInstant::now() + Duration::from_secs(5))
+            .await;
+        assert!(
+            cleanup_proved,
+            "cleanup failed after the unrelated periodic writers drained"
+        );
+        assert_eq!(store.read_offset(&sibling, ReadOffsetType::ReadFromStore).await, 11);
+        assert!(store.local_writer_finished().await);
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_retirement_without_a_cached_offset_does_not_open_the_file() {
+        let label = format!("review49n-no-offset-{}", std::process::id());
+        let cc = ClientConfig::default();
+        let group = CheetahString::from_string(label.clone());
+        let cfg = ArcMut::new(ConsumerConfig {
+            consumer_group: group.clone(),
+            message_model: MessageModel::Broadcasting,
+            ..Default::default()
+        });
+        let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg, None));
+        let handle = push.clone();
+        push.set_default_mqpush_consumer_impl(handle);
+        push.mark_managed_lifecycle();
+        *push.service_state = ServiceState::Running;
+        let mut client = MQClientInstance::new_arc(cc, 0, &label, None);
+        push.client_instance = Some(client.clone());
+        push.rebalance_impl.set_consumer_group(group.clone());
+        push.rebalance_impl.set_message_model(MessageModel::Broadcasting);
+        push.rebalance_impl.rebalance_impl_inner.client_instance = Some(client.clone());
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let mut local = LocalFileOffsetStore::new(client.clone(), group);
+        local.review49e_path_and_lock(path.clone());
+        let sibling = MessageQueue::from_parts(format!("{label}-sibling"), "broker", 1);
+        let sibling_pq = Arc::new(ProcessQueue::new());
+        let mut store = ArcMut::new(OffsetStore::new_with_local(local));
+        store.update_offset(&sibling, 11, false).await;
+        store.persist(&sibling).await;
+        store.update_offset(&sibling, 12, false).await;
+        let backup = path.with_extension("json.bak");
+        std::fs::create_dir(&backup).unwrap();
+        assert!(matches!(
+            store.persist_for_retirement(&sibling).await,
+            crate::consumer::store::offset_store::OffsetWrite::Deferred
+        ));
+        std::fs::remove_dir(&backup).unwrap();
+        push.offset_store = Some(store.clone());
+
+        let q = MessageQueue::from_parts(label.as_str(), "broker", 0);
+        let pq = Arc::new(ProcessQueue::new());
+        let table = push.rebalance_impl.rebalance_impl_inner.process_queue_table.clone();
+        table.write().await.insert(q.clone(), pq.clone());
+        table.write().await.insert(sibling.clone(), sibling_pq.clone());
+        push.note_queue_installed(&q, &pq);
+        push.note_queue_installed(&sibling, &sibling_pq);
+        let mut rebalance = push.rebalance_impl.clone();
+        rebalance.remove_process_queue(&q, &pq).await;
+        assert!(!table.read().await.contains_key(&q));
+        assert!(table.read().await.contains_key(&sibling));
+        assert!(
+            !store.local_writer_finished().await,
+            "no-value retirement cleared sibling debt"
+        );
+        assert_eq!(store.read_offset(&sibling, ReadOffsetType::ReadFromStore).await, 11);
+
+        let mut stopper = push.clone();
+        assert!(
+            stopper
+                .shutdown_until(TokioInstant::now() + Duration::from_secs(5))
+                .await
+        );
+        assert!(store.local_writer_finished().await);
+        assert_eq!(store.read_offset(&sibling, ReadOffsetType::ReadFromStore).await, 12);
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_captured_periodic_write_must_not_outlive_its_retirements_proof() {
+        captured_periodic_write(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_successful_captured_periodic_write_preserves_local_proof() {
+        captured_periodic_write(false).await;
     }
 }
