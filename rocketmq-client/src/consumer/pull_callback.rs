@@ -385,13 +385,22 @@ impl PullCallback for DefaultPullCallback {
                     pull_result_ext.pull_result, pull_result_ext.pull_result.pull_status
                 );
                 pull_request.next_offset = pull_result_ext.pull_result.next_begin_offset as i64;
-                pull_request.process_queue.set_dropped(true);
-
+                let process_queue = Arc::clone(&pull_request.process_queue);
+                let commit_guard = process_queue.commit_lock.lock().await;
+                if process_queue.is_dropped()
+                    || !push_consumer_impl.owns_process_queue(pull_request.get_message_queue(), &process_queue)
+                    || !push_consumer_impl
+                        .holds_acquisition(pull_request.get_message_queue(), pull_request.lease_epoch())
+                {
+                    return;
+                }
+                process_queue.set_dropped(true);
                 let offset_store = push_consumer_impl.offset_store.as_mut().unwrap();
                 offset_store
                     .update_and_freeze_offset(pull_request.get_message_queue(), pull_request.next_offset)
                     .await;
                 offset_store.persist(pull_request.get_message_queue()).await;
+                drop(commit_guard);
                 push_consumer_impl
                     .rebalance_impl
                     .remove_process_queue(pull_request.get_message_queue(), &pull_request.process_queue)

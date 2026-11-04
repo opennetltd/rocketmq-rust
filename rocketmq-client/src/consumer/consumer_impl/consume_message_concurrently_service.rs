@@ -48,6 +48,44 @@ use crate::consumer::listener::consume_return_type::ConsumeReturnType;
 use crate::consumer::listener::message_listener_concurrently::ArcBoxMessageListenerConcurrently;
 use crate::hook::consume_message_context::ConsumeMessageContext;
 
+#[cfg(test)]
+mod review49m_commit_gate {
+    use once_cell::sync::Lazy;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    struct Gate {
+        queue: MessageQueue,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static NEXT: Lazy<Mutex<Option<Gate>>> = Lazy::new(|| Mutex::new(None));
+
+    pub(super) fn hold(queue: MessageQueue) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *NEXT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Gate {
+            queue,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn wait(queue: &MessageQueue) {
+        let gate = {
+            let mut next = NEXT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            next.take_if(|gate| &gate.queue == queue)
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+}
+
 pub struct ConsumeMessageConcurrentlyService {
     pub(crate) default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
     pub(crate) client_config: ArcMut<ClientConfig>,
@@ -240,7 +278,16 @@ impl ConsumeMessageConcurrentlyService {
         let mut removals = consume_request.msgs.clone();
         removals.extend(finalized);
         let offset = consume_request.process_queue.remove_message(&removals).await;
-        if offset >= 0 && !consume_request.process_queue.is_dropped() {
+        if offset >= 0
+            && !consume_request.process_queue.is_dropped()
+            && self
+                .default_mqpush_consumer_impl
+                .as_ref()
+                .unwrap()
+                .owns_process_queue(&consume_request.message_queue, &consume_request.process_queue)
+        {
+            #[cfg(test)]
+            review49m_commit_gate::wait(&consume_request.message_queue).await;
             let default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_mut().unwrap();
             default_mqpush_consumer_impl
                 .offset_store
@@ -699,6 +746,7 @@ mod tests {
 
     use super::*;
     use crate::consumer::listener::message_listener_concurrently::MessageListenerConcurrently;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
     use crate::consumer::store::offset_store::OffsetStore;
     use crate::consumer::store::read_offset_type::ReadOffsetType;
     use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
@@ -834,6 +882,34 @@ mod tests {
                 .unwrap()
                 .read_offset(&self.mq, ReadOffsetType::ReadFromMemory)
                 .await
+        }
+
+        async fn use_local_store(&mut self) -> std::path::PathBuf {
+            let path =
+                std::env::temp_dir().join(format!("review49m-consume-{}-{}.json", self.group, std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut local = LocalFileOffsetStore::new(self.client.clone(), self.group.clone());
+            local.review49e_path_and_lock(path.clone());
+            self.push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+            self.push
+                .offset_store
+                .as_ref()
+                .unwrap()
+                .update_offset(&self.mq, 7, false)
+                .await;
+            path
+        }
+
+        async fn install_managed_queue(&self, mq: &MessageQueue, pq: &StdArc<ProcessQueue>) {
+            self.push.mark_managed_lifecycle();
+            self.push
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await
+                .insert(mq.clone(), pq.clone());
+            self.push.note_queue_installed(mq, pq);
         }
 
         async fn shutdown(mut self) {
@@ -989,6 +1065,133 @@ mod tests {
             "a message the broker took back is no longer outstanding work here"
         );
         fixture.shutdown().await;
+    }
+
+    /// A real consume-result commit that passed its final ownership check before retirement marks
+    /// the queue dropped remains inside the commit barrier. Retirement waits for that commit,
+    /// persists its newer offset, and only then removes the in-memory queue and acquisition. A
+    /// sibling queue can commit while this queue is paused, proving the barrier is per queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_consume_result_commit_is_proven_before_retirement_forgets_it() {
+        use crate::consumer::consumer_impl::re_balance::Rebalance;
+        use crate::consumer::store::read_offset_type::ReadOffsetType;
+
+        let messages = vec![message(98, 0)];
+        let mut fixture = Fixture::new("retirement-commit", MessageModel::Broadcasting, 0, messages.clone()).await;
+        let path = fixture.use_local_store().await;
+        fixture.install_managed_queue(&fixture.mq, &fixture.pq).await;
+        let mut request = fixture.request(
+            handles(&messages),
+            fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+        );
+        let context = ConsumeConcurrentlyContext::new(fixture.mq.clone());
+        let (entered, release) = review49m_commit_gate::hold(fixture.mq.clone());
+        let service = fixture.service.clone();
+        let mut commit_service = service.clone();
+        let mut commit = tokio::spawn(async move {
+            commit_service
+                .process_consume_result(
+                    service,
+                    ConsumeConcurrentlyStatus::ConsumeSuccess,
+                    &context,
+                    &mut request,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered)
+            .await
+            .expect("the production consume-result path never reached its admitted commit")
+            .expect("the commit gate was dropped before the offset update");
+
+        let mut rebalance = fixture.push.rebalance_impl.clone();
+        let retirement_mq = fixture.mq.clone();
+        let retirement_pq = fixture.pq.clone();
+        let mut retirement = tokio::spawn(async move {
+            rebalance.remove_process_queue(&retirement_mq, &retirement_pq).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.pq.is_dropped() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement did not close the old queue before waiting for its commit lock");
+
+        let other_mq = MessageQueue::from_parts("T-sibling", "broker-a", 0);
+        let other_pq = StdArc::new(ProcessQueue::new());
+        fixture.install_managed_queue(&other_mq, &other_pq).await;
+        let other_messages = vec![message(21, 0)];
+        other_pq.put_message(handles(&other_messages)).await;
+        let other_accounting = Some(fixture.push.progress.admit_batch(&other_mq, other_messages.len()));
+        let mut other_request = ConsumeRequest {
+            msgs: handles(&other_messages),
+            message_listener: fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+            process_queue: other_pq.clone(),
+            message_queue: other_mq.clone(),
+            dispatch_to_consume: true,
+            consumer_group: fixture.group.clone(),
+            default_mqpush_consumer_impl: Some(fixture.push.clone()),
+            delivery: fixture.push.delivery.clone(),
+            accounting: other_accounting,
+        };
+        let other_context = ConsumeConcurrentlyContext::new(other_mq.clone());
+        let sibling_service = ArcMut::new(ConsumeMessageConcurrentlyService::new(
+            fixture.service.client_config.clone(),
+            fixture.service.consumer_config.clone(),
+            fixture.group.clone(),
+            fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+            Some(fixture.push.clone()),
+            fixture.push.delivery.clone(),
+        ));
+        let mut sibling_service_mut = sibling_service.clone();
+        sibling_service_mut
+            .process_consume_result(
+                sibling_service.clone(),
+                ConsumeConcurrentlyStatus::ConsumeSuccess,
+                &other_context,
+                &mut other_request,
+            )
+            .await;
+        let sibling_offset = fixture
+            .push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .read_offset(&other_mq, ReadOffsetType::ReadFromMemory)
+            .await;
+        assert_eq!(
+            sibling_offset, 22,
+            "an unrelated queue waited on the retiring queue's commit barrier"
+        );
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut commit)
+            .await
+            .expect("the consume-result commit stayed blocked")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut retirement)
+            .await
+            .expect("retirement did not finish after the admitted commit released its lock")
+            .unwrap();
+
+        let store = fixture.push.offset_store.as_ref().unwrap();
+        let memory = store.read_offset(&fixture.mq, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&fixture.mq, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = fixture.push.progress.current_epoch(&fixture.mq);
+        sibling_service_mut.shutdown(100).await;
+        fixture.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+
+        assert_eq!(memory, -1, "retirement did not remove the proven memory copy");
+        assert_eq!(
+            disk, 99,
+            "retirement forgot a consume-result offset newer than its earlier snapshot"
+        );
+        assert!(proof, "the final write did not settle local offset proof");
+        assert_eq!(epoch, None, "the retired acquisition stayed published");
+        assert_eq!(sibling_offset, 22);
     }
 
     /// A mixed send-back batch removes only what the broker accepted; the refused one stays cached

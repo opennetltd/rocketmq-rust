@@ -258,6 +258,21 @@ async fn retire_owned_process_queue(
     let droped = pq.is_dropped();
     pq.set_dropped(true);
 
+    // Concurrent PULL commits use this same per-queue barrier for their final dropped/acquisition
+    // check and memory offset update. Keep it until the proven snapshot is no longer addressable
+    // through the table or acquisition; otherwise an admitted commit can advance memory while this
+    // write is pending and then have that newer value erased by the key-only removal below.
+    // Orderly consumption has its own consume-lock retirement sequence and remains unchanged.
+    let _commit_guard = if rebalance
+        .default_mqpush_consumer_impl
+        .as_ref()
+        .is_some_and(|consumer| !consumer.is_consume_orderly())
+    {
+        Some(pq.commit_lock.lock().await)
+    } else {
+        None
+    };
+
     // Side effects first, while this object still owns the queue; revocation afterwards, because it
     // is what stops further work on this identity. Each step revalidates against this exact process
     // queue (plan 49i I2 item 2), which is what makes it safe for the operation to outlive the

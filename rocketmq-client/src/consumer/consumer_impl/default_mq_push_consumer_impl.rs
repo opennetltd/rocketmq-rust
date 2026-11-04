@@ -2591,7 +2591,13 @@ impl DefaultMQPushConsumerImpl {
     }
 
     pub(crate) async fn correct_tags_offset(&mut self, pull_request: &PullRequest) {
-        if pull_request.process_queue.msg_count() == 0 {
+        let process_queue = Arc::clone(&pull_request.process_queue);
+        let _commit_guard = process_queue.commit_lock.lock().await;
+        if !process_queue.is_dropped()
+            && self.owns_process_queue(pull_request.get_message_queue(), &process_queue)
+            && self.holds_acquisition(pull_request.get_message_queue(), pull_request.lease_epoch())
+            && process_queue.msg_count() == 0
+        {
             self.offset_store
                 .as_mut()
                 .unwrap()
