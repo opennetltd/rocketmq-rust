@@ -88,8 +88,8 @@ pub enum OffsetWrite {
     /// is now carried by every later whole-table write, so a healed filesystem retries it even
     /// when no assignment names it any more (plan 49k K2 item 2).
     Deferred,
-    /// No local file backs this store - broker offsets only - where the existing bounded
-    /// best-effort policy applies and there is nothing local to prove.
+    /// No local file backs this store, or this queue has neither a memory offset nor required
+    /// local debt. Broker-only stores keep their existing bounded best-effort policy.
     NoLocalState,
 }
 

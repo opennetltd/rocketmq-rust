@@ -133,6 +133,100 @@ impl LocalFileOffsetStore {
 }
 
 #[cfg(test)]
+mod review49n {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_and_cancelled_keys_do_not_start_local_writes() {
+        let label = format!("review49n-noop-{}", std::process::id());
+        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
+        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        store.review49e_path_and_lock(path.clone());
+
+        let stale = MessageQueue::from_parts(format!("{label}-stale"), "broker", 0);
+        let live = MessageQueue::from_parts(format!("{label}-live"), "broker", 1);
+        store.io_failed.store(true, Ordering::Release);
+        assert_eq!(store.persist_with_proof(&stale).await, OffsetWrite::NoLocalState);
+        assert!(
+            !store.io_complete().await,
+            "no-local-state retirement cleared unrelated failure evidence"
+        );
+        let no_op = store.persist_all(&HashSet::from([stale.clone()]), &|| false).await;
+        assert_eq!((no_op.attempted, no_op.succeeded, no_op.failed), (0, 0, 0));
+        assert!(!path.exists(), "a stale key opened or created the offset file");
+        assert!(!store.io_complete().await, "a no-op cleared prior I/O failure evidence");
+
+        store.io_failed.store(false, Ordering::Release);
+        store.update_offset(&live, 10, false).await;
+        let cancelled = store
+            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| true)
+            .await;
+        assert_eq!(
+            (
+                cancelled.attempted,
+                cancelled.succeeded,
+                cancelled.failed,
+                cancelled.skipped
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(!path.exists(), "cancellation before I/O still opened the offset file");
+        assert!(store.io_complete().await);
+
+        let mixed = store
+            .persist_all(&HashSet::from([live.clone(), stale.clone()]), &|| false)
+            .await;
+        assert_eq!((mixed.attempted, mixed.succeeded, mixed.failed), (1, 1, 0));
+        assert_eq!(store.read_offset(&live, ReadOffsetType::ReadFromStore).await, 10);
+        assert_eq!(store.read_offset(&stale, ReadOffsetType::ReadFromStore).await, -1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_assignment_keeps_unmatched_debt_and_failure_evidence() {
+        let label = format!("review49n-debt-{}", std::process::id());
+        let mut client = MQClientInstance::new_arc(ClientConfig::default(), 0, &label, None);
+        let mut store = LocalFileOffsetStore::new(client.clone(), CheetahString::from_string(label.clone()));
+        let path = std::env::temp_dir().join(format!("{label}.json"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        store.review49e_path_and_lock(path.clone());
+
+        let q = MessageQueue::from_parts(label.as_str(), "broker", 0);
+        store.update_offset(&q, 7, false).await;
+        assert!(store.publish_debt(&q).await.is_some());
+        store.offset_table.lock().await.remove(&q);
+        store.io_failed.store(true, Ordering::Release);
+
+        let summary = store.persist_all(&HashSet::new(), &|| false).await;
+        assert_eq!(
+            (summary.attempted, summary.succeeded, summary.failed, summary.skipped),
+            (0, 0, 0, 1)
+        );
+        assert!(!path.exists(), "unmatched debt caused an empty file write");
+        assert!(store.offsets_unproven.lock().await.contains_key(&q));
+        assert!(
+            !store.io_complete().await,
+            "an empty assignment erased a genuine I/O failure"
+        );
+        assert!(!(store.io_complete().await && !store.has_required_debt().await));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    }
+}
+
+#[cfg(test)]
 impl LocalFileOffsetStore {
     /// Redirect this store at a test-owned path and hand back the same file-I/O mutex its writer
     /// takes, so a regression can hold that writer without adding a production lock-holding API
@@ -220,6 +314,14 @@ impl LocalFileOffsetStore {
     /// was, and every later whole-table write re-includes the key - including one whose assigned
     /// set is empty - until a write lands.
     pub(crate) async fn persist_with_proof(&mut self, mq: &MessageQueue) -> OffsetWrite {
+        let has_value = self.offset_table.lock().await.contains_key(mq);
+        let has_debt = self.offsets_unproven.lock().await.contains_key(mq);
+        match (has_value, has_debt) {
+            (false, false) => return OffsetWrite::NoLocalState,
+            (false, true) => return OffsetWrite::Deferred,
+            (true, _) => {}
+        }
+
         let obligation = self.publish_debt(mq).await;
         let summary = self.persist_all(&HashSet::from([mq.clone()]), &|| false).await;
         // Settled means an acknowledged write carried this exact value to the file. A newer failed
@@ -320,22 +422,30 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         // (plan 49k K2 item 2); it is part of this table's durable state until a write proves it.
         let debt: HashMap<MessageQueue, OffsetDebt> = self.offsets_unproven.lock().await.clone();
         let keys: HashSet<MessageQueue> = mqs.union(&debt.keys().cloned().collect()).cloned().collect();
-        if keys.is_empty() {
-            return summary;
-        }
-        if cancelled() {
-            summary.skipped += keys.len() as u64;
-            return summary;
-        }
-        let count = keys.len() as u64;
-        summary.attempted = count;
-        let offsets = self
+        // Assignment keys only identify candidates. A retired queue may still be present in an
+        // earlier snapshot after its memory value and retry debt have both been removed; it must
+        // not trigger a physical write or alter the real I/O proof (plan 49n N1 item 1).
+        let snapshot_offsets = self
             .offset_table
             .lock()
             .await
             .iter()
             .filter(|(mq, _)| keys.contains(mq))
-            .map(|(mq, offset)| (mq.clone(), AtomicI64::new(offset.get_offset())))
+            .map(|(mq, offset)| (mq.clone(), offset.get_offset()))
+            .collect::<HashMap<_, _>>();
+        summary.skipped += debt.keys().filter(|mq| !snapshot_offsets.contains_key(*mq)).count() as u64;
+        if snapshot_offsets.is_empty() {
+            return summary;
+        }
+        if cancelled() {
+            summary.skipped += snapshot_offsets.len() as u64;
+            return summary;
+        }
+        let count = snapshot_offsets.len() as u64;
+        summary.attempted = count;
+        let offsets = snapshot_offsets
+            .iter()
+            .map(|(mq, offset)| (mq.clone(), AtomicI64::new(*offset)))
             .collect::<HashMap<_, _>>();
         // The obligations this write actually carries, captured with the values they are about
         // (plan 49l L2 item 1). A key that has no memory value cannot be settled by a write
@@ -348,7 +458,7 @@ impl OffsetStoreTrait for LocalFileOffsetStore {
         // successful write, which is what debt settlement has to get right. Never compiled into
         // anything that ships.
         #[cfg(test)]
-        review49l::after_key_snapshot(&keys).await;
+        review49l::after_key_snapshot(&snapshot_offsets.keys().cloned().collect()).await;
         let path = self.store_path.clone();
         let failed = self.io_failed.clone();
         // Mark unfinished work unsafe before spawning; panic/cancellation cannot report success.
