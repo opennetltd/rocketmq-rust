@@ -28,11 +28,16 @@ use rocketmq_remoting::protocol::body::consume_message_directly_result::ConsumeM
 use rocketmq_remoting::protocol::heartbeat::message_model::MessageModel;
 use rocketmq_runtime::RocketMQRuntime;
 use rocketmq_rust::ArcMut;
+use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::base::client_config::ClientConfig;
 use crate::consumer::consumer_impl::consume_message_service::ConsumeMessageServiceTrait;
+use crate::consumer::consumer_impl::consumer_lifecycle::call_listener_catching;
+use crate::consumer::consumer_impl::consumer_lifecycle::DeliveryOwner;
+use crate::consumer::consumer_impl::consumer_lifecycle::ListenerCall;
 use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
@@ -43,6 +48,44 @@ use crate::consumer::listener::consume_return_type::ConsumeReturnType;
 use crate::consumer::listener::message_listener_concurrently::ArcBoxMessageListenerConcurrently;
 use crate::hook::consume_message_context::ConsumeMessageContext;
 
+#[cfg(test)]
+mod review49m_commit_gate {
+    use once_cell::sync::Lazy;
+    use rocketmq_common::common::message::message_queue::MessageQueue;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    struct Gate {
+        queue: MessageQueue,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static NEXT: Lazy<Mutex<Option<Gate>>> = Lazy::new(|| Mutex::new(None));
+
+    pub(super) fn hold(queue: MessageQueue) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *NEXT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Gate {
+            queue,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn wait(queue: &MessageQueue) {
+        let gate = {
+            let mut next = NEXT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            next.take_if(|gate| &gate.queue == queue)
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+}
+
 pub struct ConsumeMessageConcurrentlyService {
     pub(crate) default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
     pub(crate) client_config: ArcMut<ClientConfig>,
@@ -51,6 +94,13 @@ pub struct ConsumeMessageConcurrentlyService {
     pub(crate) message_listener: ArcBoxMessageListenerConcurrently,
     pub(crate) consume_runtime: Option<RocketMQRuntime>,
     work: Arc<super::consumer_work::ConsumerWork>,
+    /// Shared with the push consumer: one close stops admission on both sides.
+    delivery: Arc<super::consumer_work::DeliveryGate>,
+    /// Test-only answers for `send_message_back`, consumed in order (plan 49d R4): lets a test
+    /// drive the all-successful and mixed clustering send-back outcomes without a broker. Not
+    /// present in a production build.
+    #[cfg(test)]
+    pub(crate) send_back_outcomes: std::sync::Mutex<std::collections::VecDeque<bool>>,
 }
 
 impl ConsumeMessageConcurrentlyService {
@@ -60,6 +110,7 @@ impl ConsumeMessageConcurrentlyService {
         consumer_group: CheetahString,
         message_listener: ArcBoxMessageListenerConcurrently,
         default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
+        delivery: Arc<super::consumer_work::DeliveryGate>,
     ) -> Self {
         let consume_thread = consumer_config.consume_thread_max;
         let consumer_group_tag = format!("{}_{}", "ConsumeMessageThread_", consumer_group);
@@ -74,6 +125,9 @@ impl ConsumeMessageConcurrentlyService {
                 consumer_group_tag.as_str(),
             )),
             work: Arc::new(super::consumer_work::ConsumerWork::default()),
+            delivery,
+            #[cfg(test)]
+            send_back_outcomes: Default::default(),
         }
     }
 }
@@ -117,6 +171,15 @@ impl ConsumeMessageConcurrentlyService {
             },
         };
 
+        // Messages this attempt **finished** without the listener acknowledging them: dropped after
+        // exhausting broadcast retries, or handed back to the broker successfully. They are
+        // collected here and removed from the process queue with the acknowledged ones
+        // (plan 49d R4) - a terminal message that stays cached pins the commit offset
+        // behind it and can hold enough of the queue's count/size budget to stop further
+        // pulls, while its delivery ownership has already been released, so nothing else
+        // will ever clean it up.
+        let mut finalized: Vec<ArcMut<MessageExt>> = Vec::new();
+
         match self.consumer_config.message_model {
             MessageModel::Broadcasting => {
                 let pending_start = (ack_index + 1) as usize;
@@ -136,48 +199,69 @@ impl ConsumeMessageConcurrentlyService {
                                 msg.msg_id,
                                 attempts,
                             );
+                            finalized.push(msg);
                         } else {
                             msg.set_reconsume_times(attempts as i32 + 1);
                             to_retry.push(msg);
                         }
                     }
                     if !to_retry.is_empty() {
+                        // The retried messages leave this attempt but are not finished: their
+                        // ownership moves to the delayed request, which
+                        // releases them when it commits. Without the
+                        // transfer this batch's owner would subtract them at the end of the attempt
+                        // and the sleeping retry would be invisible until
+                        // it ran again (plan 49c C4).
+                        let accounting = consume_request
+                            .accounting
+                            .as_mut()
+                            .and_then(|owner| owner.split_off(to_retry.len()));
                         self.submit_consume_request_later_with_delay(
                             to_retry,
                             this,
                             consume_request.process_queue.clone(),
                             consume_request.message_queue.clone(),
                             retry_delay,
+                            accounting,
                         );
                     }
                 }
             }
             MessageModel::Clustering => {
                 let len = consume_request.msgs.len();
-                let mut msg_back_failed = Vec::with_capacity(len);
-                let mut msg_back_success = Vec::with_capacity(len);
                 let failed_msgs = consume_request.msgs.split_off((ack_index + 1) as usize);
-                for mut msg in failed_msgs {
-                    if !consume_request.process_queue.contains_message(&msg).await {
-                        continue;
-                    }
-
-                    let result = self.send_message_back(&mut msg, context).await;
-                    if !result {
-                        let reconsume_times = msg.reconsume_times() + 1;
-                        msg.set_reconsume_times(reconsume_times);
-                        msg_back_failed.push(msg);
-                    } else {
-                        msg_back_success.push(msg);
+                // What the queue still holds, in order; a message someone else already took has
+                // nothing left to send back and nothing left to remove.
+                let mut held = Vec::with_capacity(len);
+                for msg in failed_msgs {
+                    if consume_request.process_queue.contains_message(&msg).await {
+                        held.push(msg);
                     }
                 }
+                let mut sent_back = Vec::with_capacity(held.len());
+                for msg in held.iter_mut() {
+                    sent_back.push(self.send_message_back(msg.as_mut(), context).await);
+                }
+                let (msg_back_failed, sent_back) = partition_send_backs(held, &sent_back);
+                // The broker took these back for redelivery: this queue is done with them, whether
+                // or not any sibling send-back failed (plan 49d R4). Keeping the
+                // successful ones only when something also failed left an
+                // all-successful batch cached forever.
+                finalized.extend(sent_back);
                 if !msg_back_failed.is_empty() {
-                    consume_request.msgs.append(&mut msg_back_success);
+                    // Same transfer as the broadcasting retry above: these messages are queued
+                    // again and stay outstanding work until that attempt
+                    // commits them (plan 49c C4).
+                    let accounting = consume_request
+                        .accounting
+                        .as_mut()
+                        .and_then(|owner| owner.split_off(msg_back_failed.len()));
                     self.submit_consume_request_later(
                         msg_back_failed,
                         this,
                         consume_request.process_queue.clone(),
                         consume_request.message_queue.clone(),
+                        accounting,
                     );
                 }
             }
@@ -188,11 +272,22 @@ impl ConsumeMessageConcurrentlyService {
         // offset advancement. Independent queues are not blocked because each
         // ProcessQueue carries its own lock.
         let _commit_guard = consume_request.process_queue.commit_lock.lock().await;
-        let offset = consume_request
-            .process_queue
-            .remove_message(&consume_request.msgs)
-            .await;
-        if offset >= 0 && !consume_request.process_queue.is_dropped() {
+        // One removal for the whole finished set, under the same commit lock: cached count, cached
+        // bytes and the resulting memory offset then all describe the messages this attempt is done
+        // with, and only locally retried messages stay in `ProcessQueue` (plan 49d R4).
+        let mut removals = consume_request.msgs.clone();
+        removals.extend(finalized);
+        let offset = consume_request.process_queue.remove_message(&removals).await;
+        if offset >= 0
+            && !consume_request.process_queue.is_dropped()
+            && self
+                .default_mqpush_consumer_impl
+                .as_ref()
+                .unwrap()
+                .owns_process_queue(&consume_request.message_queue, &consume_request.process_queue)
+        {
+            #[cfg(test)]
+            review49m_commit_gate::wait(&consume_request.message_queue).await;
             let default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_mut().unwrap();
             default_mqpush_consumer_impl
                 .offset_store
@@ -203,18 +298,23 @@ impl ConsumeMessageConcurrentlyService {
         }
     }
 
+    /// Queue a retry of messages whose accounting ownership was transferred from the attempt that
+    /// failed them. `accounting` is `None` only when the batch carried no SDK ownership; a
+    /// cancelled sleep releases it here rather than leaving the count held by a task that will
+    /// never run.
     fn submit_consume_request_later(
         &self,
         msgs: Vec<ArcMut<MessageExt>>,
         this: ArcMut<Self>,
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
+        accounting: Option<DeliveryOwner>,
     ) {
         self.work
             .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let this_ = this.clone();
-                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                this.submit_consume_request_accounted(this_, msgs, process_queue, message_queue, true, accounting)
                     .await;
             });
     }
@@ -226,17 +326,24 @@ impl ConsumeMessageConcurrentlyService {
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
         delay: Duration,
+        accounting: Option<DeliveryOwner>,
     ) {
         self.work
             .spawn(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
                 tokio::time::sleep(delay).await;
                 let this_ = this.clone();
-                this.submit_consume_request(this_, msgs, process_queue, message_queue, true)
+                this.submit_consume_request_accounted(this_, msgs, process_queue, message_queue, true, accounting)
                     .await;
             });
     }
 
     pub async fn send_message_back(&mut self, msg: &mut MessageExt, context: &ConsumeConcurrentlyContext) -> bool {
+        // Test-only broker answer (plan 49d R4): a queued outcome is returned instead of calling
+        // the broker, so what leaves the process queue can be tested per send-back result.
+        #[cfg(test)]
+        if let Some(outcome) = self.send_back_outcomes.lock().unwrap().pop_front() {
+            return outcome;
+        }
         let delay_level = context.delay_level_when_next_consume;
         msg.set_topic(self.client_config.with_namespace(msg.get_topic().as_str()));
 
@@ -269,10 +376,17 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
             });
     }
 
+    /// Stops accepting new delivery without waiting for anything; idempotent so every cleanup
+    /// entry point may call it before it awaits a tracker.
+    fn begin_shutdown(&mut self) {
+        self.delivery.close();
+        self.work.close();
+    }
+
     async fn shutdown(&mut self, _await_terminate_millis: u64) {
         // The caller owns the absolute timeout. A blocked synchronous listener
         // keeps its task token, so a timeout cannot be mistaken for safe cleanup.
-        self.work.close();
+        self.begin_shutdown();
         self.work.wait().await;
         if let Some(runtime) = self.consume_runtime.take() {
             runtime.shutdown();
@@ -303,15 +417,24 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
 
         let begin_timestamp = Instant::now();
 
-        let status = self.message_listener.consume_message(
-            &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>(),
-            &mut context,
-        );
+        // A panicking listener must still produce a result for the admin/broadcast caller instead
+        // of unwinding out of this task (plan 49a F5).
+        let status = call_listener_catching(|| {
+            self.message_listener.consume_message(
+                &msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>(),
+                &mut context,
+            )
+        });
         let mut result = ConsumeMessageDirectlyResult::default();
         result.set_order(false);
         result.set_auto_commit(true);
         match status {
-            Ok(status) => match status {
+            ListenerCall::ThrewPanic => {
+                error!("message listener panicked while consuming directly, reporting a thrown exception");
+                result.set_consume_result(CMResult::CRThrowException);
+                result.set_remark(CheetahString::from_static_str("listener panicked"));
+            }
+            ListenerCall::Returned(Ok(status)) => match status {
                 ConsumeConcurrentlyStatus::ConsumeSuccess => {
                     result.set_consume_result(CMResult::CRSuccess);
                 }
@@ -319,7 +442,7 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                     result.set_consume_result(CMResult::CRLater);
                 }
             },
-            Err(e) => {
+            ListenerCall::Returned(Err(e)) => {
                 result.set_consume_result(CMResult::CRThrowException);
                 result.set_remark(CheetahString::from_string(e.to_string()))
             }
@@ -337,11 +460,39 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
     ) {
+        // No SDK ownership accompanies a batch submitted without one; such a request neither adds
+        // nor releases counts of its own.
+        self.submit_consume_request_accounted(this, msgs, process_queue, message_queue, dispatch_to_consume, None)
+            .await;
+    }
+
+    async fn submit_consume_request_accounted(
+        &self,
+        this: ArcMut<Self>,
+        msgs: Vec<ArcMut<MessageExt>>,
+        process_queue: Arc<ProcessQueue>,
+        message_queue: MessageQueue,
+        dispatch_to_consume: bool,
+        mut accounting: Option<DeliveryOwner>,
+    ) {
+        let queued = accounting.as_ref().map_or(0, |owner| owner.messages());
         if self.work.is_closed() {
+            // Rejected admission: this batch will never run, so its ownership ends here rather than
+            // being counted as work forever (plan 49c C4).
+            debug!(
+                messages = queued,
+                "consume service is closed, releasing the queued batch instead of admitting it"
+            );
             return;
         }
+        // ProcessQueue::put_message returns an orderly-consumption wake-up flag: it is true
+        // only when that queue first becomes consuming. Concurrent consumption schedules every
+        // newly pulled batch independently, including when this flag is false. Rejecting later
+        // batches strands their cached messages without a listener or accounting owner, eventually
+        // stopping pulls at the queue's flow-control threshold.
         let consume_batch_size = self.consumer_config.consume_message_batch_max_size;
         if msgs.len() <= consume_batch_size as usize {
+            let owned = accounting.as_mut().and_then(|owner| owner.split_off(msgs.len()));
             let mut consume_request = ConsumeRequest {
                 msgs,
                 message_listener: self.message_listener.clone(),
@@ -350,6 +501,8 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                 dispatch_to_consume,
                 consumer_group: self.consumer_group.clone(),
                 default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                delivery: self.delivery.clone(),
+                accounting: owned,
             };
 
             self.work
@@ -357,24 +510,29 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
                     consume_request.run(this).await
                 });
         } else {
-            msgs.chunks(consume_batch_size as usize)
-                .map(|t| t.to_vec())
-                .for_each(|msgs| {
-                    let mut consume_request = ConsumeRequest {
-                        msgs,
-                        message_listener: self.message_listener.clone(),
-                        process_queue: process_queue.clone(),
-                        message_queue: message_queue.clone(),
-                        dispatch_to_consume,
-                        consumer_group: self.consumer_group.clone(),
-                        default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
-                    };
-                    let consume_message_concurrently_service = this.clone();
-                    self.work
-                        .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
-                            consume_request.run(consume_message_concurrently_service).await
-                        });
-                });
+            // One owner per chunk, taken from the single batch admitted at handover, so the chunks
+            // can commit in any order and each releases exactly its own messages (plan
+            // 49c C4).
+            for chunk in msgs.chunks(consume_batch_size as usize) {
+                let chunk = chunk.to_vec();
+                let owned = accounting.as_mut().and_then(|owner| owner.split_off(chunk.len()));
+                let mut consume_request = ConsumeRequest {
+                    msgs: chunk,
+                    message_listener: self.message_listener.clone(),
+                    process_queue: process_queue.clone(),
+                    message_queue: message_queue.clone(),
+                    dispatch_to_consume,
+                    consumer_group: self.consumer_group.clone(),
+                    default_mqpush_consumer_impl: self.default_mqpush_consumer_impl.clone(),
+                    delivery: self.delivery.clone(),
+                    accounting: owned,
+                };
+                let consume_message_concurrently_service = this.clone();
+                self.work
+                    .spawn_draining(self.consume_runtime.as_ref().unwrap().get_handle(), async move {
+                        consume_request.run(consume_message_concurrently_service).await
+                    });
+            }
         }
     }
 
@@ -389,7 +547,31 @@ impl ConsumeMessageServiceTrait for ConsumeMessageConcurrentlyService {
     }
 }
 
+/// Decide what a refused batch does next from the broker's own answers, in the order the send-backs
+/// were attempted (plan 49d R4). A message the broker accepted is finished with this queue; only
+/// one it refused is tried again, and that one carries its incremented attempt count.
+pub(crate) fn partition_send_backs(
+    messages: Vec<ArcMut<MessageExt>>,
+    sent_back: &[bool],
+) -> (Vec<ArcMut<MessageExt>>, Vec<ArcMut<MessageExt>>) {
+    let mut failed = Vec::with_capacity(messages.len());
+    let mut succeeded = Vec::with_capacity(messages.len());
+    for (index, mut msg) in messages.into_iter().enumerate() {
+        if sent_back.get(index).copied().unwrap_or(false) {
+            succeeded.push(msg);
+        } else {
+            let reconsume_times = msg.reconsume_times() + 1;
+            msg.set_reconsume_times(reconsume_times);
+            failed.push(msg);
+        }
+    }
+    (failed, succeeded)
+}
+
 struct ConsumeRequest {
+    /// Accounting ownership of `msgs`, taken when the batch was admitted. `None` for a request
+    /// built without SDK ownership, which then neither adds nor releases counts.
+    accounting: Option<DeliveryOwner>,
     msgs: Vec<ArcMut<MessageExt>>,
     message_listener: ArcBoxMessageListenerConcurrently,
     process_queue: Arc<ProcessQueue>,
@@ -397,10 +579,17 @@ struct ConsumeRequest {
     dispatch_to_consume: bool,
     consumer_group: CheetahString,
     default_mqpush_consumer_impl: Option<ArcMut<DefaultMQPushConsumerImpl>>,
+    delivery: Arc<super::consumer_work::DeliveryGate>,
 }
 
 impl ConsumeRequest {
     async fn run(&mut self, mut consume_message_concurrently_service: ArcMut<ConsumeMessageConcurrentlyService>) {
+        // SDK-owned delivery accounting (plan 49 section 4.2, plan 49c C4): this request holds the
+        // ownership taken when its batch was admitted, so a revoked queue still releases the batch
+        // it will never deliver and a listener that blocks or unwinds cannot leave pending
+        // work counted forever - and nothing here has to add a count that someone else
+        // already added.
+        let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
         if self.process_queue.is_dropped() {
             info!(
                 "the message queue not be able to consume, because it's dropped. group={} {}",
@@ -408,9 +597,14 @@ impl ConsumeRequest {
             );
             return;
         }
+        // Listener admission (plan 49 section 4.3): claimed atomically before anything is executed.
+        // A batch that never started is rejected here without advancing its offsets, while a batch
+        // that did start holds the permit until its commit, so cleanup drains it instead of losing
+        // it. The lock is not held across the listener call.
+        let Some(_admission) = self.delivery.admit() else {
+            return;
+        };
         let mut context = ConsumeConcurrentlyContext::new(self.message_queue.clone());
-
-        let mut default_mqpush_consumer_impl = self.default_mqpush_consumer_impl.as_ref().unwrap().clone();
         let consumer_group = self.consumer_group.clone();
         DefaultMQPushConsumerImpl::try_reset_pop_retry_topic(&mut self.msgs, consumer_group.as_str());
         default_mqpush_consumer_impl.reset_retry_and_namespace(&mut self.msgs, consumer_group.as_str());
@@ -448,13 +642,39 @@ impl ConsumeRequest {
                 default_mqpush_consumer_impl.execute_hook_before(&mut consume_message_context);
             }
             let vec = self.msgs.iter().map(|msg| msg.as_ref()).collect::<Vec<&MessageExt>>();
-            match self.message_listener.consume_message(&vec, &mut context) {
-                Ok(value) => {
+            if let Some(owner) = self.accounting.as_mut() {
+                owner.enter_listener();
+            }
+            match call_listener_catching(|| self.message_listener.consume_message(&vec, &mut context)) {
+                ListenerCall::Returned(Ok(value)) => {
                     status = Some(value);
                 }
-                Err(_) => {
+                ListenerCall::Returned(Err(_)) => {
                     has_exception = true;
                 }
+                // Plan 49a F5: an unwinding listener is failed consumption, not a dead task. The delivery
+                // guard still releases this batch as the panic unwinds, and leaving `status` unset routes
+                // the messages through the existing retry/send-back path below.
+                ListenerCall::ThrewPanic => {
+                    error!(
+                        "message listener panicked, treating {} message(s) as failed consumption, mq={}",
+                        self.msgs.len(),
+                        self.message_queue
+                    );
+                    // A listener that unwound may have acknowledged part of the batch on its way
+                    // out. That acknowledgement is void: the panic means the
+                    // work it covered did not finish, and honouring it would
+                    // advance consumption past business work while reporting the batch
+                    // as retried (plan 49c C4). A listener that *returned* with an ack index keeps
+                    // it.
+                    context.ack_index = None;
+                    has_exception = true;
+                }
+            }
+            // The callback is over: user code no longer occupies a slot, and the batch moves to the
+            // commit phase whose offsets this call still has to write (plan 49c C4).
+            if let Some(owner) = self.accounting.as_mut() {
+                owner.leave_listener();
             }
             // Update last_consume_timestamp after the listener returns so that
             // admin/running-info reflects real callback progress, not flow-control entries.
@@ -511,5 +731,590 @@ impl ConsumeRequest {
                 .process_consume_result(this, status.unwrap(), &context, self)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc as StdArc;
+
+    use super::*;
+    use crate::consumer::listener::message_listener_concurrently::MessageListenerConcurrently;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_store::OffsetStore;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+    use crate::consumer::store::remote_broker_offset_store::RemoteBrokerOffsetStore;
+    use crate::factory::mq_client_instance::MQClientInstance;
+
+    struct Listener {
+        status: ConsumeConcurrentlyStatus,
+        ack_index: Option<i32>,
+    }
+
+    impl MessageListenerConcurrently for Listener {
+        fn consume_message(
+            &self,
+            _: &[&MessageExt],
+            context: &mut ConsumeConcurrentlyContext,
+        ) -> rocketmq_error::RocketMQResult<ConsumeConcurrentlyStatus> {
+            context.ack_index = self.ack_index;
+            Ok(self.status)
+        }
+    }
+
+    fn message(queue_offset: i64, reconsume_times: i32) -> MessageExt {
+        let mut msg = MessageExt {
+            queue_offset,
+            reconsume_times,
+            ..Default::default()
+        };
+        msg.message.body = Some(bytes::Bytes::from_static(b"x"));
+        msg
+    }
+
+    /// A consumer whose every remote call fails fast, a process queue holding `messages`, and the
+    /// request that runs one delivery attempt over them.
+    struct Fixture {
+        group: CheetahString,
+        mq: MessageQueue,
+        push: ArcMut<DefaultMQPushConsumerImpl>,
+        service: ArcMut<ConsumeMessageConcurrentlyService>,
+        pq: StdArc<ProcessQueue>,
+        client: ArcMut<MQClientInstance>,
+    }
+
+    impl Fixture {
+        async fn new(
+            name: &str,
+            message_model: MessageModel,
+            broadcast_max_retries: u32,
+            messages: Vec<MessageExt>,
+        ) -> Self {
+            let group = CheetahString::from_string(format!("rereview49d-{name}"));
+            let cc = ClientConfig {
+                namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:1")),
+                ..Default::default()
+            };
+            let cfg = ArcMut::new(ConsumerConfig {
+                consumer_group: group.clone(),
+                message_model,
+                consume_thread_min: 1,
+                consume_thread_max: 1,
+                broadcast_max_retries,
+                // Long enough that a locally retried message is still parked when the test looks.
+                broadcast_retry_delay: Duration::from_secs(600),
+                consume_concurrently_max_span: 0,
+                ..Default::default()
+            });
+            let listener: ArcBoxMessageListenerConcurrently = StdArc::new(Box::new(Listener {
+                status: ConsumeConcurrentlyStatus::ReconsumeLater,
+                ack_index: None,
+            }));
+            let mut push = ArcMut::new(DefaultMQPushConsumerImpl::new(cc.clone(), cfg.clone(), None));
+            let handle = push.clone();
+            push.set_default_mqpush_consumer_impl(handle);
+            let client = MQClientInstance::new_arc(cc.clone(), 0, format!("rereview49d-{name}"), None);
+            push.offset_store = Some(ArcMut::new(OffsetStore::new_with_remote(RemoteBrokerOffsetStore::new(
+                client.clone(),
+                group.clone(),
+            ))));
+            let service = ArcMut::new(ConsumeMessageConcurrentlyService::new(
+                ArcMut::new(cc),
+                cfg,
+                group.clone(),
+                listener.clone(),
+                Some(push.clone()),
+                push.delivery.clone(),
+            ));
+            let pq = StdArc::new(ProcessQueue::new());
+            let mq = MessageQueue::from_parts("T", "broker-a", 0);
+            let msgs = messages.into_iter().map(ArcMut::new).collect::<Vec<_>>();
+            // Keep shared handles so the test can inspect exactly what is still cached.
+            let cached_handles = msgs.clone();
+            pq.put_message(cached_handles).await;
+            Fixture {
+                group,
+                mq,
+                push,
+                service,
+                pq,
+                client,
+            }
+        }
+
+        fn request(
+            &self,
+            msgs: Vec<ArcMut<MessageExt>>,
+            listener: ArcBoxMessageListenerConcurrently,
+        ) -> ConsumeRequest {
+            let accounting = Some(self.push.progress.admit_batch(&self.mq, msgs.len()));
+            ConsumeRequest {
+                msgs,
+                message_listener: listener,
+                process_queue: self.pq.clone(),
+                message_queue: self.mq.clone(),
+                dispatch_to_consume: true,
+                consumer_group: self.group.clone(),
+                default_mqpush_consumer_impl: Some(self.push.clone()),
+                delivery: self.push.delivery.clone(),
+                accounting,
+            }
+        }
+
+        fn listener(
+            &self,
+            status: ConsumeConcurrentlyStatus,
+            ack_index: Option<i32>,
+        ) -> ArcBoxMessageListenerConcurrently {
+            StdArc::new(Box::new(Listener { status, ack_index }))
+        }
+
+        async fn memory_offset(&self) -> i64 {
+            self.push
+                .offset_store
+                .as_ref()
+                .unwrap()
+                .read_offset(&self.mq, ReadOffsetType::ReadFromMemory)
+                .await
+        }
+
+        async fn use_local_store(&mut self) -> std::path::PathBuf {
+            let path =
+                std::env::temp_dir().join(format!("review49m-consume-{}-{}.json", self.group, std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut local = LocalFileOffsetStore::new(self.client.clone(), self.group.clone());
+            local.review49e_path_and_lock(path.clone());
+            self.push.offset_store = Some(ArcMut::new(OffsetStore::new_with_local(local)));
+            self.push
+                .offset_store
+                .as_ref()
+                .unwrap()
+                .update_offset(&self.mq, 7, false)
+                .await;
+            path
+        }
+
+        async fn install_managed_queue(&self, mq: &MessageQueue, pq: &StdArc<ProcessQueue>) {
+            self.push.mark_managed_lifecycle();
+            self.push
+                .rebalance_impl
+                .rebalance_impl_inner
+                .process_queue_table
+                .write()
+                .await
+                .insert(mq.clone(), pq.clone());
+            self.push.note_queue_installed(mq, pq);
+        }
+
+        async fn shutdown(mut self) {
+            self.service.shutdown(100).await;
+            self.client.shutdown().await;
+        }
+    }
+
+    fn handles(messages: &[MessageExt]) -> Vec<ArcMut<MessageExt>> {
+        messages.iter().cloned().map(ArcMut::new).collect()
+    }
+
+    /// Control the broker's answers to this batch's send-backs (test-only field, plan 49d R4).
+    fn queue_send_back(fixture: &Fixture, outcomes: &[bool]) {
+        let mut guard = fixture.service.send_back_outcomes.lock().unwrap();
+        guard.clear();
+        guard.extend(outcomes.iter().copied());
+    }
+
+    /// A broadcast message that has used its last retry is finished with the queue: it must leave
+    /// `ProcessQueue` and advance the memory offset, not sit there pinning both forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_broadcast_failure_leaves_the_process_queue() {
+        let messages = vec![message(0, 0)];
+        let fixture = Fixture::new("terminal", MessageModel::Broadcasting, 0, messages.clone()).await;
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ReconsumeLater, None);
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        let snapshot = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        let cached = fixture.pq.msg_count();
+        let offset = fixture.memory_offset().await;
+        assert_eq!(cached, 0, "terminal drop left a message pinning the queue");
+        assert_eq!(offset, 1, "the memory offset must move past a terminal drop");
+        assert_eq!(snapshot.pending_delivery_msgs, 0);
+        assert_eq!(snapshot.committing_delivery_msgs, 0);
+        fixture.shutdown().await;
+    }
+
+    /// Mixed batch: acknowledged and terminal messages leave, the one still being retried stays
+    /// cached, and the offset may not pass what is still in the queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_broadcast_batch_removes_only_what_it_finished() {
+        let messages = vec![
+            message(0, 0), // acknowledged by ack_index
+            message(1, 0), // one retry left -> stays cached
+            message(2, 1), // out of retries -> terminal
+        ];
+        let fixture = Fixture::new("mixed", MessageModel::Broadcasting, 1, messages.clone()).await;
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ReconsumeLater, Some(0));
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        assert_eq!(fixture.pq.msg_count(), 1, "only the retried message stays cached");
+        assert!(
+            fixture.pq.contains_message(&messages[1]).await,
+            "the retried message must still be in the queue"
+        );
+        assert_eq!(
+            fixture.memory_offset().await,
+            1,
+            "the offset may not pass a message that is still cached"
+        );
+        let snapshot = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        assert_eq!(
+            snapshot.pending_delivery_msgs + snapshot.committing_delivery_msgs,
+            1,
+            "the retried message stays outstanding work while the finished ones are released"
+        );
+        fixture.shutdown().await;
+    }
+
+    /// A partially acknowledged successful batch removes exactly what it acknowledged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partially_acknowledged_batch_removes_the_acknowledged_prefix() {
+        let messages = vec![message(0, 0), message(1, 0), message(2, 0)];
+        let fixture = Fixture::new("partial-ack", MessageModel::Broadcasting, 5, messages.clone()).await;
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, Some(0));
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        assert_eq!(fixture.pq.msg_count(), 2, "the acknowledged message leaves");
+        assert!(!fixture.pq.contains_message(&messages[0]).await);
+        assert_eq!(fixture.memory_offset().await, 1);
+        fixture.shutdown().await;
+    }
+
+    /// A clustering send-back the broker refused stays cached and outstanding: only what the broker
+    /// accepted is finished with the queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_send_back_stays_in_the_process_queue() {
+        let messages = vec![message(0, 0)];
+        let fixture = Fixture::new("send-back", MessageModel::Clustering, 3, messages.clone()).await;
+        queue_send_back(&fixture, &[false]);
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ReconsumeLater, None);
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        assert_eq!(fixture.pq.msg_count(), 1, "a refused send-back stays cached");
+        assert!(fixture.pq.contains_message(&messages[0]).await);
+        assert_eq!(
+            fixture.memory_offset().await,
+            0,
+            "the offset may only point back at the message that is still cached"
+        );
+        let snapshot = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        assert_eq!(
+            snapshot.pending_delivery_msgs + snapshot.committing_delivery_msgs,
+            1,
+            "the refused message stays outstanding work"
+        );
+        fixture.shutdown().await;
+    }
+
+    /// Every send-back the broker accepted finishes the whole batch: nothing may stay cached and
+    /// the offset moves past all of it, even though no message was acknowledged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_all_successful_send_back_empties_the_process_queue() {
+        let messages = vec![message(0, 0), message(1, 0)];
+        let fixture = Fixture::new("send-back-all", MessageModel::Clustering, 3, messages.clone()).await;
+        queue_send_back(&fixture, &[true, true]);
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ReconsumeLater, None);
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        assert_eq!(
+            fixture.pq.msg_count(),
+            0,
+            "a handed-back batch is finished with the queue"
+        );
+        assert_eq!(fixture.memory_offset().await, 2);
+        let snapshot = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        assert_eq!(
+            snapshot.pending_delivery_msgs + snapshot.committing_delivery_msgs,
+            0,
+            "a message the broker took back is no longer outstanding work here"
+        );
+        fixture.shutdown().await;
+    }
+
+    /// A real consume-result commit that passed its final ownership check before retirement marks
+    /// the queue dropped remains inside the commit barrier. Retirement waits for that commit,
+    /// persists its newer offset, and only then removes the in-memory queue and acquisition. A
+    /// sibling queue can commit while this queue is paused, proving the barrier is per queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_consume_result_commit_is_proven_before_retirement_forgets_it() {
+        use crate::consumer::consumer_impl::re_balance::Rebalance;
+        use crate::consumer::store::read_offset_type::ReadOffsetType;
+
+        let messages = vec![message(98, 0)];
+        let mut fixture = Fixture::new("retirement-commit", MessageModel::Broadcasting, 0, messages.clone()).await;
+        let path = fixture.use_local_store().await;
+        fixture.install_managed_queue(&fixture.mq, &fixture.pq).await;
+        let mut request = fixture.request(
+            handles(&messages),
+            fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+        );
+        let context = ConsumeConcurrentlyContext::new(fixture.mq.clone());
+        let (entered, release) = review49m_commit_gate::hold(fixture.mq.clone());
+        let service = fixture.service.clone();
+        let mut commit_service = service.clone();
+        let mut commit = tokio::spawn(async move {
+            commit_service
+                .process_consume_result(
+                    service,
+                    ConsumeConcurrentlyStatus::ConsumeSuccess,
+                    &context,
+                    &mut request,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered)
+            .await
+            .expect("the production consume-result path never reached its admitted commit")
+            .expect("the commit gate was dropped before the offset update");
+
+        let mut rebalance = fixture.push.rebalance_impl.clone();
+        let retirement_mq = fixture.mq.clone();
+        let retirement_pq = fixture.pq.clone();
+        let mut retirement = tokio::spawn(async move {
+            rebalance.remove_process_queue(&retirement_mq, &retirement_pq).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.pq.is_dropped() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement did not close the old queue before waiting for its commit lock");
+
+        let other_mq = MessageQueue::from_parts("T-sibling", "broker-a", 0);
+        let other_pq = StdArc::new(ProcessQueue::new());
+        fixture.install_managed_queue(&other_mq, &other_pq).await;
+        let other_messages = vec![message(21, 0)];
+        other_pq.put_message(handles(&other_messages)).await;
+        let other_accounting = Some(fixture.push.progress.admit_batch(&other_mq, other_messages.len()));
+        let mut other_request = ConsumeRequest {
+            msgs: handles(&other_messages),
+            message_listener: fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+            process_queue: other_pq.clone(),
+            message_queue: other_mq.clone(),
+            dispatch_to_consume: true,
+            consumer_group: fixture.group.clone(),
+            default_mqpush_consumer_impl: Some(fixture.push.clone()),
+            delivery: fixture.push.delivery.clone(),
+            accounting: other_accounting,
+        };
+        let other_context = ConsumeConcurrentlyContext::new(other_mq.clone());
+        let sibling_service = ArcMut::new(ConsumeMessageConcurrentlyService::new(
+            fixture.service.client_config.clone(),
+            fixture.service.consumer_config.clone(),
+            fixture.group.clone(),
+            fixture.listener(ConsumeConcurrentlyStatus::ConsumeSuccess, None),
+            Some(fixture.push.clone()),
+            fixture.push.delivery.clone(),
+        ));
+        let mut sibling_service_mut = sibling_service.clone();
+        sibling_service_mut
+            .process_consume_result(
+                sibling_service.clone(),
+                ConsumeConcurrentlyStatus::ConsumeSuccess,
+                &other_context,
+                &mut other_request,
+            )
+            .await;
+        let sibling_offset = fixture
+            .push
+            .offset_store
+            .as_ref()
+            .unwrap()
+            .read_offset(&other_mq, ReadOffsetType::ReadFromMemory)
+            .await;
+        assert_eq!(
+            sibling_offset, 22,
+            "an unrelated queue waited on the retiring queue's commit barrier"
+        );
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut commit)
+            .await
+            .expect("the consume-result commit stayed blocked")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut retirement)
+            .await
+            .expect("retirement did not finish after the admitted commit released its lock")
+            .unwrap();
+
+        let store = fixture.push.offset_store.as_ref().unwrap();
+        let memory = store.read_offset(&fixture.mq, ReadOffsetType::ReadFromMemory).await;
+        let disk = store.read_offset(&fixture.mq, ReadOffsetType::ReadFromStore).await;
+        let proof = store.local_writer_finished().await;
+        let epoch = fixture.push.progress.current_epoch(&fixture.mq);
+        sibling_service_mut.shutdown(100).await;
+        fixture.shutdown().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+
+        assert_eq!(memory, -1, "retirement did not remove the proven memory copy");
+        assert_eq!(
+            disk, 99,
+            "retirement forgot a consume-result offset newer than its earlier snapshot"
+        );
+        assert!(proof, "the final write did not settle local offset proof");
+        assert_eq!(epoch, None, "the retired acquisition stayed published");
+        assert_eq!(sibling_offset, 22);
+    }
+
+    /// A mixed send-back batch removes only what the broker accepted; the refused one stays cached
+    /// and keeps the offset from passing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_send_back_removes_only_what_the_broker_took() {
+        let messages = vec![message(0, 0), message(1, 0)];
+        let fixture = Fixture::new("send-back-mixed", MessageModel::Clustering, 3, messages.clone()).await;
+        queue_send_back(&fixture, &[true, false]);
+        let listener = fixture.listener(ConsumeConcurrentlyStatus::ReconsumeLater, None);
+        let mut request = fixture.request(handles(&messages), listener);
+        request.run(fixture.service.clone()).await;
+        drop(request);
+
+        assert_eq!(fixture.pq.msg_count(), 1, "only the refused message stays cached");
+        assert!(fixture.pq.contains_message(&messages[1]).await);
+        assert_eq!(fixture.memory_offset().await, 1);
+        fixture.shutdown().await;
+    }
+
+    /// The broker's answers decide what leaves the queue: an all-successful batch is finished with
+    /// every message, and a mixed one only finishes the accepted subset.
+    #[test]
+    fn send_back_answers_decide_what_is_finished() {
+        let build = |offsets: &[i64]| {
+            offsets
+                .iter()
+                .map(|offset| ArcMut::new(message(*offset, 0)))
+                .collect::<Vec<_>>()
+        };
+
+        let (failed, finalized) = partition_send_backs(build(&[0, 1, 2]), &[true, true, true]);
+        assert!(failed.is_empty());
+        assert_eq!(finalized.len(), 3, "an all-successful batch is fully finished");
+        assert_eq!(finalized[0].reconsume_times(), 0);
+
+        let (failed, finalized) = partition_send_backs(build(&[0, 1, 2]), &[true, false, true]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].queue_offset, 1);
+        assert_eq!(failed[0].reconsume_times(), 1, "a retried message counts its attempt");
+        assert_eq!(finalized.len(), 2);
+
+        let (failed, finalized) = partition_send_backs(build(&[0, 1]), &[false, false]);
+        assert_eq!(failed.len(), 2);
+        assert!(finalized.is_empty());
+
+        let (failed, finalized) = partition_send_backs(Vec::new(), &[]);
+        assert!(failed.is_empty() && finalized.is_empty());
+    }
+
+    struct CountingSuccess(StdArc<std::sync::atomic::AtomicU64>);
+
+    impl MessageListenerConcurrently for CountingSuccess {
+        fn consume_message(
+            &self,
+            msgs: &[&MessageExt],
+            _: &mut ConsumeConcurrentlyContext,
+        ) -> rocketmq_error::RocketMQResult<ConsumeConcurrentlyStatus> {
+            self.0.fetch_add(msgs.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            Ok(ConsumeConcurrentlyStatus::ConsumeSuccess)
+        }
+    }
+
+    async fn repeated_pull_batches_are_dispatched(model: MessageModel, label: &str) {
+        let mut fixture = Fixture::new(label, model, 3, Vec::new()).await;
+        let received = StdArc::new(std::sync::atomic::AtomicU64::new(0));
+        fixture.service.message_listener = StdArc::new(Box::new(CountingSuccess(received.clone())));
+        fixture.service.consumer_config.consume_message_batch_max_size = 2;
+        let mut expected = 0;
+        let mut drained = true;
+        for offsets in [vec![0], vec![1], vec![2, 3, 4]] {
+            let msgs = offsets
+                .into_iter()
+                .map(|offset| ArcMut::new(message(offset, 0)))
+                .collect::<Vec<_>>();
+            expected += msgs.len() as u64;
+            let dispatch = fixture.pq.put_message(msgs.clone()).await;
+            assert_eq!(dispatch, expected == 1, "put_message exposes an orderly wake-up flag");
+            let owner = fixture.push.progress.admit_batch(&fixture.mq, msgs.len());
+            fixture
+                .service
+                .submit_consume_request_accounted(
+                    fixture.service.clone(),
+                    msgs,
+                    fixture.pq.clone(),
+                    fixture.mq.clone(),
+                    dispatch,
+                    Some(owner),
+                )
+                .await;
+            drained = tokio::time::timeout(Duration::from_secs(1), async {
+                while received.load(std::sync::atomic::Ordering::SeqCst) != expected || fixture.pq.msg_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !drained {
+                break;
+            }
+        }
+        fixture.service.work.close();
+        fixture.service.work.wait().await;
+        let calls = received.load(std::sync::atomic::Ordering::SeqCst);
+        let cached = fixture.pq.msg_count();
+        let offset = fixture.memory_offset().await;
+        let progress = fixture
+            .push
+            .progress
+            .snapshot(Duration::from_secs(30), Duration::from_secs(45));
+        fixture.shutdown().await;
+        assert!(
+            drained,
+            "later pulled batch was not dispatched: received={calls}, expected={expected}, cached={cached}"
+        );
+        assert_eq!(calls, 5);
+        assert_eq!(cached, 0);
+        assert_eq!(offset, 5);
+        assert_eq!(progress.pending_delivery_msgs, 0);
+        assert_eq!(progress.accounting_underflows, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_broadcast_pull_batches_reach_the_listener() {
+        repeated_pull_batches_are_dispatched(MessageModel::Broadcasting, "continuous-broadcast").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_clustering_pull_batches_reach_the_listener() {
+        repeated_pull_batches_are_dispatched(MessageModel::Clustering, "continuous-clustering").await;
     }
 }

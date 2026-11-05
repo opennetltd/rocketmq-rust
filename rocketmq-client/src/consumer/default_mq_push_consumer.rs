@@ -23,6 +23,8 @@ use rocketmq_remoting::protocol::namespace_util::NamespaceUtil;
 use rocketmq_remoting::runtime::RPCHook;
 use rocketmq_rust::ArcMut;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -638,6 +640,10 @@ impl MQPushConsumer for DefaultMQPushConsumer {
     }
 }
 
+/// How long a repair round waits on another caller's flight before moving on (plan 49d R3). The
+/// owner keeps running and a later round may join it again: waiting is not failing (plan 49e E3).
+pub(crate) const ROUTE_REPAIR_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A replacement is permitted only after `Complete`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsumerCleanup {
@@ -645,8 +651,252 @@ pub enum ConsumerCleanup {
     Incomplete,
 }
 
+/// What one route-repair round achieved (plan 49e E3).
+///
+/// A round can finish its sweep having done no control-plane work at all: every topic was inside a
+/// success cooldown, deferred behind a scheduled retry, or still waiting on another caller's
+/// flight. Reporting only "the sweep finished" let the controller charge those rounds as failed
+/// attempts and roll an incarnation after four checks that never reached a nameserver, while a
+/// genuinely failing fetch looks the same in the snapshot. So the round carries its own evidence:
+/// how many flights gave this round a terminal answer, and how many of those answers said the fetch
+/// failed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RouteRepairRound {
+    /// The topic a later round continues after, or `None` when this sweep finished.
+    pub(crate) continuation: Option<CheetahString>,
+    /// Flights whose terminal answer this round received (fetched by us, or joined).
+    pub(crate) terminal_attempts: u32,
+    /// Terminal answers that said the fetch failed.
+    pub(crate) terminal_failures: u32,
+}
+
+/// One bounded route-repair pass, owned by whoever asked for it so it can be pinned and polled
+/// beside other work instead of blocking it (plan 49d R3). Resolves to where a later round
+/// continues plus what this round's own flights proved.
+pub(crate) type RouteRepairPass = Pin<Box<dyn Future<Output = RouteRepairRound> + Send>>;
+
+/// One bounded lost-pull repair pass. Resolves to whether anything is still lost.
+pub(crate) type LostPullRepairPass =
+    Pin<Box<dyn Future<Output = crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound> + Send>>;
+
 impl DefaultMQPushConsumer {
-    /// Uses the same deadline for lock acquisition and every local cleanup phase.
+    /// The SDK-owned progress bus of this instance. Shared with the recovery controller so it can
+    /// observe real work transitions without an application observer.
+    pub(crate) fn progress(&self) -> Arc<crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .expect("default_mqpush_consumer_impl is None")
+            .progress
+            .clone()
+    }
+
+    /// Replace the progress bus before startup. Used by the managed entry point so one controller
+    /// can observe each incarnation it builds.
+    pub(crate) fn set_progress(
+        &mut self,
+        progress: Arc<crate::consumer::consumer_impl::consumer_lifecycle::ConsumerProgress>,
+    ) {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .expect("default_mqpush_consumer_impl is None")
+            .progress = progress;
+    }
+
+    /// In-place repair used by the recovery controller: refresh the route of every topic this
+    /// consumer actually subscribes to at runtime through the normal publish path, reconcile
+    /// broker state, then wake this client's own rebalance so each queue gets at most one new
+    /// pull request. Never registers a second client.
+    ///
+    /// The pass is resumable (plan 49c C2): it starts after `after` in sorted topic order and stops
+    /// at its time slice between topics, returning the topic to continue from so the next round
+    /// carries on instead of repeating what already succeeded. An in-flight bounded route wait
+    /// is never cut short.
+    ///
+    /// It is returned as an **owned** future (plan 49d R3) holding only cloned handles - the
+    /// runtime subscription table and this client's instance - so the controller can pin it and
+    /// keep polling its status cadence beside it instead of being blocked behind a nameserver.
+    pub(crate) fn route_repair_pass(
+        &mut self,
+        after: Option<cheetah_string::CheetahString>,
+        slice: std::time::Duration,
+    ) -> Option<RouteRepairPass> {
+        let impl_ = self.default_mqpush_consumer_impl.as_ref()?;
+        // The **runtime** subscription table is authoritative (plan 49d R2). Managed construction
+        // detaches the builder's subscriptions and re-applies them through `subscribe`,
+        // which writes here and leaves `consumer_config.subscription` empty, so reading
+        // configuration made every managed repair finish without visiting a single
+        // subscribed topic. Namespace normalisation and later subscribe/unsubscribe also
+        // land only here, including the SDK retry topic added at start.
+        let subscriptions = impl_.rebalance_impl.get_subscription_inner();
+        let instance = impl_.client_instance.clone()?;
+        Some(Box::pin(async move {
+            let mut instance = instance;
+            let topics: Vec<cheetah_string::CheetahString> = {
+                let guard = subscriptions.read().await;
+                let mut keys = guard.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            };
+            let started = std::time::Instant::now();
+            let resume = after.clone();
+            let after = after.as_ref();
+            let pending: Vec<_> = topics
+                .into_iter()
+                .filter(|topic| after.is_none_or(|done| topic.as_str() > done.as_str()))
+                .collect();
+            // The last topic whose route was actually asked for. A round that runs out of budget
+            // hands off at a step boundary and names what it reached, rather than starting another
+            // bounded lookup on an exhausted round or claiming work it never did (plan 49e E3).
+            let mut reached: Option<cheetah_string::CheetahString> = None;
+            // Terminal evidence collected from this round's own flights (plan 49e E3).
+            let mut terminal_attempts = 0u32;
+            let mut terminal_failures = 0u32;
+            for (index, topic) in pending.iter().enumerate() {
+                if index > 0 && started.elapsed() >= slice {
+                    instance.re_balance_immediately();
+                    tracing::debug!(
+                        topic = %topic,
+                        "route repair reached its time slice, continuing with the remaining topics on the next status round"
+                    );
+                    return RouteRepairRound {
+                        continuation: reached.or_else(|| resume.clone()),
+                        terminal_attempts,
+                        terminal_failures,
+                    };
+                }
+                // A resumed slice works from a snapshot: whatever unsubscribed in the meantime must
+                // not get route work for a subscription this consumer no longer holds.
+                if !subscriptions.read().await.contains_key(topic) {
+                    tracing::debug!(
+                        topic = %topic,
+                        "this topic is no longer subscribed, dropping it from the route repair"
+                    );
+                    continue;
+                }
+                // The guard's own distinction is what the controller needs (plan 49e E3): a fetch
+                // that answered, a joined flight's answer, an owner whose flight still runs and a
+                // deferred cooldown/backoff check are not four equivalent attempts. Reducing them
+                // to one boolean charged work that never happened as failed work.
+                let step = instance
+                    .as_mut()
+                    .repair_route_after_broker_miss_step(topic, ROUTE_REPAIR_JOIN_BUDGET)
+                    .await;
+                match step.terminal() {
+                    Some(true) => terminal_attempts += 1,
+                    Some(false) => {
+                        terminal_attempts += 1;
+                        terminal_failures += 1;
+                    }
+                    None => tracing::debug!(
+                        topic = %topic,
+                        route_step = step.kind(),
+                        "route repair for one subscribed topic reached no terminal answer this round"
+                    ),
+                }
+                reached = Some(topic.clone());
+            }
+            instance.re_balance_immediately();
+            RouteRepairRound {
+                continuation: None,
+                terminal_attempts,
+                terminal_failures,
+            }
+        }))
+    }
+
+    /// Re-dispatch the pulls that were lost, if any (plan 49a F4 section 4.3 item 5). Used by the
+    /// recovery controller when a queue this consumer owns stopped having a pull request in flight.
+    ///
+    /// Owned future for the same reason as [`Self::route_repair_pass`]: one pass is pinned and
+    /// polled beside status, so an offset read that waits on another task delays only the
+    /// repair.
+    pub(crate) fn lost_pull_repair_pass(
+        &mut self,
+        after: Option<cheetah_string::CheetahString>,
+        stall_after: std::time::Duration,
+        pull_deadline: std::time::Duration,
+        prep_allowance: std::time::Duration,
+        slice: std::time::Duration,
+    ) -> LostPullRepairPass {
+        let Some(mut impl_) = self.default_mqpush_consumer_impl.as_mut().cloned() else {
+            return Box::pin(async {
+                crate::consumer::consumer_impl::default_mq_push_consumer_impl::LostPullRound::Complete { dispatched: 0 }
+            });
+        };
+        Box::pin(async move {
+            impl_
+                .repair_lost_pulls(after, stall_after, pull_deadline, prep_allowance, slice)
+                .await
+        })
+    }
+
+    /// Where this consumer's single cleanup session stands, or `None` while no stop has been
+    /// requested. Reading it cannot start, restart, or cancel the pass.
+    pub(crate) fn cleanup_progress(&self) -> Option<crate::consumer::cleanup_session::CleanupProgress> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .and_then(|impl_| impl_.cleanup_progress())
+    }
+
+    /// Close admission and make sure this consumer's single cleanup pass exists, without waiting
+    /// for it. The pass belongs to the SDK: an observer that stops watching leaves it running,
+    /// and its finalization ceiling comes from the lifecycle policy rather than from any
+    /// caller's wait.
+    pub(crate) fn begin_cleanup(&mut self) -> bool {
+        self.default_mqpush_consumer_impl
+            .as_mut()
+            .map(|impl_| impl_.begin_cleanup())
+            .unwrap_or(false)
+    }
+
+    /// The phase stream of the one cleanup pass, or `None` while no stop was requested.
+    pub(crate) fn cleanup_progress_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::consumer::cleanup_session::CleanupProgress>> {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .and_then(|impl_| impl_.cleanup_progress_changes())
+    }
+
+    /// How long the SDK lets this consumer's cleanup pass finalize.
+    pub(crate) fn cleanup_session_ceiling(&self) -> std::time::Duration {
+        self.default_mqpush_consumer_impl
+            .as_ref()
+            .map(|impl_| impl_.cleanup_session_ceiling())
+            .unwrap_or(std::time::Duration::from_secs(90))
+    }
+
+    /// Record that the SDK lifecycle controller owns this consumer, so startup classifies
+    /// configuration failures as permanent typed rejections. Legacy consumers never call this
+    /// and keep their historical error variants (plan 49b R5).
+    pub(crate) fn mark_managed_lifecycle(&mut self) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.mark_managed_lifecycle();
+        }
+    }
+
+    pub(crate) fn set_cleanup_session_ceiling(&mut self, ceiling: std::time::Duration) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.set_cleanup_session_ceiling(ceiling);
+        }
+    }
+
+    /// Give this consumer the remote budgets of its lifecycle policy: how long bulk offset
+    /// persistence may take once local work has drained, and what unregistration and teardown
+    /// keep back before it starts (plan 49c C5).
+    pub(crate) fn set_remote_budgets(
+        &mut self,
+        persist_opportunity: std::time::Duration,
+        reserve: std::time::Duration,
+    ) {
+        if let Some(impl_) = self.default_mqpush_consumer_impl.as_ref() {
+            impl_.set_remote_budgets(persist_opportunity, reserve);
+        }
+    }
+
+    /// Join the consumer's one cleanup session until `deadline`. The deadline bounds only this
+    /// wait: an elapsed answer means "not proved yet", and the pass keeps running to release what
+    /// it holds. Use [`Self::cleanup_progress`] to tell a still-running pass from a settled one.
     pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> ConsumerCleanup {
         if self
             .default_mqpush_consumer_impl
@@ -735,6 +985,25 @@ mod tests {
 
         consumer.shutdown().await;
         consumer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_second_stop_after_proved_cleanup_adds_nothing() {
+        let mut consumer = DefaultMQPushConsumer::builder().consumer_group("repeated-stop").build();
+        assert_eq!(
+            consumer
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            ConsumerCleanup::Complete
+        );
+        // Repeated stop is a no-op: the first proved pass is the answer, and asking again must not
+        // start another cleanup operation or report it as unfinished.
+        assert_eq!(
+            consumer
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            ConsumerCleanup::Complete
+        );
     }
 
     #[tokio::test]

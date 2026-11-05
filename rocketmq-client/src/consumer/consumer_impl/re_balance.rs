@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 use rocketmq_remoting::protocol::heartbeat::consume_type::ConsumeType;
 
@@ -21,7 +23,10 @@ use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::pop_request::PopRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::queue_transitions::RetirementGuard;
+use crate::consumer::store::offset_store::OffsetWrite;
 
+pub(crate) mod queue_transitions;
 pub(crate) mod rebalance_impl;
 pub(crate) mod rebalance_push_impl;
 pub(crate) mod rebalance_service;
@@ -42,17 +47,68 @@ pub trait RebalanceLocal {
         mq_divided: &HashSet<MessageQueue>,
     );
 
-    /// Removes an unnecessary message queue.
+    /// What one completed allocation pass concluded **for `topic`** (plan 49c C3). Consumers that
+    /// do not observe their own assignment record nothing.
+    async fn note_allocation_pass(
+        &mut self,
+        topic: &str,
+        outcome: crate::consumer::consumer_impl::consumer_lifecycle::AllocationOutcome,
+    );
+
+    /// Reports the subscription set this rebalance pass is working over, so allocation evidence for
+    /// topics that are no longer subscribed stops being reported (plan 49c C3).
+    async fn note_subscription_set(&mut self, topics: &[CheetahString]);
+
+    /// Publishes the acquisition identity of a process queue that has just been installed.
+    /// Ownership begins here, before any pull is dispatched for that queue; waiting for an
+    /// assignment callback
+    /// - which waits for a heartbeat - would let the first pull arrive unowned (plan 49c C1).
     ///
-    /// # Arguments
+    /// The object itself is part of the identity (plan 49h H1): work may only be issued against the
+    /// exact process queue this installation published, not merely one with the same key.
+    async fn note_queue_installed(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
+
+    /// Ends the acquisition identity of one **exact** process queue that has left the table. Its
+    /// epoch retires with it so a replacement installation cannot inherit an older loop's lease,
+    /// and naming the object means a predecessor finishing late cannot end what replaced it
+    /// (plan 49i I2 item 3).
+    async fn note_queue_revoked(&mut self, mq: &MessageQueue, process_queue: &Arc<ProcessQueue>);
+
+    /// Write and then erase the local offsets of a queue this pass is retiring.
     ///
-    /// * `mq` - The message queue to be removed.
-    /// * `pq` - The process queue associated with the message queue.
+    /// The object is named because those offsets are shared by key: an installation that appeared
+    /// while this was waiting on persistence owns them now, and this call must leave them alone
+    /// (plan 49i I2 item 2).
     ///
     /// # Returns
     ///
-    /// A boolean indicating whether the message queue was removed.
-    async fn remove_unnecessary_message_queue(&mut self, mq: &MessageQueue, pq: &ProcessQueue) -> bool;
+    /// What the write proved - and `None` when a newer installation owns those offsets, in which
+    /// case nothing was written or erased. A retirement that got `Deferred` keeps its queue:
+    /// the offset is still retryable and this object's ownership has to outlast it (plan 49k K2
+    /// item 1).
+    async fn remove_unnecessary_message_queue(
+        &mut self,
+        mq: &MessageQueue,
+        pq: &Arc<ProcessQueue>,
+    ) -> Option<OffsetWrite>;
+
+    /// Retire one **exact** process queue on work this SDK owns, under a transition claim the
+    /// caller already holds (plan 49k K3 item 1). This is the one retirement operation every
+    /// entry point uses - the direct request and both rebalance removal loops alike.
+    ///
+    /// The claim moves in rather than being carried by the caller, because required persistence may
+    /// wait on a local writer that outlives whoever asked: cancelling then would end the claim -
+    /// authorizing an installation to write the same offset file - while this retirement's own
+    /// erase is still coming. Watching the returned completion is optional; giving up watching
+    /// cancels nothing, and shutdown joins the work because it belongs to the consumer's drain.
+    ///
+    /// # Returns
+    ///
+    /// Whether the queue left this consumer's table. `false` means somebody else owns that key now,
+    /// or its offset write has not landed yet - in both cases the entry stays where it is for a
+    /// later pass.
+    async fn retire_process_queue(&mut self, mq: &MessageQueue, pq: &Arc<ProcessQueue>, guard: RetirementGuard)
+        -> bool;
 
     /// Removes an unnecessary pop message queue.
     ///
@@ -144,12 +200,16 @@ pub trait RebalanceLocal {
     /// A new pop process queue.
     fn create_pop_process_queue(&self) -> PopProcessQueue;
 
-    /// Removes a process queue.
+    /// Removes one **exact** process queue: the table entry is dropped only while it still names
+    /// `expected`, and its transition is claimed first so a second caller reaching the same key
+    /// does not repeat the side effects or act on an installation it never owned (plan 49i I2).
+    /// The retirement itself then runs as [`Self::retire_process_queue`] (plan 49k K3 item 1).
     ///
     /// # Arguments
     ///
-    /// * `mq` - The message queue for which the process queue should be removed.
-    async fn remove_process_queue(&mut self, mq: &MessageQueue);
+    /// * `mq` - The message queue whose process queue should be removed.
+    /// * `expected` - The process queue this caller believes holds the key.
+    async fn remove_process_queue(&mut self, mq: &MessageQueue, expected: &Arc<ProcessQueue>);
 
     /// Unlocks a message queue.
     ///

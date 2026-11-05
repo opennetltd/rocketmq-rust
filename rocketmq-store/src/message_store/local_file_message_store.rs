@@ -2017,6 +2017,9 @@ impl ReputMessageService {
 
                                     // Decrement pending counter after successful send
                                     // Use saturating_sub to prevent underflow
+                                    // `fetch_update` is only renamed to `try_update` on newer toolchains; keep the old
+                                    // spelling so older compilers can still build this crate.
+                                    #[allow(deprecated)]
                                     pending_messages.fetch_update(
                                         Ordering::Relaxed,
                                         Ordering::Relaxed,
@@ -2042,6 +2045,9 @@ impl ReputMessageService {
                         if pending_messages.load(Ordering::Relaxed) > 0 || inner.is_commit_log_available() {
                             if let Some(batch) = inner.read_and_parse_batch().await {
                                 if dispatch_tx.send(batch).await.is_ok() {
+                                    // `fetch_update` is only renamed to `try_update` on newer toolchains; keep the old
+                                    // spelling so older compilers can still build this crate.
+                                    #[allow(deprecated)]
                                     pending_messages.fetch_update(
                                         Ordering::Relaxed,
                                         Ordering::Relaxed,

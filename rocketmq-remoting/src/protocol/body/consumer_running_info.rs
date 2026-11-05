@@ -85,15 +85,18 @@ mod tests {
             CheetahString::from_static_str("CONSUME_PASSIVELY"),
         );
         let mq = MessageQueue::from_parts("topic", "broker-a", 0);
-        info.mq_table.insert(mq, ProcessQueueInfo {
-            commit_offset: 5,
-            cached_msg_count: 3,
-            locked: false,
-            droped: false,
-            last_pull_timestamp: 1_000,
-            last_consume_timestamp: 900,
-            ..Default::default()
-        });
+        info.mq_table.insert(
+            mq,
+            ProcessQueueInfo {
+                commit_offset: 5,
+                cached_msg_count: 3,
+                locked: false,
+                droped: false,
+                last_pull_timestamp: 1_000,
+                last_consume_timestamp: 900,
+                ..Default::default()
+            },
+        );
         info
     }
 
@@ -102,7 +105,13 @@ mod tests {
         let info = sample();
         let bytes = info.encode().unwrap();
         let decoded = ConsumerRunningInfo::decode(&bytes).unwrap();
-        assert_eq!(decoded.properties.get(ConsumerRunningInfo::PROP_CONSUME_TYPE).map(|s| s.as_str()), Some("CONSUME_PASSIVELY"));
+        assert_eq!(
+            decoded
+                .properties
+                .get(ConsumerRunningInfo::PROP_CONSUME_TYPE)
+                .map(|s| s.as_str()),
+            Some("CONSUME_PASSIVELY")
+        );
         assert_eq!(decoded.mq_table.len(), 1);
         let pq = decoded.mq_table.values().next().unwrap();
         assert_eq!(pq.commit_offset, 5);

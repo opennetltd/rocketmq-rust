@@ -500,6 +500,20 @@ impl ChannelInner {
     /// - ~40-60% higher throughput than tokio::mpsc
     /// - Better performance under contention
     pub fn new(connection: Connection, pending_responses: PendingResponses) -> Self {
+        Self::new_on(&tokio::runtime::Handle::current(), connection, pending_responses)
+    }
+
+    /// The same channel whose send pump runs on an explicitly supplied runtime.
+    ///
+    /// A connection created for a shared client outlives the caller that opened it, so its send
+    /// pump must live on the runtime owned by that client. Spawning it on whatever runtime happened
+    /// to issue the first request means the pump dies with that caller while other users of the
+    /// same client still hold the connection - they then see a channel that never sends.
+    pub fn new_on(
+        handle: &tokio::runtime::Handle,
+        connection: Connection,
+        pending_responses: PendingResponses,
+    ) -> Self {
         const QUEUE_CAPACITY: usize = 1024;
 
         // Use flume bounded channel for better performance
@@ -509,7 +523,7 @@ impl ChannelInner {
         let connection = Arc::new(connection);
         let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let closed = Arc::new(AtomicBool::new(false));
-        let send_task = tokio::spawn(handle_send(
+        let send_task = handle.spawn(handle_send(
             connection.clone(),
             outbound_queue_rx,
             pending_responses.clone(),

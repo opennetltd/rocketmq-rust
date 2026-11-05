@@ -16,6 +16,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as SyncOrdering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +47,7 @@ use rocketmq_rust::RocketMQTokioMutex;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -55,6 +58,9 @@ use crate::consumer::consumer_impl::pull_message_service::PullMessageService;
 use crate::consumer::consumer_impl::re_balance::rebalance_service::RebalanceService;
 use crate::consumer::mq_consumer_inner::MQConsumerInner;
 use crate::consumer::mq_consumer_inner::MQConsumerInnerImpl;
+use crate::factory::route_refresh_guard::BeginRefresh;
+use crate::factory::route_refresh_guard::FlightAnswer;
+use crate::factory::route_refresh_guard::RouteRefreshGuard;
 use crate::factory::transport_health::emit_consumer_transport_event;
 use crate::factory::transport_health::ConsumerTransportEvent;
 use crate::factory::transport_health::ConsumerTransportOperation;
@@ -69,6 +75,46 @@ use crate::producer::producer_impl::mq_producer_inner::MQProducerInnerImpl;
 use crate::producer::producer_impl::topic_publish_info::TopicPublishInfo;
 
 const LOCK_TIMEOUT_MILLIS: u64 = 3000;
+
+/// What waiting for a route table or NameServer snapshot may cost on top of the SDK's own request
+/// timeout, so one allowance covers both (plan 49h H3).
+pub(crate) const LOOKUP_LOCK_ALLOWANCE: Duration = Duration::from_millis(LOCK_TIMEOUT_MILLIS);
+
+/// Cooldown applied to a successful miss-triggered route refresh (plan 49 section
+/// 4.1.4). Scheduled route refreshes are unaffected.
+pub(crate) const ROUTE_REFRESH_COOLDOWN: Duration = Duration::from_millis(1_000);
+
+/// Interval between bounded INFO summaries of repetitive route/broker bookkeeping.
+const LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Selects the address to use for one `(broker_name, broker_id)` lookup (plan 49 section
+/// 4.1.3): the requested ID first, then the master when a slave was requested, and only
+/// when `only_this_broker` is false any other advertised entry, preferring the master so the
+/// choice stays deterministic. `None` means no address was selected; callers must not treat a
+/// bare map hit as success.
+fn select_broker_addr(
+    addrs: &HashMap<u64, CheetahString>,
+    broker_id: u64,
+    only_this_broker: bool,
+) -> Option<(CheetahString, bool)> {
+    if let Some(addr) = addrs.get(&broker_id).filter(|addr| !addr.is_empty()) {
+        return Some((addr.clone(), broker_id != mix_all::MASTER_ID));
+    }
+    if broker_id != mix_all::MASTER_ID {
+        // A slave that vanished is served by its master, never by an unrelated peer.
+        if let Some(addr) = addrs.get(&mix_all::MASTER_ID).filter(|addr| !addr.is_empty()) {
+            return Some((addr.clone(), false));
+        }
+    }
+    if only_this_broker {
+        return None;
+    }
+    addrs
+        .iter()
+        .filter(|(_, addr)| !addr.is_empty())
+        .min_by_key(|(id, _)| **id != mix_all::MASTER_ID)
+        .map(|(id, addr)| (addr.clone(), *id != mix_all::MASTER_ID))
+}
 
 pub struct MQClientInstance {
     pub(crate) client_config: ArcMut<ClientConfig>,
@@ -109,6 +155,135 @@ pub struct MQClientInstance {
     broker_version_table:
         Arc<RwLock<HashMap<CheetahString /* Broker Name */, HashMap<CheetahString /* address */, i32>>>>,
     send_heartbeat_times_total: Arc<AtomicI64>,
+    /// Sequence of the most recent successful route fetch per topic. A higher sequence
+    /// always wins when two topics disagree on one broker name/ID address.
+    topic_route_sequence: Arc<RwLock<HashMap<CheetahString, u64>>>,
+    route_update_sequence: Arc<AtomicU64>,
+    /// Coalesces broker-miss route refreshes; scheduled refreshes bypass it.
+    pub(crate) route_refresh_guard: Arc<RouteRefreshGuard>,
+    /// Bounded INFO summaries for repetitive client bookkeeping events.
+    log_gate: crate::utils::log_gate::LogGate,
+}
+
+/// The three answers a nameserver route query can produce. Collapsing them into one `Option` is
+/// what let a missing answer and an authoritative empty answer be treated alike (plan 50 F7).
+enum FetchedRoute {
+    /// A route was returned.
+    Route(TopicRouteData),
+    /// The nameserver answered authoritatively that the topic has no route.
+    Absent,
+    /// No answer: a transport failure, a timeout or a malformed response.
+    Failed,
+}
+
+/// What one route refresh did to this client's knowledge. `Failed` is the only outcome that must
+/// not be recorded as a success by the refresh cooldown (plan 50 F7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteFetchOutcome {
+    /// A route was published and differed from the cached one.
+    Applied,
+    /// A route was published and matched the cached one; still the newest observation.
+    Unchanged,
+    /// An authoritative empty answer retired what was known.
+    Absent,
+    /// No answer; every table is as it was.
+    Failed,
+}
+
+impl RouteFetchOutcome {
+    /// Whether a nameserver answered. Only this lets the refresh cooldown take effect.
+    pub(crate) fn succeeded(self) -> bool {
+        !matches!(self, RouteFetchOutcome::Failed)
+    }
+}
+
+/// Whether a successfully decoded answer advertises at least one broker address. A route with no
+/// broker addresses anywhere is an authoritative empty snapshot rather than a partial answer (plan
+/// 49b R4).
+fn advertises_brokers(route: &TopicRouteData) -> bool {
+    route
+        .broker_datas
+        .iter()
+        .any(|broker_data| !broker_data.broker_addrs().is_empty())
+}
+
+/// What one step of a miss-triggered route repair achieved (plan 49e E3).
+///
+/// The shared guard already distinguishes these cases internally; flattening them to a boolean
+/// at this boundary let the recovery controller read "nothing ran" as "an attempt failed", so a
+/// cooldown window, a scheduled retry or one slow owner's flight could spend every in-place
+/// repair allowance without any control-plane work finishing. A step therefore reports whether
+/// it received a **terminal** answer at all, separately from what that answer said.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteRepairStep {
+    /// This caller owned the fetch and it ended: `true` when the nameserver answered (applied,
+    /// unchanged or authoritatively empty), `false` when the attempt itself failed.
+    Fetched { succeeded: bool },
+    /// Joined the owner's flight and received its terminal answer.
+    Joined { succeeded: bool },
+    /// The join budget elapsed while the owner's flight still runs: no evidence either way, and
+    /// the next round may join it again.
+    StillJoining,
+    /// A recent successful refresh owns the cooldown window: the tables are as fresh as policy
+    /// allows and nothing was asked for.
+    Cooldown,
+    /// A failed attempt already scheduled the next one behind its retry window; asking now would
+    /// add a round trip the guard has deliberately deferred.
+    Backoff,
+    /// The flight this caller joined was replaced, or its topic was forgotten: another attempt owns
+    /// that topic now and this step learned nothing about its outcome.
+    Superseded,
+    /// The client is stopping; no wait and no further fetch are allowed.
+    Closed,
+}
+
+impl RouteRepairStep {
+    /// Variant name for logs and assertions.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            RouteRepairStep::Fetched { .. } => "fetched",
+            RouteRepairStep::Joined { .. } => "joined",
+            RouteRepairStep::StillJoining => "still_joining",
+            RouteRepairStep::Cooldown => "cooldown",
+            RouteRepairStep::Backoff => "backoff",
+            RouteRepairStep::Superseded => "superseded",
+            RouteRepairStep::Closed => "closed",
+        }
+    }
+
+    /// The flight's terminal answer, when this step received one. `None` means no control-plane
+    /// attempt finished here: a deferred check or an unfinished join cannot be charged as failed
+    /// work and cannot be counted as a success either (plan 49e E3).
+    ///
+    /// No separate flight identity has to travel with the answer for one result to be charged once:
+    /// a release records its outcome **and** opens that topic's retry window under the same lock,
+    /// so the next step against the same guard is `Backoff` until the window passes, and
+    /// anything after that claims a genuinely new generation.
+    pub(crate) fn terminal(self) -> Option<bool> {
+        match self {
+            RouteRepairStep::Fetched { succeeded } => Some(succeeded),
+            RouteRepairStep::Joined { succeeded } => Some(succeeded),
+            RouteRepairStep::StillJoining
+            | RouteRepairStep::Cooldown
+            | RouteRepairStep::Backoff
+            | RouteRepairStep::Superseded
+            | RouteRepairStep::Closed => None,
+        }
+    }
+
+    /// Whether the caller should re-check its own tables afterwards. This is the historical
+    /// boolean: a deferred check means the tables are as fresh as policy allows, so the caller
+    /// looks at what it has rather than issuing another round trip.
+    pub(crate) fn recheck(self) -> bool {
+        match self {
+            RouteRepairStep::Fetched { .. }
+            | RouteRepairStep::Joined { .. }
+            | RouteRepairStep::Cooldown
+            | RouteRepairStep::Backoff
+            | RouteRepairStep::Superseded => true,
+            RouteRepairStep::StillJoining | RouteRepairStep::Closed => false,
+        }
+    }
 }
 
 impl MQClientInstance {
@@ -178,6 +353,16 @@ impl MQClientInstance {
         unimplemented!()
     }
 
+    /// Point this instance at one broker address so a cleanup pass has an unregister target without
+    /// running a nameserver (plan 49e E5).
+    #[cfg(test)]
+    pub(crate) async fn review49e_broker_target(&self, addr: &str) {
+        self.broker_addr_table
+            .write()
+            .await
+            .insert("review49e".into(), [(0u64, addr.into())].into_iter().collect());
+    }
+
     pub fn new_arc(
         client_config: ClientConfig,
         instance_index: i32,
@@ -213,6 +398,10 @@ impl MQClientInstance {
             broker_addr_table,
             broker_version_table: Arc::new(Default::default()),
             send_heartbeat_times_total: Arc::new(AtomicI64::new(0)),
+            topic_route_sequence: Arc::new(Default::default()),
+            route_update_sequence: Arc::new(AtomicU64::new(0)),
+            route_refresh_guard: Arc::new(RouteRefreshGuard::new(ROUTE_REFRESH_COOLDOWN)),
+            log_gate: crate::utils::log_gate::LogGate::new(LOG_SUMMARY_INTERVAL),
         });
         let instance_clone = instance.clone();
         instance.mq_admin_impl.set_client(instance_clone);
@@ -227,9 +416,13 @@ impl MQClientInstance {
             Some(tx),
         ));
         instance.mq_client_api_impl = Some(mq_client_api_impl.clone());
+        // Shared services belong to this client, never to whichever consumer created it first: they
+        // run on the runtime stored in the instance so that stopping or replacing one consumer
+        // cannot drop the pull loop, the rebalance loop or the connection observer that siblings
+        // still depend on.
+        let shared_runtime = instance.runtime_handle();
         if let Some(namesrv_addr) = client_config.namesrv_addr.as_deref() {
-            let handle = Handle::current();
-
+            let handle = shared_runtime.clone();
             let namesrv_addr = namesrv_addr.to_string();
             instance.work.spawn(&handle, async move {
                 mq_client_api_impl
@@ -237,7 +430,7 @@ impl MQClientInstance {
                     .await;
             });
         }
-        instance.work.spawn(&Handle::current(), async move {
+        instance.work.spawn(&shared_runtime, async move {
             while let Ok(value) = rx.recv().await {
                 if let Some(instance_) = weak_instance.upgrade() {
                     match value {
@@ -248,10 +441,10 @@ impl MQClientInstance {
                                 broker_addr_table
                                     .iter()
                                     .flat_map(|(broker_name, broker_addrs)| {
-                                        broker_addrs.iter().filter_map(|(id, addr)| {
-                                            (addr == remote_address.to_string().as_str())
-                                                .then(|| (broker_name.clone(), *id, addr.clone()))
-                                        })
+                                        broker_addrs
+                                            .iter()
+                                            .filter(|(_, addr)| *addr == remote_address.to_string().as_str())
+                                            .map(|(id, addr)| (broker_name.clone(), *id, addr.clone()))
                                     })
                                     .collect::<Vec<_>>()
                             };
@@ -272,6 +465,26 @@ impl MQClientInstance {
         instance
     }
 
+    /// The runtime owned by this client instance.
+    ///
+    /// Every task that outlives the call which created it - shared pull loop, rebalance loop,
+    /// connection-event observer, nameserver initialization and their delayed dispatches - is
+    /// spawned here. Consumers share instances by client id, so a task spawned on the ambient
+    /// handle of the consumer that happened to start first would die with that consumer's
+    /// controller while its siblings were still registered.
+    ///
+    /// Falls back to the caller's runtime only after this client's own runtime has been taken by
+    /// shutdown, which is a teardown path that must not panic.
+    pub(crate) fn runtime_handle(&self) -> Handle {
+        match self.instance_runtime.as_ref() {
+            Some(runtime) => runtime.get_handle().clone(),
+            None => {
+                debug!("client instance runtime is gone; using the caller's runtime for this task");
+                Handle::current()
+            }
+        }
+    }
+
     pub fn re_balance_immediately(&self) {
         self.rebalance_service.wakeup();
     }
@@ -281,7 +494,8 @@ impl MQClientInstance {
             self.rebalance_service.wakeup();
         } else {
             let service = self.rebalance_service.clone();
-            self.work.spawn(&Handle::current(), async move {
+            let runtime = self.runtime_handle();
+            self.work.spawn(&runtime, async move {
                 tokio::time::sleep(delay_millis).await;
                 service.wakeup();
             });
@@ -373,6 +587,9 @@ impl MQClientInstance {
         if self.instance_runtime.is_none() {
             return;
         }
+        // Cancel route-refresh waiters before draining tasks so no background work can start
+        // a nameserver fetch during shutdown (plan 49 section 4.1.4).
+        self.route_refresh_guard.close();
         self.work.close();
         drop((consumers, producers, admins));
         self.work.wait().await;
@@ -521,9 +738,33 @@ impl MQClientInstance {
     }
 
     #[inline]
-    pub async fn update_topic_route_info_from_name_server_topic(&mut self, topic: &CheetahString) -> bool {
+    pub async fn update_topic_route_info_from_name_server_topic(&mut self, topic: &CheetahString) -> RouteFetchOutcome {
         self.update_topic_route_info_from_name_server_default(topic, false, None)
             .await
+    }
+
+    /// One route operation - nameserver lock acquisition, fetch and publication - bounded by one
+    /// absolute `deadline`. A miss-triggered leader holds the single-flight slot plus every
+    /// joiner behind it, so a stalled nameserver or a lock held by another refresh must end
+    /// this call with no answer rather than an open-ended wait (plan 49b R3). Publication is
+    /// not started past the deadline: applying half a route would be worse than applying none,
+    /// so an elapsed deadline reports `None`.
+    pub async fn update_topic_route_info_within(
+        &mut self,
+        topic: &CheetahString,
+        deadline: Instant,
+    ) -> Option<RouteFetchOutcome> {
+        let namesrv_lock = self.lock_namesrv.clone();
+        let Ok(_namesrv_guard) = tokio::time::timeout_at(deadline, namesrv_lock.lock()).await else {
+            return None;
+        };
+        let Ok(fetched) = tokio::time::timeout_at(deadline, self.fetch_topic_route(topic, false, None)).await else {
+            return None;
+        };
+        if Instant::now() >= deadline {
+            return None;
+        }
+        Some(self.apply_route_fetch(topic, fetched, false, None).await)
     }
 
     pub async fn find_consumer_id_list(
@@ -595,114 +836,320 @@ impl MQClientInstance {
         topic: &CheetahString,
         is_default: bool,
         producer_config: Option<&Arc<ProducerConfig>>,
-    ) -> bool {
-        let lock = self.lock_namesrv.lock().await;
-        let topic_route_data = if let (true, Some(producer_config)) = (is_default, producer_config) {
-            let mut result = match self
-                .mq_client_api_impl
-                .as_mut()
-                .unwrap()
+    ) -> RouteFetchOutcome {
+        // Plan 49 section 4.1.1: the nameserver lock stays held across fetch and publish so
+        // route state changes remain serialized; table locks are taken route-then-broker and
+        // every one of them is released before a listener callback or any network I/O.
+        // Cloning the lock handle keeps the guard from borrowing `self`, so the fetch and the
+        // table publishes below can still take &mut self.
+        let namesrv_lock = self.lock_namesrv.clone();
+        let _namesrv_guard = namesrv_lock.lock().await;
+        let fetched = self.fetch_topic_route(topic, is_default, producer_config).await;
+        self.apply_route_fetch(topic, fetched, is_default, producer_config)
+            .await
+    }
+
+    /// Publish one nameserver answer. Split from the fetch so the three different answers -
+    /// a route, an authoritative "no route", and no answer at all - can be tested against the real
+    /// publication path (plan 50 F7).
+    async fn apply_route_fetch(
+        &mut self,
+        topic: &CheetahString,
+        fetched: FetchedRoute,
+        is_default: bool,
+        producer_config: Option<&Arc<ProducerConfig>>,
+    ) -> RouteFetchOutcome {
+        let mut topic_route_data = match fetched {
+            // A failed fetch must never erase the last known route (plan 49 section 4.1.2), and it
+            // is not an answer about the topic either (plan 50 F7).
+            FetchedRoute::Failed => {
+                warn!(
+                    "updateTopicRouteInfoFromNameServer got no answer, keeping the last known route for topic: {}. \
+                     [{}]",
+                    topic, self.client_id
+                );
+                return RouteFetchOutcome::Failed;
+            }
+            // An authoritative empty answer is knowledge: it retires what this client knew.
+            FetchedRoute::Absent => return self.retire_topic_route(topic).await,
+            FetchedRoute::Route(data) => data,
+        };
+        // A successfully decoded answer that advertises no broker at all is itself the
+        // authoritative empty snapshot: it says where this topic is not. Retiring from it
+        // goes through the same path as an explicit empty answer so consumers, producers
+        // and derived addresses cannot disagree about which queues still exist (plan 49b
+        // R4). TopicNotExist, transport errors and bodyless answers stay non-authoritative
+        // under the agreed contract and never reach here.
+        if !advertises_brokers(&topic_route_data) {
+            return self.retire_topic_route(topic).await;
+        }
+
+        let mut changed = {
+            let topic_route_table = self.topic_route_table.read().await;
+            topic_route_data.topic_route_data_changed(topic_route_table.get(topic))
+        };
+        if !changed {
+            changed = self.is_need_update_topic_route_info(topic).await;
+        }
+        // Default topics carry no priority queues; keep the upstream queue-number clamp.
+        if let Some(producer_config) = producer_config.filter(|_| is_default) {
+            for data in topic_route_data.queue_datas.iter_mut() {
+                let queue_nums = producer_config.default_topic_queue_nums().max(data.read_queue_nums);
+                data.read_queue_nums = queue_nums;
+                data.write_queue_nums = queue_nums;
+            }
+        }
+
+        // Publish the route snapshot and its sequence first: broker reconciliation derives
+        // from cached routes, so it must observe this response.
+        let old_route = {
+            let topic_route_table = self.topic_route_table.read().await;
+            topic_route_table.get(topic).cloned()
+        };
+        let sequence = self.route_update_sequence.fetch_add(1, SyncOrdering::SeqCst) + 1;
+        {
+            let mut topic_route_table = self.topic_route_table.write().await;
+            topic_route_table.insert(topic.clone(), TopicRouteData::from_existing(&topic_route_data));
+        }
+        self.topic_route_sequence.write().await.insert(topic.clone(), sequence);
+
+        // Reconcile the derived broker address table against every cached route instead of
+        // replacing one broker name wholesale (plan 49 section 4.1.1). This runs for an unchanged
+        // answer too: a successful fetch is the newest observation whether or not its bytes differ,
+        // and skipping it let an alternating second topic keep holding a shared broker address
+        // after this topic had answered again with the current one (plan 50 F7).
+        let retired = self.reconcile_broker_addr_table().await;
+
+        if !changed {
+            debug!(
+                topic = %topic,
+                sequence,
+                retired_brokers = retired.len(),
+                "the topic[{}] route info is unchanged, newest observation recorded, client: {}",
+                topic, self.client_id
+            );
+            return RouteFetchOutcome::Unchanged;
+        }
+        if let Some(suppressed) = self.log_gate.try_acquire(&format!("route-changed:{topic}")) {
+            info!(
+                topic = %topic,
+                sequence,
+                retired_brokers = retired.len(),
+                suppressed,
+                "topic[{}] route info changed, client: {}, retired {} obsolete broker address(es), suppressed {} identical summaries",
+                topic,
+                self.client_id,
+                retired.len(),
+                suppressed
+            );
+        }
+        debug!(
+            "new topic route info, topic: {}; old: {:?}, new: {:?}",
+            topic, old_route, topic_route_data
+        );
+        for (broker_name, broker_id, address) in retired {
+            debug!(
+                "topic route no longer contains broker[{}:{}] at [{}], client: {}",
+                broker_name, broker_id, address, self.client_id
+            );
+        }
+
+        // Replace this topic's static endpoint projection on every applicable success. A route that
+        // advertises no endpoints must remove the map its predecessor left behind, or a
+        // static-to-ordinary change keeps resolving messages through broker names that no
+        // longer exist (plan 49b R4).
+        {
+            let mq_end_points = ClientMetadata::topic_route_data2endpoints_for_static_topic(topic, &topic_route_data);
+            let mut topic_end_points_table = self.topic_end_points_table.write().await;
+            match mq_end_points {
+                Some(mq_end_points) if !mq_end_points.is_empty() => {
+                    topic_end_points_table.insert(topic.into(), mq_end_points);
+                }
+                _ => {
+                    topic_end_points_table.remove(topic);
+                }
+            }
+        }
+
+        // Update Pub info. Snapshot the table, release it, then notify: no table lock is
+        // held across a consumer/producer callback.
+        {
+            let mut publish_info = topic_route_data2topic_publish_info(topic, &mut topic_route_data);
+            publish_info.have_topic_router_info = true;
+            let producers: Vec<_> = self.producer_table.read().await.values().cloned().collect();
+            for mut value in producers {
+                value.update_topic_publish_info(topic.to_string(), Some(publish_info.clone()));
+            }
+        }
+
+        // Update sub info
+        {
+            let consumers = {
+                let consumer_table = self.consumer_table.read().await;
+                consumer_table.values().cloned().collect::<Vec<_>>()
+            };
+            if !consumers.is_empty() {
+                let subscribe_info = topic_route_data2topic_subscribe_info(topic, &topic_route_data);
+                for value in consumers {
+                    value.update_topic_subscribe_info(topic.clone(), &subscribe_info).await;
+                }
+            }
+        }
+        RouteFetchOutcome::Applied
+    }
+
+    /// Record an authoritative "this topic has no route" answer: drop the cached route and its
+    /// endpoints, then let reconciliation retire the addresses nothing advertises any more (plan 50
+    /// F7). A failed fetch never reaches here; it keeps every table as it was.
+    async fn retire_topic_route(&mut self, topic: &CheetahString) -> RouteFetchOutcome {
+        let known = { self.topic_route_table.write().await.remove(topic).is_some() };
+        self.topic_end_points_table.write().await.remove(topic);
+        if !known {
+            // Nothing was known about this topic; the empty answer changes no table but is still a
+            // successful observation, so cooldown may apply.
+            return RouteFetchOutcome::Absent;
+        }
+        let sequence = self.route_update_sequence.fetch_add(1, SyncOrdering::SeqCst) + 1;
+        self.topic_route_sequence.write().await.insert(topic.clone(), sequence);
+        let retired = self.reconcile_broker_addr_table().await;
+        // Producers stop publishing to a topic the nameserver no longer routes. Consumer subscribe
+        // info is left alone on purpose: assignment is derived from the route tables, and inventing
+        // an empty subscription entry here would be a second source of truth.
+        let producers: Vec<_> = self.producer_table.read().await.values().cloned().collect();
+        for mut producer in producers {
+            producer.update_topic_publish_info(topic.to_string(), None);
+        }
+        let consumers: Vec<_> = self.consumer_table.read().await.values().cloned().collect();
+        if !consumers.is_empty() {
+            let empty_queues = HashSet::new();
+            for consumer in consumers {
+                // The consumer ignores a topic it does not subscribe to, so this is safe to
+                // broadcast.
+                consumer.update_topic_subscribe_info(topic.clone(), &empty_queues).await;
+            }
+            // Let the normal fenced rebalance retire the queues and tell listeners.
+            self.rebalance_service.wakeup();
+        }
+        if let Some(suppressed) = self.log_gate.try_acquire(&format!("route-absent:{topic}")) {
+            info!(
+                topic = %topic,
+                sequence,
+                retired_brokers = retired.len(),
+                suppressed,
+                "topic[{}] has no route according to the nameserver, retired {} obsolete broker address(es), client: {}, suppressed {} identical summaries",
+                topic, retired.len(), self.client_id, suppressed
+            );
+        }
+        RouteFetchOutcome::Absent
+    }
+
+    /// Fetches one route from the nameserver, distinguishing the three answers a client can get.
+    async fn fetch_topic_route(
+        &mut self,
+        topic: &CheetahString,
+        is_default: bool,
+        producer_config: Option<&Arc<ProducerConfig>>,
+    ) -> FetchedRoute {
+        if let (true, Some(_)) = (is_default, producer_config) {
+            let Some(api) = self.mq_client_api_impl.as_mut() else {
+                return FetchedRoute::Failed;
+            };
+            match api
                 .get_default_topic_route_info_from_name_server(self.client_config.mq_client_api_timeout)
                 .await
             {
-                Ok(value) => value,
+                Ok(Some(data)) => FetchedRoute::Route(data),
+                // The nameserver answered and says there is no route.
+                Ok(None) => FetchedRoute::Absent,
                 Err(e) => {
                     error!(
                         "get_default_topic_route_info_from_name_server failed, topic: {}, error: {}",
                         topic, e
                     );
-                    None
-                }
-            };
-            if let Some(topic_route_data) = result.as_mut() {
-                for data in topic_route_data.queue_datas.iter_mut() {
-                    let queue_nums = producer_config.default_topic_queue_nums().max(data.read_queue_nums);
-                    data.read_queue_nums = queue_nums;
-                    data.write_queue_nums = queue_nums;
+                    FetchedRoute::Failed
                 }
             }
-            result
         } else {
-            self.mq_client_api_impl
-                .as_mut()
-                .unwrap()
+            let Some(api) = self.mq_client_api_impl.as_mut() else {
+                return FetchedRoute::Failed;
+            };
+            match api
                 .get_topic_route_info_from_name_server(topic, self.client_config.mq_client_api_timeout)
                 .await
-                .unwrap_or_else(|err| {
+            {
+                Ok(Some(data)) => FetchedRoute::Route(data),
+                Ok(None) => FetchedRoute::Absent,
+                Err(err) => {
                     warn!(
                         "getTopicRouteInfoFromNameServer failed, topic: {}, err: {:?}",
                         topic, err
                     );
-                    None
-                })
-        };
-        if let Some(mut topic_route_data) = topic_route_data {
-            let mut topic_route_table = self.topic_route_table.write().await;
-            let old = topic_route_table.get(topic);
-            let mut changed = topic_route_data.topic_route_data_changed(old);
-            if !changed {
-                changed = self.is_need_update_topic_route_info(topic).await;
-            } else {
-                info!(
-                    "the topic[{}] route info changed, old[{:?}] ,new[{:?}]",
-                    topic, old, topic_route_data
-                )
+                    FetchedRoute::Failed
+                }
             }
-            if changed {
-                let mut broker_addr_table = self.broker_addr_table.write().await;
-                for bd in topic_route_data.broker_datas.iter() {
-                    broker_addr_table.insert(bd.broker_name().clone(), bd.broker_addrs().clone());
-                }
-                drop(broker_addr_table);
-
-                // Update endpoint map
-                {
-                    let mq_end_points =
-                        ClientMetadata::topic_route_data2endpoints_for_static_topic(topic, &topic_route_data);
-                    if let Some(mq_end_points) = mq_end_points {
-                        if !mq_end_points.is_empty() {
-                            let mut topic_end_points_table = self.topic_end_points_table.write().await;
-                            topic_end_points_table.insert(topic.into(), mq_end_points);
-                        }
-                    }
-                }
-
-                // Update Pub info
-                {
-                    let mut publish_info = topic_route_data2topic_publish_info(topic, &mut topic_route_data);
-                    publish_info.have_topic_router_info = true;
-                    let mut producer_table = self.producer_table.write().await;
-                    for value in producer_table.values_mut() {
-                        value.update_topic_publish_info(topic.to_string(), Some(publish_info.clone()));
-                    }
-                }
-
-                // Update sub info
-                {
-                    let consumers = {
-                        let consumer_table = self.consumer_table.read().await;
-                        consumer_table.values().cloned().collect::<Vec<_>>()
-                    };
-                    if !consumers.is_empty() {
-                        let subscribe_info = topic_route_data2topic_subscribe_info(topic, &topic_route_data);
-                        for value in consumers {
-                            value.update_topic_subscribe_info(topic.clone(), &subscribe_info).await;
-                        }
-                    }
-                }
-                let clone_topic_route_data = TopicRouteData::from_existing(&topic_route_data);
-                topic_route_table.insert(topic.clone(), clone_topic_route_data);
-                return true;
-            }
-        } else {
-            warn!(
-                "updateTopicRouteInfoFromNameServer, getTopicRouteInfoFromNameServer return null, Topic: {}. [{}]",
-                topic, self.client_id
-            );
         }
+    }
 
-        drop(lock);
-        false
+    /// Rebuilds the broker address table from every cached topic route. A key present in a
+    /// newer response takes that address; a key still advertised by any other cached route
+    /// survives, and only keys no cached route advertises are retired (plan 49 section
+    /// 4.1.1). Returns the retired `(broker_name, broker_id, address)` triples.
+    async fn reconcile_broker_addr_table(&self) -> Vec<(CheetahString, u64, CheetahString)> {
+        // Snapshot cached routes under one read lock; no callback and no I/O run here.
+        let (desired, has_route_knowledge) = {
+            let topic_route_table = self.topic_route_table.read().await;
+            let sequences = self.topic_route_sequence.read().await;
+            let mut desired: HashMap<(CheetahString, u64), (CheetahString, u64)> = HashMap::new();
+            for (topic, route) in topic_route_table.iter() {
+                // Topics fetched before this counter existed compare as oldest.
+                let sequence = sequences.get(topic).copied().unwrap_or(0);
+                for broker in route.broker_datas.iter() {
+                    for (broker_id, address) in broker.broker_addrs().iter() {
+                        let key = (broker.broker_name().clone(), *broker_id);
+                        match desired.get(&key) {
+                            Some((_, seen)) if *seen >= sequence => {}
+                            _ => {
+                                desired.insert(key, (address.clone(), sequence));
+                            }
+                        }
+                    }
+                }
+            }
+            // Answering at all is knowledge: a topic whose route was retired still leaves its
+            // sequence behind, which is what lets the last authoritative empty answer
+            // retire the final address instead of looking like a client that has never
+            // fetched.
+            (desired, !topic_route_table.is_empty() || !sequences.is_empty())
+        };
+        if !has_route_knowledge {
+            // No cached route knowledge at all: keep the last known addresses rather than wiping
+            // every broker because a fetch has not answered yet. This is deliberately
+            // about having *no* snapshot, not about a snapshot that advertises nothing
+            // - an authoritative empty answer must be able to retire the final obsolete
+            // broker, which is exactly when the derived set is empty (plan 49b R4).
+            return Vec::new();
+        }
+        let mut broker_addr_table = self.broker_addr_table.write().await;
+        let mut retired = Vec::new();
+        for (broker_name, addrs) in broker_addr_table.iter() {
+            for (broker_id, address) in addrs.iter() {
+                if !desired.contains_key(&(broker_name.clone(), *broker_id)) {
+                    retired.push((broker_name.clone(), *broker_id, address.clone()));
+                }
+            }
+        }
+        // Rebuild from the reconciled snapshot so a key advertised by any still-cached route
+        // survives and only unreferenced keys disappear.
+        let mut rebuilt: HashMap<CheetahString, HashMap<u64, CheetahString>> =
+            HashMap::with_capacity(broker_addr_table.len());
+        for ((broker_name, broker_id), (address, _)) in desired {
+            rebuilt
+                .entry(broker_name)
+                .or_insert_with(|| HashMap::with_capacity(2))
+                .insert(broker_id, address);
+        }
+        *broker_addr_table = rebuilt;
+        retired
     }
 
     async fn is_need_update_topic_route_info(&self, topic: &CheetahString) -> bool {
@@ -731,6 +1178,12 @@ impl MQClientInstance {
         result
     }
 
+    /// Shared summary-rate gate, so a component that reports per-pass rather than per-item can
+    /// reuse the same interval instead of amplifying logs with its own.
+    pub(crate) fn log_gate(&self) -> &crate::utils::log_gate::LogGate {
+        &self.log_gate
+    }
+
     pub async fn persist_all_consumer_offset(&mut self) {
         let consumers = {
             let consumer_table = self.consumer_table.read().await;
@@ -746,31 +1199,40 @@ impl MQClientInstance {
             .lock_namesrv
             .try_lock_timeout(Duration::from_millis(LOCK_TIMEOUT_MILLIS))
             .await;
-        if let Some(lock) = lock {
-            let mut broker_addr_table = self.broker_addr_table.write().await;
-            let mut updated_table = HashMap::with_capacity(broker_addr_table.len());
-            let mut broker_name_set = HashSet::new();
-            for (broker_name, one_table) in broker_addr_table.iter() {
-                let mut clone_addr_table = one_table.clone();
-                let mut remove_id_set = HashSet::new();
-                for (id, addr) in one_table.iter() {
-                    if !self.is_broker_addr_exist_in_topic_route_table(addr).await {
-                        remove_id_set.insert(*id);
-                    }
-                }
-                clone_addr_table.retain(|k, _| !remove_id_set.contains(k));
-                if clone_addr_table.is_empty() {
-                    info!("the broker[{}] name's host is offline, remove it", broker_name);
-                    broker_name_set.insert(broker_name.clone());
-                } else {
-                    updated_table.insert(broker_name.clone(), clone_addr_table);
-                }
-            }
-            broker_addr_table.retain(|k, _| !broker_name_set.contains(k));
-            if !updated_table.is_empty() {
-                broker_addr_table.extend(updated_table);
+        if lock.is_none() {
+            return;
+        }
+        // Reconcile from cached routes rather than matching addresses alone: a broker name/ID
+        // no cached route advertises is retired, while one still advertised by another topic
+        // survives even if this pass saw it only indirectly (plan 49 section 4.1.1).
+        let retired = self.reconcile_broker_addr_table().await;
+        for (broker_name, broker_id, address) in &retired {
+            debug!(
+                "the broker[{}:{}] host [{}] is offline, removed from the address table, client: {}",
+                broker_name, broker_id, address, self.client_id
+            );
+        }
+        if !retired.is_empty() {
+            if let Some(suppressed) = self.log_gate.try_acquire("offline-broker") {
+                info!(
+                    "reconciled the broker address table for client[{}]: retired {} obsolete address(es), suppressed \
+                     {} identical summaries",
+                    self.client_id,
+                    retired.len(),
+                    suppressed
+                );
             }
         }
+        // Bound per-topic refresh state to topics this instance still knows about.
+        let known = {
+            let topic_route_table = self.topic_route_table.read().await;
+            topic_route_table.keys().cloned().collect::<HashSet<CheetahString>>()
+        };
+        self.route_refresh_guard.retain(|topic| known.contains(topic));
+        self.topic_route_sequence
+            .write()
+            .await
+            .retain(|topic, _| known.contains(topic));
     }
     pub async fn send_heartbeat_to_all_broker_with_lock(&mut self) -> bool {
         if let Some(lock) = self.lock_heartbeat.try_lock().await {
@@ -916,9 +1378,12 @@ impl MQClientInstance {
             let times = self
                 .send_heartbeat_times_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if times % 20 == 0 {
-                info!("send heart beat to broker[{} {} {}] success", broker_name, id, addr,);
-            }
+            // Per-target success is routine bookkeeping and stays at DEBUG; failures keep
+            // WARN below (plan 49 section 4.1.6).
+            debug!(
+                "send heart beat to broker[{} {} {}] success, times: {}",
+                broker_name, id, addr, times,
+            );
             return true;
         }
         if self.is_broker_in_name_server(addr).await {
@@ -1105,6 +1570,22 @@ impl MQClientInstance {
         }
     }
 
+    /// Test seam (plan 49j): wakeups this client has been asked for, so a regression can prove that
+    /// a queue whose transition was busy is asked about again instead of left alone until the
+    /// next scheduled pass. Never compiled into anything that ships.
+    #[cfg(test)]
+    pub(crate) fn review49j_rebalance_wakes(&self) -> u64 {
+        self.rebalance_service.wakeup_count()
+    }
+
+    /// Test seam (plan 49c C5): the handle for the nameserver lock, so a test can hold it and make
+    /// a route lookup wait exactly as it would behind a stalled fetch. Never compiled into
+    /// anything that ships.
+    #[cfg(test)]
+    pub(crate) fn nameserver_lock(&self) -> Arc<RocketMQTokioMutex<()>> {
+        self.lock_namesrv.clone()
+    }
+
     pub async fn find_broker_address_in_subscribe(
         &mut self,
         broker_name: &CheetahString,
@@ -1114,30 +1595,17 @@ impl MQClientInstance {
         if broker_name.is_empty() {
             return None;
         }
-        let broker_addr_table = self.broker_addr_table.read().await;
-        let map = broker_addr_table.get(broker_name);
-        let mut broker_addr = None;
-        let mut slave = false;
-        let mut found = false;
-
-        if let Some(map) = map {
-            broker_addr = map.get(&broker_id);
-            slave = broker_id != mix_all::MASTER_ID;
-            found = broker_addr.is_some();
-            if !found && slave {
-                broker_addr = map.get(&(broker_id + 1));
-                found = broker_addr.is_some();
-            }
-            if !found && !only_this_broker {
-                if let Some((key, value)) = map.iter().next() {
-                    //broker_addr = Some(value.clone());
-                    slave = *key != mix_all::MASTER_ID;
-                    found = !value.is_empty();
-                }
-            }
-        }
-        if found {
-            let broker_addr = broker_addr.cloned()?;
+        // Resolve from one snapshot of the table (plan 49 section 4.1.3): the requested ID
+        // first, then the master when a slave was requested, then any other entry only if the
+        // caller tolerates another broker. No result is produced unless an address was really
+        // selected, so callers can distinguish "resolved" from "route refresh needed".
+        let selected = {
+            let broker_addr_table = self.broker_addr_table.read().await;
+            broker_addr_table
+                .get(broker_name)
+                .and_then(|addrs| select_broker_addr(addrs, broker_id, only_this_broker))
+        };
+        if let Some((broker_addr, slave)) = selected {
             let broker_version = self.find_broker_version(broker_name, broker_addr.as_str()).await;
             Some(FindBrokerResult {
                 broker_addr,
@@ -1146,6 +1614,78 @@ impl MQClientInstance {
             })
         } else {
             None
+        }
+    }
+
+    /// Repairs a broker-address miss through the shared refresh guard so thousands of queues
+    /// on one topic coalesce into a single nameserver fetch plus cooldown instead of one
+    /// sequential round trip each (plan 49 section 4.1.4). Returns whether the caller should
+    /// re-check its tables; `false` only when the client is stopping, in which case no wait and
+    /// no further fetch are allowed. A joiner waits at most `join_budget` and never issues a
+    /// second round trip.
+    pub async fn repair_route_after_broker_miss(&mut self, topic: &CheetahString, join_budget: Duration) -> bool {
+        self.repair_route_after_broker_miss_step(topic, join_budget)
+            .await
+            .recheck()
+    }
+
+    /// The same repair keeping the guard's distinction that plan 49e E3 needs: a completed fetch, a
+    /// joined flight with its answer, a still-running owner's flight, and a deferred cooldown or
+    /// backoff check are four different pieces of evidence.
+    pub(crate) async fn repair_route_after_broker_miss_step(
+        &mut self,
+        topic: &CheetahString,
+        join_budget: Duration,
+    ) -> RouteRepairStep {
+        match self.route_refresh_guard.begin(topic) {
+            BeginRefresh::Fetch(mut ticket) => {
+                // The ticket owns the slot until it completes or drops, so a cancelled or
+                // panicking leader cannot strand this topic in "in flight" (plan 50 F8). One
+                // deadline covers lock, fetch and publish: giving up on time
+                // releases the flight as a failure, which is retried behind its own
+                // backoff instead of blocking every joiner forever.
+                let budget = Duration::from_millis(self.client_config.mq_client_api_timeout) + LOOKUP_LOCK_ALLOWANCE;
+                let outcome = self
+                    .update_topic_route_info_within(topic, Instant::now() + budget)
+                    .await;
+                // Cooldown is earned by answering, not only by changing something: an unchanged or
+                // authoritative-empty repair is still a completed refresh (plan 50 F7/F8).
+                let succeeded = outcome.map(|outcome| outcome.succeeded()).unwrap_or(false);
+                ticket.complete(succeeded);
+                RouteRepairStep::Fetched { succeeded }
+            }
+            BeginRefresh::Joining => {
+                // Wait for the owner's fetch, then re-check our own tables. The answer describes
+                // the flight this caller joined, so a timeout or someone else's
+                // outcome is never read as a refresh that happened for us (plan 49b
+                // R3). An elapsed budget says nothing about the flight at all: it keeps running and
+                // remains joinable, which is not a failed attempt (plan 49e E3).
+                let answer = self.route_refresh_guard.await_flight(topic, join_budget).await;
+                if answer != FlightAnswer::Succeeded {
+                    debug!(
+                        "miss-triggered route refresh for [{}] was joined and ended as {}",
+                        topic,
+                        answer.kind()
+                    );
+                }
+                match answer {
+                    FlightAnswer::Succeeded => RouteRepairStep::Joined { succeeded: true },
+                    // A flight that ended without an answer failed; a joiner whose own flight was
+                    // superseded or forgotten re-checks its tables but did not learn that this
+                    // fetch failed, so only `Succeeded`/`Failed` carry terminal evidence.
+                    FlightAnswer::Failed => RouteRepairStep::Joined { succeeded: false },
+                    FlightAnswer::Superseded => RouteRepairStep::Superseded,
+                    FlightAnswer::Timeout => RouteRepairStep::StillJoining,
+                    FlightAnswer::Closed => RouteRepairStep::Closed,
+                }
+            }
+            // A recent success means the tables are as fresh as the cooldown allows, and a recent
+            // failure means the next attempt is already scheduled behind its own backoff window: in
+            // both cases the caller re-checks what it has instead of adding another round trip
+            // (plan 49b R3), and neither case is an attempt that finished (plan 49e E3).
+            BeginRefresh::Cooldown => RouteRepairStep::Cooldown,
+            BeginRefresh::Backoff(_) => RouteRepairStep::Backoff,
+            BeginRefresh::Closed => RouteRepairStep::Closed,
         }
     }
     async fn find_broker_version(&self, broker_name: &str, broker_addr: &str) -> i32 {
@@ -1281,26 +1821,12 @@ impl MQClientInstance {
                 break;
             };
             if result.3.is_ok() {
-                info!(
+                debug!(
                     "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] success",
                     producer_group, consumer_group, result.0, result.1, result.2,
                 );
             }
         }
-    }
-
-    async fn is_broker_addr_exist_in_topic_route_table(&self, addr: &str) -> bool {
-        let topic_route_table = self.topic_route_table.read().await;
-        for value in topic_route_table.values() {
-            for bd in value.broker_datas.iter() {
-                for value in bd.broker_addrs().values() {
-                    if value.as_str() == addr {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// Queries the assignment for a given topic.
@@ -1478,6 +2004,8 @@ pub fn topic_route_data2topic_subscribe_info(topic: &str, route: &TopicRouteData
 
 #[cfg(test)]
 mod tests {
+    use rocketmq_remoting::protocol::route::route_data_view::BrokerData;
+
     use super::*;
     use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
     use crate::consumer::default_mq_push_consumer::ConsumerConfig;
@@ -1543,6 +2071,250 @@ mod tests {
         assert_eq!(instance.service_state, ServiceState::ShutdownAlready);
     }
 
+    /// Plan 50 F2: the shared pull loop, rebalance loop and their delayed dispatches belong to the
+    /// client, not to whichever consumer controller happened to start them. Consumers share a
+    /// client by client id, so a service spawned on that controller's runtime would disappear
+    /// while its siblings were still registered - with no state transition and nothing to
+    /// restart it.
+    #[test]
+    fn shared_services_survive_the_runtime_of_the_consumer_that_started_them() {
+        // A current-thread runtime standing in for one managed consumer controller: the client is
+        // created and its shared loops are started inside it, exactly as consumer startup does.
+        let creator = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = creator.block_on(async {
+            let config = ClientConfig {
+                namesrv_addr: Some(CheetahString::from("127.0.0.1:19876")),
+                ..Default::default()
+            };
+            let instance = MQClientInstance::new_arc(config, 0, "phase50-shared-services", None);
+            instance.clone().pull_message_service.start(instance.clone()).await;
+            instance.clone().rebalance_service.start(instance.clone()).await;
+            instance
+        });
+
+        // The creator is gone. Anything it spawned on its own runtime dies here; the bound keeps a
+        // stranded task from hanging the suite, because shutdown_timeout returns either way.
+        creator.shutdown_timeout(Duration::from_secs(2));
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = observer.block_on(async move {
+            // A delayed rebalance dispatch is a task of its own: it must still fire.
+            let wakes = instance.rebalance_service.wakeup_count();
+            instance.re_balance_later(Duration::from_millis(20));
+            for _ in 0..100 {
+                if instance.rebalance_service.wakeup_count() > wakes {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                instance.rebalance_service.wakeup_count() > wakes,
+                "the delayed rebalance dispatch stopped once the runtime that started it ended"
+            );
+
+            // And the shared rebalance loop must still execute passes for whoever is left.
+            let passes = instance.rebalance_service.pass_count();
+            for _ in 0..200 {
+                if instance.rebalance_service.pass_count() > passes {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                instance.rebalance_service.pass_count() > passes,
+                "the shared rebalance loop stopped once the consumer that started it went away"
+            );
+            instance
+        });
+        // Dropped outside any runtime: this client owns runtimes of its own.
+        drop(instance);
+        drop(observer);
+    }
+
+    fn addrs(entries: &[(u64, &str)]) -> HashMap<u64, CheetahString> {
+        entries
+            .iter()
+            .map(|(id, addr)| (*id, CheetahString::from_string(addr.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn broker_lookup_prefers_the_requested_id() {
+        let table = addrs(&[(0, "master:10911"), (1, "slave:10912")]);
+        assert_eq!(
+            select_broker_addr(&table, 1, true),
+            Some((CheetahString::from_static_str("slave:10912"), true))
+        );
+        assert_eq!(
+            select_broker_addr(&table, mix_all::MASTER_ID, true),
+            Some((CheetahString::from_static_str("master:10911"), false))
+        );
+    }
+
+    #[test]
+    fn missing_slave_falls_back_to_the_master() {
+        let table = addrs(&[(0, "master:10911")]);
+        assert_eq!(
+            select_broker_addr(&table, 1, true),
+            Some((CheetahString::from_static_str("master:10911"), false))
+        );
+    }
+
+    #[test]
+    fn another_entry_is_used_only_when_the_caller_allows_it() {
+        let table = addrs(&[(2, "other:10913")]);
+        assert_eq!(select_broker_addr(&table, 1, true), None);
+        assert_eq!(
+            select_broker_addr(&table, 1, false),
+            Some((CheetahString::from_static_str("other:10913"), true))
+        );
+    }
+
+    #[test]
+    fn an_empty_address_is_never_returned() {
+        let table = addrs(&[(0, "")]);
+        assert_eq!(select_broker_addr(&table, mix_all::MASTER_ID, false), None);
+        assert_eq!(select_broker_addr(&table, 1, false), None);
+    }
+
+    #[test]
+    fn any_entry_lookup_prefers_the_master_deterministically() {
+        let table = addrs(&[(3, "c:10914"), (2, "b:10913"), (0, "a:10911")]);
+        assert_eq!(
+            select_broker_addr(&table, 7, false),
+            Some((CheetahString::from_static_str("a:10911"), false))
+        );
+    }
+
+    fn route(broker_name: &str, entries: &[(u64, &str)]) -> TopicRouteData {
+        let mut topic_route_data = TopicRouteData::new();
+        topic_route_data.broker_datas.push(BrokerData::new(
+            CheetahString::from_static_str("cluster"),
+            CheetahString::from_string(broker_name.to_string()),
+            addrs(entries),
+            None,
+        ));
+        topic_route_data
+    }
+
+    async fn seed(instance: &MQClientInstance, topic: &str, route: TopicRouteData, sequence: u64) {
+        instance
+            .topic_route_table
+            .write()
+            .await
+            .insert(CheetahString::from_string(topic.to_string()), route);
+        instance
+            .topic_route_sequence
+            .write()
+            .await
+            .insert(CheetahString::from_string(topic.to_string()), sequence);
+    }
+
+    async fn addresses(instance: &MQClientInstance) -> Vec<(String, u64, String)> {
+        let table = instance.broker_addr_table.read().await;
+        let mut out = table
+            .iter()
+            .flat_map(|(name, addrs)| addrs.iter().map(|(id, addr)| (name.to_string(), *id, addr.to_string())))
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn reconciliation_keeps_ids_advertised_by_another_topic() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "phase1-reconcile", None);
+        // Two topics share one broker name but disagree on which IDs exist.
+        seed(
+            &instance,
+            "TopicA",
+            route("broker-a", &[(0, "10.0.0.1:10911"), (1, "10.0.0.2:10911")]),
+            1,
+        )
+        .await;
+        seed(&instance, "TopicB", route("broker-a", &[(2, "10.0.0.3:10911")]), 2).await;
+
+        let retired = instance.reconcile_broker_addr_table().await;
+        assert!(retired.is_empty(), "nothing is unreferenced: {retired:?}");
+        assert_eq!(
+            addresses(&instance).await,
+            vec![
+                ("broker-a".to_string(), 0, "10.0.0.1:10911".to_string()),
+                ("broker-a".to_string(), 1, "10.0.0.2:10911".to_string()),
+                ("broker-a".to_string(), 2, "10.0.0.3:10911".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_lets_the_newest_response_win_and_retires_nothing_else() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "phase1-newest", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "old-master:10911")]), 1).await;
+        assert!(instance.reconcile_broker_addr_table().await.is_empty());
+
+        // A newer response for the same broker name/ID replaces the address.
+        seed(&instance, "TopicB", route("broker-a", &[(0, "new-master:10911")]), 2).await;
+        let retired = instance.reconcile_broker_addr_table().await;
+        assert!(retired.is_empty(), "a replacement is not a retirement: {retired:?}");
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "new-master:10911".to_string())]
+        );
+
+        // An older response must not roll the newer address back.
+        seed(&instance, "TopicA", route("broker-a", &[(0, "old-master:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "new-master:10911".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retires_only_keys_no_cached_route_advertises() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "phase1-retire", None);
+        seed(
+            &instance,
+            "TopicA",
+            route("broker-a", &[(0, "master:10911"), (1, "slave:10912")]),
+            1,
+        )
+        .await;
+        instance.reconcile_broker_addr_table().await;
+
+        // The slave disappears from the only route that advertised it.
+        seed(&instance, "TopicA", route("broker-a", &[(0, "master:10911")]), 2).await;
+        let retired = instance.reconcile_broker_addr_table().await;
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            (retired[0].0.as_str(), retired[0].1, retired[0].2.as_str()),
+            ("broker-a", 1, "slave:10912")
+        );
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "master:10911".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_without_route_knowledge_keeps_addresses() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "phase1-keep", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "master:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+
+        // Losing every cached route must not wipe known brokers (a fetch may be in flight).
+        instance.topic_route_table.write().await.clear();
+        instance.topic_route_sequence.write().await.clear();
+        let retired = instance.reconcile_broker_addr_table().await;
+        assert!(retired.is_empty());
+        assert_eq!(addresses(&instance).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn shared_factory_start_lock_is_single_flight() {
         let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "phase3-start-lock-client", None);
@@ -1568,5 +2340,303 @@ mod tests {
         }
 
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Plan 50 F7: a successful fetch is knowledge whether or not its bytes differ. Returning early
+    /// on "unchanged" left an older answer from another topic holding a shared broker address after
+    /// this topic had answered again, and made the refresh cooldown think the repair had failed.
+    #[tokio::test]
+    async fn an_unchanged_answer_is_still_the_newest_observation() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-unchanged", None);
+        // One counter orders every topic's answers, so seeding uses values it could really have
+        // produced and the fetch below continues from them.
+        instance.route_update_sequence.store(12, SyncOrdering::SeqCst);
+        let current = route("broker-a", &[(0, "10.0.0.1:10911")]);
+        seed(&instance, "TopicA", current.clone(), 11).await;
+        // Another topic answered later and currently wins the shared key.
+        seed(&instance, "TopicB", route("broker-a", &[(0, "10.9.9.9:10911")]), 12).await;
+        instance.reconcile_broker_addr_table().await;
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.9.9.9:10911".to_string())]
+        );
+
+        // TopicA answers again with the same route it already holds: unchanged, but newer.
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(current),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Unchanged);
+        assert!(outcome.succeeded(), "an unchanged answer earns the cooldown");
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.0.0.1:10911".to_string())],
+            "the newest successful response wins a shared broker address"
+        );
+    }
+
+    /// Plan 50 F7: an authoritative empty answer is knowledge too - it retires the cached route and
+    /// the addresses only it advertised, while another topic's knowledge survives.
+    #[tokio::test]
+    async fn an_authoritative_empty_answer_retires_the_route_it_covers() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-absent", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        seed(&instance, "TopicB", route("broker-b", &[(0, "10.0.0.2:10911")]), 2).await;
+        instance.reconcile_broker_addr_table().await;
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Absent,
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Absent);
+        assert!(outcome.succeeded());
+        assert!(
+            !instance
+                .topic_route_table
+                .read()
+                .await
+                .contains_key(&CheetahString::from_static_str("TopicA")),
+            "the retired route is gone from the cache"
+        );
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-b".to_string(), 0, "10.0.0.2:10911".to_string())],
+            "only the addresses no cached route advertises are retired"
+        );
+    }
+
+    /// Plan 50 F7: no answer is not an answer. Nothing may be erased and the refresh cooldown must
+    /// not treat it as a completed refresh.
+    #[tokio::test]
+    async fn a_failed_fetch_preserves_every_table() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "f7-failed", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Failed,
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Failed);
+        assert!(!outcome.succeeded(), "a missing answer earns no cooldown");
+        assert!(instance
+            .topic_route_table
+            .read()
+            .await
+            .contains_key(&CheetahString::from_static_str("TopicA")));
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0, "10.0.0.1:10911".to_string())]
+        );
+    }
+
+    /// Plan 49b R4: a successfully decoded answer that advertises no broker is authoritative
+    /// evidence, and it must be able to retire the *final* obsolete address. Preserving
+    /// "because the derived set came out empty" used to keep every broker alive exactly when
+    /// nothing was left to advertise them. The body goes through the same decode entry point
+    /// the nameserver response uses, so this is real wire evidence and not a helper-injected
+    /// outcome.
+    #[tokio::test]
+    async fn an_empty_decoded_route_retires_the_final_obsolete_broker() {
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-empty-last", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+        assert_eq!(
+            addresses(&instance).await,
+            vec![("broker-a".to_string(), 0u64, "10.0.0.1:10911".to_string())]
+        );
+
+        let body = br#"{"orderTopicConf":"","queueDatas":[],"brokerDatas":[],"filterServerTable":{}}"#;
+        let decoded = TopicRouteData::decode(body).expect("a nameserver route body decodes");
+        assert!(
+            !advertises_brokers(&decoded),
+            "the evidence really advertises no broker address"
+        );
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(decoded),
+                false,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, RouteFetchOutcome::Absent);
+        assert!(outcome.succeeded(), "an authoritative empty answer earns the cooldown");
+        assert!(
+            !instance
+                .topic_route_table
+                .read()
+                .await
+                .contains_key(&CheetahString::from_static_str("TopicA")),
+            "the retired topic route is gone"
+        );
+        assert_eq!(
+            addresses(&instance).await,
+            Vec::<(String, u64, String)>::new(),
+            "an authoritative empty snapshot retires the final obsolete broker instead of preserving it"
+        );
+    }
+
+    /// Plan 49b R4: the same empty answer must not touch what another topic still advertises.
+    #[tokio::test]
+    async fn an_empty_decoded_route_leaves_a_sibling_topic_alone() {
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-empty-sibling", None);
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        seed(
+            &instance,
+            "TopicB",
+            route("broker-b", &[(0, "10.0.0.2:10911"), (1, "10.0.0.3:10911")]),
+            2,
+        )
+        .await;
+        instance.reconcile_broker_addr_table().await;
+
+        let decoded = TopicRouteData::decode(br#"{"queueDatas":[],"brokerDatas":[]}"#).expect("decodes");
+        instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &CheetahString::from_static_str("TopicA"),
+                FetchedRoute::Route(decoded),
+                false,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            addresses(&instance).await,
+            vec![
+                ("broker-b".to_string(), 0u64, "10.0.0.2:10911".to_string()),
+                ("broker-b".to_string(), 1u64, "10.0.0.3:10911".to_string()),
+            ],
+            "only addresses no cached route advertises any more are retired"
+        );
+    }
+
+    /// Plan 49b R4: a successful answer that advertises no static endpoint must replace the
+    /// projection its predecessor left behind, or a static-to-ordinary topic change keeps
+    /// resolving dead broker names.
+    #[tokio::test]
+    async fn a_route_without_endpoints_clears_the_previous_endpoint_projection() {
+        let instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-endpoints", None);
+        let topic = CheetahString::from_static_str("TopicA");
+        instance.topic_end_points_table.write().await.insert(
+            topic.clone(),
+            HashMap::from([(MessageQueue::new(), CheetahString::from_static_str("broker-a"))]),
+        );
+
+        let outcome = instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &topic,
+                FetchedRoute::Route(route("broker-a", &[(0, "10.0.0.1:10911")])),
+                false,
+                None,
+            )
+            .await;
+        assert!(outcome.succeeded());
+        assert!(
+            !instance.topic_end_points_table.read().await.contains_key(&topic),
+            "a route advertising no endpoints removes the stale projection instead of keeping it"
+        );
+    }
+
+    /// Plan 49b R4: an authoritative empty answer has to reach consumers too - rebalance reads the
+    /// consumer's own subscribe-info table, so leaving the old queue set there keeps pulling
+    /// retired brokers.
+    #[tokio::test]
+    async fn an_empty_answer_publishes_an_empty_subscribe_set_to_consumers() {
+        use rocketmq_remoting::protocol::heartbeat::subscription_data::SubscriptionData;
+        use rocketmq_remoting::protocol::RemotingDeserializable;
+
+        // Registration owns the shared instance, so it runs first and the assertions below read
+        // through the same Arc.
+        let mut instance = MQClientInstance::new_arc(ClientConfig::default(), 0, "r4-consumers", None);
+        let topic = CheetahString::from_static_str("TopicA");
+        let consumer = test_consumer("group-r4");
+        instance
+            .register_consumer(&CheetahString::from_static_str("group-r4"), consumer.clone())
+            .await;
+        // The consumer only accepts a projection for topics it actually subscribes to.
+        {
+            let subscription = SubscriptionData {
+                topic: topic.clone(),
+                sub_string: CheetahString::from_static_str(SubscriptionData::SUB_ALL),
+                ..Default::default()
+            };
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .get_subscription_inner()
+                .write()
+                .await
+                .insert(topic.clone(), subscription);
+        }
+        consumer
+            .default_mqpush_consumer_impl
+            .update_topic_subscribe_info(
+                topic.clone(),
+                &HashSet::from([MessageQueue::from_parts(topic.clone(), "broker-a", 0)]),
+            )
+            .await;
+        assert_eq!(
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .rebalance_impl_inner
+                .topic_subscribe_info_table
+                .read()
+                .await
+                .get(&topic)
+                .map(|set| set.len()),
+            Some(1)
+        );
+
+        seed(&instance, "TopicA", route("broker-a", &[(0, "10.0.0.1:10911")]), 1).await;
+        instance.reconcile_broker_addr_table().await;
+
+        instance
+            .mut_from_ref()
+            .apply_route_fetch(
+                &topic,
+                FetchedRoute::Route(TopicRouteData::decode(br#"{"brokerDatas":[]}"#).expect("decodes")),
+                false,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            consumer
+                .default_mqpush_consumer_impl
+                .rebalance_impl
+                .rebalance_impl_inner
+                .topic_subscribe_info_table
+                .read()
+                .await
+                .get(&topic)
+                .map(|set| set.len()),
+            Some(0),
+            "the consumer sees the same authoritative emptiness so rebalance can retire its queues"
+        );
     }
 }

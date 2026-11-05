@@ -22,6 +22,7 @@ use rocketmq_remoting::protocol::body::consume_message_directly_result::ConsumeM
 use rocketmq_rust::ArcMut;
 use rocketmq_rust::WeakArcMut;
 
+use crate::consumer::consumer_impl::consumer_lifecycle::DeliveryOwner;
 use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 
@@ -59,6 +60,17 @@ where
         if let Some(consume_message_orderly_service) = &mut self.consume_message_orderly_service {
             let this = consume_message_orderly_service.clone();
             consume_message_orderly_service.start(this);
+        }
+    }
+
+    /// Stops accepting new delivery on every owned service. Idempotent and non-blocking, so a
+    /// cleanup session can close admission before it awaits any tracker.
+    pub fn begin_shutdown(&mut self) {
+        if let Some(consume_message_concurrently_service) = &mut self.consume_message_concurrently_service {
+            consume_message_concurrently_service.begin_shutdown();
+        }
+        if let Some(consume_message_orderly_service) = &mut self.consume_message_orderly_service {
+            consume_message_orderly_service.begin_shutdown();
         }
     }
 
@@ -115,16 +127,31 @@ where
         process_queue: Arc<ProcessQueue>,
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
+        accounting: DeliveryOwner,
     ) {
         if let Some(consume_message_concurrently_service) = &self.consume_message_concurrently_service {
             let this = consume_message_concurrently_service.clone();
             consume_message_concurrently_service
-                .submit_consume_request(this, msgs, process_queue, message_queue, dispatch_to_consume)
+                .submit_consume_request_accounted(
+                    this,
+                    msgs,
+                    process_queue,
+                    message_queue,
+                    dispatch_to_consume,
+                    Some(accounting),
+                )
                 .await;
         } else if let Some(consume_message_orderly_service) = &self.consume_message_orderly_service {
             let this = consume_message_orderly_service.clone();
             consume_message_orderly_service
-                .submit_consume_request(this, msgs, process_queue, message_queue, dispatch_to_consume)
+                .submit_consume_request_accounted(
+                    this,
+                    msgs,
+                    process_queue,
+                    message_queue,
+                    dispatch_to_consume,
+                    Some(accounting),
+                )
                 .await;
         }
     }
@@ -272,6 +299,10 @@ pub trait ConsumeMessageServiceTrait {
     /// * `await_terminate_millis` - The number of milliseconds to wait for termination.
     async fn shutdown(&mut self, await_terminate_millis: u64);
 
+    /// Close admission without waiting. Implementations that cannot prove listener quiescence keep
+    /// the default no-op and are reported as unproved by cleanup.
+    fn begin_shutdown(&mut self) {}
+
     /// Updates the core pool size of the service.
     ///
     /// # Arguments
@@ -327,6 +358,28 @@ pub trait ConsumeMessageServiceTrait {
         message_queue: MessageQueue,
         dispatch_to_consume: bool,
     );
+
+    /// Submit a batch whose accounting ownership was taken when the pull callback admitted it.
+    ///
+    /// A service that executes listeners for exactly these messages overrides this and carries the
+    /// owner to completion. The default releases it at handover, which is right for services that
+    /// take their batches from a process queue later and account for each one there (orderly):
+    /// keeping the handover count would hold messages pending that its own listener never
+    /// received. `None` means no SDK ownership was taken for this batch, so nothing is added or
+    /// released on its behalf.
+    async fn submit_consume_request_accounted(
+        &self,
+        this: ArcMut<Self>,
+        msgs: Vec<ArcMut<MessageExt>>,
+        process_queue: Arc<ProcessQueue>,
+        message_queue: MessageQueue,
+        dispatch_to_consume: bool,
+        accounting: Option<DeliveryOwner>,
+    ) {
+        drop(accounting);
+        self.submit_consume_request(this, msgs, process_queue, message_queue, dispatch_to_consume)
+            .await;
+    }
 
     /// Submits a pop consume request.
     ///

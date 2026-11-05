@@ -24,7 +24,8 @@ use rocketmq_error::RocketMQResult;
 use tokio::io::AsyncReadExt;
 #[cfg(feature = "async_fs")]
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 
 static LOCK: Mutex<()> = Mutex::new(());
 

@@ -3,7 +3,6 @@ name                   = "rocketmq-example"
 version.workspace      = true
 authors.workspace      = true
 edition.workspace      = true
-homepage.workspace     = true
 repository.workspace   = true
 license.workspace      = true
 keywords.workspace     = true
@@ -25,3 +24,8 @@ tokio             = { workspace = true }
 [[example]]
 name = "pop-consumer"
 path = "examples/consumer/pop_consumer.rs"
+
+# Cargo's manifest lint does not look at example targets; rocketmq-tools is used by
+# examples/consumer/pop_consumer.rs.
+[lints.cargo]
+unused_dependencies = "allow"

@@ -365,12 +365,9 @@ impl ProcessQueue {
     /// first entry so the stall duration accumulates from that point.
     pub(crate) fn mark_flow_control(&self) {
         // Use compare-and-swap so that concurrent callers don't reset an existing start time.
-        let _ = self.flow_control_since.compare_exchange(
-            0,
-            get_current_millis(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self
+            .flow_control_since
+            .compare_exchange(0, get_current_millis(), Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// How many milliseconds this queue has been continuously flow-controlled,
@@ -584,8 +581,10 @@ mod tests {
         pq.queue_offset_max.store(20, std::sync::atomic::Ordering::Release);
         pq.locked.store(true, std::sync::atomic::Ordering::Release);
         pq.dropped.store(false, std::sync::atomic::Ordering::Release);
-        pq.last_pull_timestamp.store(1_000, std::sync::atomic::Ordering::Release);
-        pq.last_consume_timestamp.store(900, std::sync::atomic::Ordering::Release);
+        pq.last_pull_timestamp
+            .store(1_000, std::sync::atomic::Ordering::Release);
+        pq.last_consume_timestamp
+            .store(900, std::sync::atomic::Ordering::Release);
 
         let info = pq.fill_process_queue_info(10);
         assert_eq!(info.commit_offset, 10);

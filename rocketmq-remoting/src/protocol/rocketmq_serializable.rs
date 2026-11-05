@@ -145,7 +145,8 @@ impl RocketMQSerializable {
     /// Estimate the size needed for encoding to reduce reallocations
     #[inline]
     fn estimate_encode_size(cmd: &RemotingCommand) -> usize {
-        let mut size = 15; // Fixed header: code(2) + language(1) + version(2) + opaque(4) + flag(4) + map_len(4)
+        let mut size = 15; // Fixed header: code(2) + language(1) + version(2) + opaque(4) + flag(4)
+                           // + map_len(4)
 
         // Remark size
         if let Some(remark) = cmd.remark() {

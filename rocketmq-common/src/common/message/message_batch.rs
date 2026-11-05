@@ -265,6 +265,23 @@ impl MessageTrait for MessageBatch {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct MessageExtBatch {
+    pub message_ext_broker_inner: MessageExtBrokerInner,
+    pub is_inner_batch: bool,
+    pub encoded_buff: Option<bytes::BytesMut>,
+}
+
+impl MessageExtBatch {
+    pub fn wrap(&self) -> Option<Bytes> {
+        self.message_ext_broker_inner.body()
+    }
+
+    pub fn get_tags(&self) -> Option<CheetahString> {
+        self.message_ext_broker_inner.get_tags()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -420,22 +437,5 @@ mod tests {
         let display = format!("{}", batch);
         assert!(display.contains("MessageBatch"));
         assert!(display.contains("topic1"));
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct MessageExtBatch {
-    pub message_ext_broker_inner: MessageExtBrokerInner,
-    pub is_inner_batch: bool,
-    pub encoded_buff: Option<bytes::BytesMut>,
-}
-
-impl MessageExtBatch {
-    pub fn wrap(&self) -> Option<Bytes> {
-        self.message_ext_broker_inner.body()
-    }
-
-    pub fn get_tags(&self) -> Option<CheetahString> {
-        self.message_ext_broker_inner.get_tags()
     }
 }

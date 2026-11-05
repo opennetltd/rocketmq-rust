@@ -20,6 +20,7 @@ use cheetah_string::CheetahString;
 use rocketmq_common::common::message::message_enum::MessageRequestMode;
 use rocketmq_common::common::message::message_queue::MessageQueue;
 
+use crate::consumer::consumer_impl::consumer_lifecycle::PullLease;
 use crate::consumer::consumer_impl::message_request::MessageRequest;
 use crate::consumer::consumer_impl::process_queue::ProcessQueue;
 
@@ -30,6 +31,13 @@ pub(crate) struct PullRequest {
     pub(crate) process_queue: Arc<ProcessQueue>,
     pub(crate) next_offset: i64,
     pub(crate) previously_locked: bool,
+    /// The in-flight pull lease this request's loop holds (plan 49a F4 section 4.3 item 3). Shared
+    /// so that a clone handed to the callback cannot release the lease before the loop itself
+    /// ends.
+    pub(crate) lease: Option<Arc<PullLease>>,
+    /// Identity of the RPC attempt this request admitted, `0` when it issued none (plan 49d R1).
+    /// The callback hands it back so only its own attempt is retired, never a newer one.
+    pub(crate) attempt_id: u64,
 }
 
 impl PullRequest {
@@ -45,7 +53,33 @@ impl PullRequest {
             process_queue,
             next_offset,
             previously_locked: false,
+            lease: None,
+            attempt_id: 0,
         }
+    }
+
+    /// The acquisition this request was issued under, if it holds a lease.
+    pub(crate) fn lease_epoch(&self) -> Option<u64> {
+        self.lease.as_ref().map(|lease| lease.epoch())
+    }
+
+    pub(crate) fn hold_lease(&mut self, lease: Arc<PullLease>) {
+        self.lease = Some(lease);
+    }
+
+    /// The acquisition this request carries, if any (plan 49f F2: admission is recorded through the
+    /// lease, so it can only ever describe the acquisition that issued the request).
+    pub(crate) fn lease(&self) -> Option<&Arc<PullLease>> {
+        self.lease.as_ref()
+    }
+
+    /// The attempt this request admitted, `0` when it issued no RPC.
+    pub(crate) fn attempt_id(&self) -> u64 {
+        self.attempt_id
+    }
+
+    pub(crate) fn set_attempt_id(&mut self, attempt_id: u64) {
+        self.attempt_id = attempt_id;
     }
 
     pub fn is_previously_locked(&self) -> bool {

@@ -13,4 +13,5 @@
 // limitations under the License.
 
 pub mod mq_client_instance;
+pub(crate) mod route_refresh_guard;
 pub mod transport_health;

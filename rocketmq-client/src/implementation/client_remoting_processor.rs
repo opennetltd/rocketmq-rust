@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use cheetah_string::CheetahString;
 use rocketmq_common::common::compression::compressor_factory::CompressorFactory;
@@ -45,6 +47,15 @@ use tracing::warn;
 use crate::consumer::mq_consumer_inner::MQConsumerInner;
 use crate::factory::mq_client_instance::MQClientInstance;
 use crate::producer::request_future_holder::REQUEST_FUTURE_HOLDER;
+use crate::utils::log_gate::LogGate;
+
+/// Broker notifications arrive per changed consumer group and, during route churn, many
+/// times a second. INFO stays bounded; the rebalance wakeup itself never is (plan 49
+/// section 4.1.6).
+fn notification_gate() -> &'static LogGate {
+    static GATE: OnceLock<LogGate> = OnceLock::new();
+    GATE.get_or_init(|| LogGate::new(Duration::from_secs(10)))
+}
 
 #[derive(Clone)]
 pub struct ClientRemotingProcessor {
@@ -71,7 +82,10 @@ impl RequestProcessor for ClientRemotingProcessor {
         request: &mut RemotingCommand,
     ) -> rocketmq_error::RocketMQResult<Option<RemotingCommand>> {
         let request_code = RequestCode::from(request.code());
-        info!("process_request: {:?}", request_code);
+        // Every broker push would print here; tracing skips formatting entirely when DEBUG
+        // is disabled, so a chatty nameserver/broker cannot amplify log work (plan 49
+        // section 4.1.6).
+        debug!("process_request: {:?}", request_code);
         match request_code {
             RequestCode::CheckTransactionState => self.check_transaction_state(channel, ctx, request).await,
             RequestCode::ResetConsumerClientOffset | RequestCode::GetConsumerStatusFromClient => {
@@ -84,7 +98,13 @@ impl RequestProcessor for ClientRemotingProcessor {
             RequestCode::NotifyConsumerIdsChanged => self.notify_consumer_ids_changed(channel, ctx, request),
 
             _ => {
-                info!("Unknown request code: {:?}", request_code);
+                if notification_gate()
+                    .try_acquire(&format!("unknown-request-code:{:?}", request_code))
+                    .is_some()
+                {
+                    warn!("Unknown request code: {:?}", request_code);
+                }
+                debug!("Unknown request code: {:?}", request_code);
                 Ok(None)
             }
         }
@@ -190,12 +210,23 @@ impl ClientRemotingProcessor {
         let request_header = request
             .decode_command_custom_header::<NotifyConsumerIdsChangedRequestHeader>()
             .unwrap();
+        let consumer_group = request_header.consumer_group.clone();
 
-        info!(
+        debug!(
             "receive broker's notification[{}], the consumer group: {} changed, rebalance immediately",
             channel.remote_address(),
-            request_header.consumer_group
+            consumer_group
         );
+        // The wake is unconditional; only its INFO summary is rate-bounded.
+        if let Some(suppressed) = notification_gate().try_acquire(&format!("consumer-ids-changed:{consumer_group}")) {
+            info!(
+                "receive broker's notification[{}], the consumer group: {} changed, rebalance immediately (suppressed \
+                 {} identical notifications)",
+                channel.remote_address(),
+                consumer_group,
+                suppressed
+            );
+        }
 
         self.client_instance.re_balance_immediately();
 
